@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{% block title %}CourtReserve Manager{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css"/>
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-logo">🎾 CR Manager</div>
+    <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}">Dashboard</a>
+    <a href="/orgs" class="nav-link {% if '/orgs' in request.url.path %}active{% endif %}">Organizations</a>
+    <a href="/jobs" class="nav-link {% if '/jobs' in request.url.path %}active{% endif %}">Jobs</a>
+  </nav>
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Organizations — CourtReserve Manager{% endblock %}
+{% block content %}
+<div class="card-header">
+  <h1>Organizations</h1>
+  <button class="btn btn-primary" onclick="document.getElementById('add-org-modal').classList.add('open')">+ Add Org</button>
+</div>
+
+{% for o in orgs %}
+<div class="card">
+  <div class="card-header">
+    <h2>{{ o.name }} <small style="color:var(--muted);font-weight:400;font-size:13px">org_id: {{ o.org_id }}</small></h2>
+    <div class="row-actions">
+      <a href="/orgs/{{ o.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
+      <form method="post" action="/orgs/{{ o.id }}/delete" style="display:inline" onsubmit="return confirm('Delete org and all accounts?')">
+        <button class="btn btn-danger btn-sm">Delete</button>
+      </form>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;font-size:13px">
+    <div><span style="color:var(--muted)">Scheduler ID:</span> {{ o.scheduler_id }}</div>
+    <div><span style="color:var(--muted)">Cost Type ID:</span> {{ o.cost_type_id }}</div>
+    <div><span style="color:var(--muted)">Timezone:</span> {{ o.timezone }}</div>
+    <div><span style="color:var(--muted)">Days out:</span> {{ o.days_out }}</div>
+    <div><span style="color:var(--muted)">Duration:</span> {{ o.default_duration }} min</div>
+    <div><span style="color:var(--muted)">Release:</span> {{ "%02d"|format(o.release_hour) }}:{{ "%02d"|format(o.release_minute) }} local</div>
+    <div><span style="color:var(--muted)">Preferred times:</span> {{ o.preferred_times | join(", ") or "any" }}</div>
+  </div>
+
+  <h2>Accounts</h2>
+  {% if o.accounts %}
+  <table style="margin-bottom:16px">
+    <thead><tr><th>Label</th><th>Email</th><th>Calendar</th><th></th></tr></thead>
+    <tbody>
+    {% for a in o.accounts %}
+    <tr>
+      <td>{{ a.label or "—" }}</td>
+      <td>{{ a.email }}</td>
+      <td><a href="/calendar/{{ a.id }}.ics" class="btn btn-ghost btn-sm">📅 .ics</a></td>
+      <td>
+        <form method="post" action="/accounts/{{ a.id }}/delete" style="display:inline" onsubmit="return confirm('Delete account?')">
+          <button class="btn btn-danger btn-sm">Remove</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:var(--muted);margin-bottom:12px">No accounts yet.</p>
+  {% endif %}
+
+  <details {% if account_error and account_error.org_id == o.id %}open{% endif %}>
+    <summary class="btn btn-ghost btn-sm" style="cursor:pointer">+ Add Account</summary>
+    <form method="post" action="/orgs/{{ o.id }}/accounts" style="margin-top:14px">
+      <div class="form-grid">
+        <div class="form-group"><label>Label (optional)</label><input name="label" placeholder="e.g. Alice"></div>
+        <div class="form-group"><label>Email</label><input name="email" type="email" required></div>
+        <div class="form-group"><label>Password</label><input name="password" type="password" required></div>
+      </div>
+      {% if account_error and account_error.org_id == o.id %}
+      <div class="verify-error" style="margin-top:8px">✕ {{ account_error.message }}</div>
+      {% endif %}
+      <div class="form-actions"><button type="submit" class="btn btn-primary">Verify &amp; Add</button></div>
+    </form>
+  </details>
+</div>
+{% else %}
+<div class="card"><div class="empty-state">No organizations yet. Add one below.</div></div>
+{% endfor %}
+
+<!-- Add Org Modal -->
+<div class="modal-overlay" id="add-org-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('add-org-modal').classList.remove('open')">✕</button>
+    <h2>Add Organization</h2>
+    <form method="post" action="/orgs">
+      <div class="form-grid">
+        <div class="form-group"><label>Name</label><input name="name" placeholder="My Tennis Club" required></div>
+        <div class="form-group"><label>Org ID</label><input name="org_id" placeholder="13233" required></div>
+        <div class="form-group"><label>Scheduler ID</label><input name="scheduler_id" placeholder="16983" required></div>
+        <div class="form-group"><label>Cost Type ID</label><input name="cost_type_id" placeholder="141205" required></div>
+        <div class="form-group"><label>Timezone</label>
+          <select name="timezone">
+            <option value="America/Los_Angeles" selected>America/Los_Angeles</option>
+            <option value="America/New_York">America/New_York</option>
+            <option value="America/Chicago">America/Chicago</option>
+            <option value="America/Denver">America/Denver</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Days Out</label><input name="days_out" type="number" value="7"></div>
+        <div class="form-group"><label>Default Duration (min)</label><input name="default_duration" type="number" value="120"></div>
+        <div class="form-group"><label>Release Hour (local)</label><input name="release_hour" type="number" value="12" min="0" max="23"></div>
+        <div class="form-group"><label>Release Minute</label><input name="release_minute" type="number" value="0" min="0" max="59"></div>
+        <div class="form-group" style="grid-column:span 2"><label>Preferred Times (comma-separated, e.g. 10:00,11:00)</label><input name="preferred_times" placeholder="10:00,11:00"></div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary">Create</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('add-org-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

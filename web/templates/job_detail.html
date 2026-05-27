@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Job Runs — CourtReserve Manager{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px">
+  <a href="/jobs" style="color:var(--muted);text-decoration:none">← Jobs</a>
+</div>
+<h1>{{ job.type }} — {{ job.org.name if job.org else "" }}</h1>
+<p style="color:var(--muted);margin-bottom:24px">Account: {{ job.account.label or job.account.email if job.account else "—" }} &nbsp;·&nbsp; Status: <span class="badge badge-{{ job.status }}">{{ job.status }}</span></p>
+
+{% if runs %}
+<div class="card">
+  <table>
+    <thead><tr><th>Run ID</th><th>Started</th><th>Finished</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for r in runs %}
+    <tr>
+      <td>#{{ r.id }}</td>
+      <td style="font-size:12px">{{ r.started_at }}</td>
+      <td style="font-size:12px">{{ r.finished_at or "running..." }}</td>
+      <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>
+      <td><a href="/runs/{{ r.id }}" class="btn btn-ghost btn-sm">View Log</a></td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card"><div class="empty-state">No runs yet.</div></div>
+{% endif %}
+{% endblock %}

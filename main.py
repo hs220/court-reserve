@@ -9,9 +9,9 @@ from datetime import date, datetime, timedelta
 import pytz
 from playwright.sync_api import sync_playwright
 
-from config import load_config, SESSION_FILE
+from config import load_config, default_org_config, SESSION_FILE
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
-from booking import get_available_slots, find_best_slot, book_slot, BOOKING_URL
+from booking import get_available_slots, find_best_slot, book_slot
 from scheduler import wait_until
 
 PT = pytz.timezone("America/Los_Angeles")
@@ -28,15 +28,16 @@ def _notify(title: str, message: str) -> None:
 
 
 def watch_and_book(page, target_date: date, target_time: str, duration: int,
-                   interval: int = 60, timeout_minutes: int = 0) -> bool:
+                   interval: int = 60, timeout_minutes: int = 0, org=None) -> bool:
     started = time.monotonic()
     while True:
-        slots = get_available_slots(page, target_date)
+        slots = get_available_slots(page, target_date, org) if org else get_available_slots(page, target_date)
         match = next((s for s in slots if s.start_time == target_time and not s.is_wait_list), None)
         if match:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{ts}] Found slot — booking now...")
-            success = book_slot(page, BOOKING_URL, match, duration_minutes=duration)
+            booking_url = org.booking_url if org else None
+            success = book_slot(page, booking_url, match, duration_minutes=duration, org=org) if org else book_slot(page, booking_url, match, duration_minutes=duration)
             if success:
                 _notify("CourtReserve", f"Court booked for {target_time} on {target_date}")
             return success
@@ -53,13 +54,14 @@ def watch_and_book(page, target_date: date, target_time: str, duration: int,
 
 
 def cmd_list(args, cfg):
+    org = default_org_config()
     target_date = date.fromisoformat(args.date)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not args.headed, args=BROWSER_ARGS)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
-        ensure_logged_in(context, page, cfg["email"], cfg["password"], BOOKING_URL, SESSION_FILE)
-        slots = get_available_slots(page, target_date)
+        ensure_logged_in(context, page, cfg["email"], cfg["password"], org.booking_url, SESSION_FILE)
+        slots = get_available_slots(page, target_date, org)
         if not slots:
             print("No available slots.")
         else:
@@ -71,6 +73,7 @@ def cmd_list(args, cfg):
 
 
 def cmd_book(args, cfg):
+    org = default_org_config()
     target_date = date.fromisoformat(args.date)
     preferred_times = [args.time] if args.time else cfg.get("preferred_times", [])
 
@@ -80,7 +83,7 @@ def cmd_book(args, cfg):
         page = context.new_page()
 
         # Pre-warm: login and land on booking page before the release time
-        ensure_logged_in(context, page, cfg["email"], cfg["password"], BOOKING_URL, SESSION_FILE)
+        ensure_logged_in(context, page, cfg["email"], cfg["password"], org.booking_url, SESSION_FILE)
 
         if args.at:
             wait_until(datetime.fromisoformat(args.at))
@@ -88,7 +91,7 @@ def cmd_book(args, cfg):
         # Retry loop: slots may not appear the instant 12PM ticks
         slots = None
         for attempt in range(12):
-            slots = get_available_slots(page, target_date)
+            slots = get_available_slots(page, target_date, org)
             if slots:
                 break
             if attempt < 11:
@@ -107,21 +110,22 @@ def cmd_book(args, cfg):
             sys.exit(1)
 
         duration = args.duration or cfg.get("default_duration", 60)
-        success = book_slot(page, BOOKING_URL, slot, duration_minutes=duration)
+        success = book_slot(page, org.booking_url, slot, duration_minutes=duration, org=org, dry_run=getattr(args, 'dry_run', False))
         browser.close()
         sys.exit(0 if success else 1)
 
 
 def cmd_watch(args, cfg):
+    org = default_org_config()
     target_date = date.fromisoformat(args.date)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not args.headed, args=BROWSER_ARGS)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
-        ensure_logged_in(context, page, cfg["email"], cfg["password"], BOOKING_URL, SESSION_FILE)
+        ensure_logged_in(context, page, cfg["email"], cfg["password"], org.booking_url, SESSION_FILE)
         success = watch_and_book(
             page, target_date, args.time, args.duration,
-            interval=args.interval, timeout_minutes=args.timeout,
+            interval=args.interval, timeout_minutes=args.timeout, org=org,
         )
         browser.close()
     sys.exit(0 if success else 1)
@@ -155,6 +159,7 @@ def main():
     p_book.add_argument("--duration", type=int, help="Duration in minutes (default from config)")
     p_book.add_argument("--at", help="Wait until this datetime before booking (ISO: 'YYYY-MM-DD HH:MM:SS')")
     p_book.add_argument("--headed", action="store_true", help="Show browser window")
+    p_book.add_argument("--dry-run", action="store_true", dest="dry_run", help="Open modal and log duration options, but do not click Save")
 
     p_next = sub.add_parser("book-next", help="Book days_out from today, waiting for today's 12PM PT release")
     p_next.add_argument("--time", help="Preferred start time HH:MM (24h)")

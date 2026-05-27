@@ -11,17 +11,31 @@ USER_AGENT = (
 )
 
 
-def login(page: Page, email: str, password: str) -> None:
+def login(page: Page, email: str, password: str, org_url: str | None = None) -> None:
     print(f"Logging in as {email}...")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=20000)
-    page.wait_for_timeout(2000)
+    # Navigate via the org booking URL so the server sets the correct OrganizationId
+    # on the login page. Hitting /Account/Login directly uses OrganizationId=0 which
+    # CourtReserve rejects for org-specific accounts.
+    if org_url:
+        page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(1500)
+        # If not redirected to login, we're already in — nothing to do
+        if "login" not in page.url.lower():
+            print("Already logged in via org URL.")
+            return
+        # Now on the org-specific login page
+    else:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(2000)
     page.fill('input[name="email"]', email)
     page.fill('input[name="password"]', password)
     page.click('button[type="submit"], input[type="submit"]')
     page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(2000)
-    if "login" in page.url.lower():
-        raise RuntimeError("Login failed — check CR_EMAIL and CR_PASSWORD in .env")
+    # Check for the login form still being present rather than URL — CourtReserve sometimes
+    # redirects to a double-encoded returnUrl that 404s, leaving "login" in the URL even on success.
+    if page.query_selector('input[name="password"]'):
+        raise RuntimeError("Login failed — check email and password")
     print("Login successful.")
 
 
@@ -50,5 +64,5 @@ def ensure_logged_in(context: BrowserContext, page: Page, email: str, password: 
     if loaded and is_logged_in(page, org_url):
         print("Using existing session.")
         return
-    login(page, email, password)
+    login(page, email, password, org_url=org_url)
     save_session(context, session_file)

@@ -1,12 +1,25 @@
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 from urllib.parse import quote
 import pytz
 
 from playwright.sync_api import Page
+
+
+class BookingError(Exception):
+    """Booking was rejected by CourtReserve."""
+
+class BookingWindowError(BookingError):
+    """Date is beyond the organization's advance booking window."""
+
+class NoAvailableCourtsError(BookingError):
+    """No courts available for the requested time slot."""
+
+class AlreadyBookedError(BookingError):
+    """Account already has a reservation and is restricted from booking more."""
 
 CANCEL_REASONS = [
     "Schedule conflict came up",
@@ -16,12 +29,43 @@ CANCEL_REASONS = [
     "Personal emergency",
 ]
 
-ORG_ID = "13233"
-SCHEDULER_ID = "16983"
-COST_TYPE_ID = "141205"
-TZ = "America/Los_Angeles"
+
+@dataclass
+class OrgConfig:
+    org_id: str
+    scheduler_id: str
+    cost_type_id: str
+    timezone: str = "America/Los_Angeles"
+
+    @property
+    def read_url(self) -> str:
+        return f"https://app.courtreserve.com/Online/Reservations/ReadConsolidated/{self.org_id}"
+
+    @property
+    def booking_url(self) -> str:
+        return f"https://app.courtreserve.com/Online/Reservations/Bookings/{self.org_id}?sId={self.scheduler_id}"
+
+
+# Backward-compat defaults (used by CLI when config.yaml doesn't specify overrides)
+_DEFAULT_ORG_ID = "13233"
+_DEFAULT_SCHEDULER_ID = "16983"
+_DEFAULT_COST_TYPE_ID = "141205"
+_DEFAULT_TZ = "America/Los_Angeles"
+
+# Keep these as module-level names so any existing import of BOOKING_URL still works
+ORG_ID = _DEFAULT_ORG_ID
+SCHEDULER_ID = _DEFAULT_SCHEDULER_ID
+COST_TYPE_ID = _DEFAULT_COST_TYPE_ID
+TZ = _DEFAULT_TZ
 READ_URL = f"https://app.courtreserve.com/Online/Reservations/ReadConsolidated/{ORG_ID}"
 BOOKING_URL = f"https://app.courtreserve.com/Online/Reservations/Bookings/{ORG_ID}?sId={SCHEDULER_ID}"
+
+DEFAULT_ORG_CONFIG = OrgConfig(
+    org_id=_DEFAULT_ORG_ID,
+    scheduler_id=_DEFAULT_SCHEDULER_ID,
+    cost_type_id=_DEFAULT_COST_TYPE_ID,
+    timezone=_DEFAULT_TZ,
+)
 
 
 @dataclass
@@ -32,10 +76,11 @@ class Slot:
     available_courts: int
     available_court_ids: list[int]
     is_wait_list: bool
+    timezone: str = field(default=_DEFAULT_TZ)
 
     @property
     def start_dt(self) -> datetime:
-        return datetime.fromtimestamp(self.start_ms / 1000, tz=pytz.timezone(TZ))
+        return datetime.fromtimestamp(self.start_ms / 1000, tz=pytz.timezone(self.timezone))
 
     @property
     def start_time(self) -> str:
@@ -54,34 +99,34 @@ def _parse_ms(val: str) -> int:
     return int(val.replace("/Date(", "").replace(")/", ""))
 
 
-def _build_json_data(target_date: date) -> str:
-    la = pytz.timezone(TZ)
-    dt = la.localize(datetime(target_date.year, target_date.month, target_date.day, 12, 0, 0))
+def _build_json_data(target_date: date, org: OrgConfig) -> str:
+    tz = pytz.timezone(org.timezone)
+    dt = tz.localize(datetime(target_date.year, target_date.month, target_date.day, 12, 0, 0))
     utc_dt = dt.astimezone(timezone.utc)
     payload = {
         "startDate": utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-        "orgId": ORG_ID,
-        "TimeZone": TZ,
+        "orgId": org.org_id,
+        "TimeZone": org.timezone,
         "Date": utc_dt.strftime("%a, %d %b %Y %H:%M:%S GMT"),
         "KendoDate": {"Year": target_date.year, "Month": target_date.month, "Day": target_date.day},
         "UiCulture": "en-US",
-        "CostTypeId": COST_TYPE_ID,
-        "CustomSchedulerId": SCHEDULER_ID,
+        "CostTypeId": org.cost_type_id,
+        "CustomSchedulerId": org.scheduler_id,
         "ReservationMinInterval": "60",
     }
     return json.dumps(payload)
 
 
-def get_available_slots(page: Page, target_date: date) -> list[Slot]:
-    json_data = _build_json_data(target_date)
+def get_available_slots(page: Page, target_date: date, org: OrgConfig = DEFAULT_ORG_CONFIG) -> list[Slot]:
+    json_data = _build_json_data(target_date, org)
     post_body = f"sort=&group=&filter=&jsonData={quote(json_data)}"
 
     response = page.request.post(
-        READ_URL,
+        org.read_url,
         headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": BOOKING_URL,
+            "Referer": org.booking_url,
         },
         data=post_body,
     )
@@ -101,6 +146,7 @@ def get_available_slots(page: Page, target_date: date) -> list[Slot]:
             available_courts=available,
             available_court_ids=item.get("AvailableCourtIds", []),
             is_wait_list=item.get("IsWaitListSlot", False),
+            timezone=org.timezone,
         ))
     return slots
 
@@ -119,6 +165,17 @@ def find_best_slot(slots: list[Slot], preferred_times: list[str]) -> Optional[Sl
     return slots[0]
 
 
+def _classify_booking_error(msg: str) -> BookingError:
+    lower = msg.lower()
+    if "only allowed to reserve up to" in lower:
+        return BookingWindowError(msg)
+    if "no available courts" in lower:
+        return NoAvailableCourtsError(msg)
+    if "restricted to" in lower and ("per day" in lower or "court" in lower):
+        return AlreadyBookedError(msg)
+    return BookingError(msg)
+
+
 def _navigate_to_date(page: Page, target_date: date) -> None:
     js_date = f"new Date({target_date.year}, {target_date.month - 1}, {target_date.day})"
     page.evaluate(f"""
@@ -128,7 +185,7 @@ def _navigate_to_date(page: Page, target_date: date) -> None:
     page.wait_for_timeout(3000)
 
 
-def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60) -> bool:
+def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
     print(f"Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
 
     # Ensure we're on the booking page
@@ -141,8 +198,9 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60) 
 
     slot_label = slot.start_dt.strftime("%-I:%M %p").upper()  # e.g. "9:30 AM"
 
-    # Find the time label row index and compute the content row offset.
-    # Time label rows start with 2 empty rows before the first actual label.
+    # Find the time cell, scroll it into view, then return its viewport coordinates.
+    # Without scrollIntoView, cells below the fold have y > viewport height and the
+    # mouse click lands off-screen, producing no modal.
     bbox = page.evaluate(f"""
         (function() {{
             var timeRows = document.querySelectorAll(".k-scheduler-times tr");
@@ -158,6 +216,7 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60) 
             if (contentRowIdx >= contentRows.length) return null;
             var cell = contentRows[contentRowIdx].querySelector("td");
             if (!cell) return null;
+            cell.scrollIntoView({{behavior: "instant", block: "center"}});
             var r = cell.getBoundingClientRect();
             return {{x: r.x + r.width / 2, y: r.y + r.height / 2}};
         }})()
@@ -167,12 +226,13 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60) 
         print(f"Could not find time slot for {slot_label} in the scheduler grid.")
         return False
 
+    page.wait_for_timeout(300)  # let scroll settle
     page.mouse.click(bbox['x'], bbox['y'])
     page.wait_for_timeout(2000)
-    return _handle_booking_modal(page, slot, duration_minutes)
+    return _handle_booking_modal(page, slot, duration_minutes, dry_run=dry_run)
 
 
-def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int) -> bool:
+def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run: bool = False) -> bool:
     modal = page.query_selector("#create-res-modal, .modal-content")
     if not modal:
         print("No booking modal appeared after clicking slot.")
@@ -190,15 +250,45 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int) -> bool
     # Confirm Save button is present (modal fully rendered)
     save_btn = page.wait_for_selector('button[type="button"]:has-text("Save")', state="visible", timeout=5000)
 
-    # Set duration via Kendo DropDownList API
-    page.evaluate(f"""(function() {{
-        var w = $("#Duration").data("kendoDropDownList");
-        if (w) {{ w.value("{duration_minutes}"); w.trigger("change"); }}
-    }})()""")
-    page.wait_for_timeout(500)
+    # Set duration via Kendo DropDownList.
+    # duration_minutes=0 means "any" — leave the widget at its default.
+    if duration_minutes > 0:
+        duration_options = page.evaluate("""(function() {
+            var w = $("#Duration").data("kendoDropDownList");
+            if (!w) return [];
+            var vf = w.options.dataValueField;
+            var opts = [];
+            var ds = w.dataSource.data();
+            for (var i = 0; i < ds.length; i++) {
+                opts.push(String(ds[i][vf] !== undefined ? ds[i][vf] : ds[i][w.options.dataTextField]));
+            }
+            return opts;
+        })()""")
 
-    end_time = page.evaluate("(function(){ return document.getElementById('EndTime')?.value; })()")
-    print(f"Duration={duration_minutes} min  EndTime={end_time}")
+        target_str = str(duration_minutes)
+        if target_str in duration_options:
+            kendo_value = target_str
+        elif duration_options:
+            kendo_value = min(duration_options, key=lambda v: abs(int(v) - duration_minutes) if v.isdigit() else 9999)
+            print(f"Duration {duration_minutes} not in options {duration_options} — using nearest: {kendo_value}")
+        else:
+            kendo_value = target_str
+
+        page.evaluate(f"""(function() {{
+            var w = $("#Duration").data("kendoDropDownList");
+            if (w) {{ w.value("{kendo_value}"); w.trigger("change"); }}
+        }})()""")
+        page.wait_for_timeout(500)
+
+        end_time = page.evaluate("(function(){ return document.getElementById('EndTime')?.value; })()")
+        print(f"Duration={duration_minutes} min (kendo={kendo_value})  EndTime={end_time}  AvailableOptions={duration_options}")
+    else:
+        print("Duration=any — using CourtReserve default")
+
+    if dry_run:
+        print("DRY RUN — stopping before Save. Modal is open; close the browser to exit.")
+        page.wait_for_timeout(8000)
+        return False
 
     # Accept the disclosure checkbox
     page.evaluate("""(function() {
@@ -210,29 +300,34 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int) -> bool
     save_btn.click()
     page.wait_for_timeout(4000)
 
-    # Check for error notice/popup (CourtReserve shows a "Reservation Notice" dialog on failure)
+    # Check for error notice/popup (CourtReserve shows a pnotify/swal dialog on failure).
+    # Do NOT include generic modal selectors here — they match the booking form itself.
     notice = page.query_selector(
         '.pnotify, .ui-pnotify, [class*="pnotify"], '
-        '.sweetalert, .swal2-container, '
-        '.modal.in .modal-body, .modal:visible .modal-body'
+        '.sweetalert, .swal2-container'
     )
     if notice:
         msg = notice.inner_text().strip()
-        if msg and "reservation" in msg.lower():
-            print(f"Booking blocked: {msg}")
-            return False
+        if msg:
+            if "reservation confirmed" in msg.lower():
+                print("Booking confirmed! (popup)")
+                return True
+            err = _classify_booking_error(msg)
+            print(f"Booking blocked [{type(err).__name__}]: {msg}")
+            raise err
 
     # Broader page text check for inline error messages
     page_text = page.evaluate("(function(){ return document.body.innerText; })()")
     if "Reservation Confirmed" in page_text:
         print("Booking confirmed!")
         return True
-    for marker in ["is only allowed", "not allowed", "cannot reserve"]:
+    for marker in ["is only allowed", "not allowed", "cannot reserve", "restricted to", "no available courts"]:
         if marker in page_text:
             idx = page_text.find(marker)
             snippet = page_text[max(0, idx-30):idx+120].strip()
-            print(f"Booking blocked: {snippet}")
-            return False
+            err = _classify_booking_error(snippet)
+            print(f"Booking blocked [{type(err).__name__}]: {snippet}")
+            raise err
 
     # Check if booking page still shows an open modal (failure) vs. closed (success)
     open_modal = page.query_selector("#create-res-modal:visible, .modal.show #create-res-modal")
@@ -246,9 +341,9 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int) -> bool
     return True
 
 
-def cancel_reservation(page: Page, reservation_id: str) -> bool:
+def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT_ORG_CONFIG) -> bool:
     reason = random.choice(CANCEL_REASONS)
-    detail_url = f"https://app.courtreserve.com/Online/MyProfile/Reservation/{ORG_ID}/{reservation_id}"
+    detail_url = f"https://app.courtreserve.com/Online/MyProfile/Reservation/{org.org_id}/{reservation_id}"
     print(f"Cancelling reservation {reservation_id} (reason: '{reason}')...")
 
     page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)

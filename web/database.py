@@ -1,0 +1,136 @@
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+from sqlalchemy import create_engine, event, text
+from sqlalchemy import (
+    Column, Integer, String, Text, DateTime, Boolean, ForeignKey,
+    MetaData, Table,
+)
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / ".court-reserve-data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "court_reserve.db"
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_conn, _):
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")   # concurrent readers+writers
+    cur.execute("PRAGMA busy_timeout=30000") # retry for up to 30s on lock
+    cur.close()
+metadata = MetaData()
+
+organizations = Table("organizations", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("org_id", String, nullable=False),
+    Column("scheduler_id", String, nullable=False),
+    Column("cost_type_id", String, nullable=False),
+    Column("timezone", String, nullable=False, default="America/Los_Angeles"),
+    Column("preferred_times", Text, default="[]"),   # JSON list
+    Column("preferred_courts", Text, default="[]"),  # JSON list
+    Column("default_duration", Integer, default=120),
+    Column("days_out", Integer, default=7),
+    Column("release_hour", Integer, default=12),     # local hour when slots open
+    Column("release_minute", Integer, default=0),
+)
+
+accounts = Table("accounts", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("org_id", Integer, ForeignKey("organizations.id"), nullable=False),
+    Column("label", String, default=""),             # friendly name e.g. "Alice"
+    Column("email", String, nullable=False),
+    Column("password", String, nullable=False),
+    Column("session_file", String, default=""),      # path to playwright storage state
+)
+
+jobs = Table("jobs", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("account_id", Integer, ForeignKey("accounts.id"), nullable=False),
+    Column("org_id", Integer, ForeignKey("organizations.id"), nullable=False),
+    Column("type", String, nullable=False),          # "book_next" | "watch"
+    Column("params", Text, default="{}"),            # JSON
+    Column("status", String, default="active"),      # active | paused | completed | failed
+    Column("cron_expr", String, default=""),         # for book_next: "50 11 * * *" (cron)
+    Column("next_run_at", DateTime, nullable=True),
+    Column("created_at", DateTime, default=datetime.utcnow),
+    Column("apscheduler_id", String, default=""),    # APScheduler job id
+)
+
+job_runs = Table("job_runs", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("job_id", Integer, ForeignKey("jobs.id"), nullable=False),
+    Column("started_at", DateTime, default=datetime.utcnow),
+    Column("finished_at", DateTime, nullable=True),
+    Column("status", String, default="running"),     # running | success | failed
+    Column("log_text", Text, default=""),
+)
+
+bookings = Table("bookings", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("job_run_id", Integer, ForeignKey("job_runs.id"), nullable=True),
+    Column("account_id", Integer, ForeignKey("accounts.id"), nullable=False),
+    Column("date", String, nullable=False),          # YYYY-MM-DD
+    Column("start_time", String, nullable=False),    # HH:MM
+    Column("court_type", String, default=""),
+    Column("duration_min", Integer, default=120),
+    Column("confirmed_at", DateTime, default=datetime.utcnow),
+)
+
+
+SEED_ORGS = [
+    dict(name="Lifetime Sunnyvale",   org_id="13233", scheduler_id="16983",  cost_type_id="141205"),
+    dict(name="Lifetime Santa Clara", org_id="13234", scheduler_id="16995",  cost_type_id="141206"),
+    dict(name="Lifetime Cupertino",   org_id="13229", scheduler_id="18246",  cost_type_id="141203"),
+]
+
+
+def init_db():
+    metadata.create_all(engine)
+    _seed_orgs()
+
+
+def _seed_orgs():
+    with engine.connect() as conn:
+        if conn.execute(organizations.select().limit(1)).fetchone():
+            return  # already populated
+    with engine.begin() as conn:
+        for o in SEED_ORGS:
+            conn.execute(organizations.insert().values(
+                name=o["name"],
+                org_id=o["org_id"],
+                scheduler_id=o["scheduler_id"],
+                cost_type_id=o["cost_type_id"],
+                timezone="America/Los_Angeles",
+                preferred_times=json.dumps(["10:00"]),
+                preferred_courts=json.dumps([]),
+                default_duration=120,
+                days_out=7,
+                release_hour=12,
+                release_minute=0,
+            ))
+
+
+def get_conn():
+    return engine.connect()
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def row_to_dict(row) -> dict:
+    return dict(row._mapping)
+
+
+def json_field(val) -> list:
+    if isinstance(val, list):
+        return val
+    try:
+        return json.loads(val or "[]")
+    except Exception:
+        return []

@@ -1,4 +1,7 @@
 org_id: "13233"
+scheduler_id: "16983"
+cost_type_id: "141205"
+timezone: "America/Los_Angeles"
 org_url: "https://app.courtreserve.com/Online/Reservations/Bookings/13233?sId=16983"
 preferred_courts: []   # e.g. ["Court 1", "Court 3"] — empty means any court
 preferred_times: ["10:00"]    # e.g. ["18:00", "19:00"] — empty means any time

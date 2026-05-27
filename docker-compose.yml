@@ -1,7 +1,25 @@
 services:
+  # One-shot CLI runner (original)
   court-reserve:
     build: .
     env_file: .env
     environment:
       TZ: America/Los_Angeles
     command: python main.py book-next
+
+  # Web UI + scheduler
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "8080:8080"
+    volumes:
+      - court_data:/data
+    environment:
+      TZ: America/Los_Angeles
+      DATA_DIR: /data
+    restart: unless-stopped
+
+volumes:
+  court_data:

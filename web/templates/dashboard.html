@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — CourtReserve Manager{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="stat-label">Organizations</div>
+    <div class="stat-value">{{ orgs | length }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Active Jobs</div>
+    <div class="stat-value">{{ active_jobs | selectattr("job_status", "equalto", "active") | list | length }}</div>
+  </div>
+</div>
+
+{% if active_jobs %}
+<div class="card">
+  <div class="card-header">
+    <h2>Scheduled Jobs</h2>
+    <a href="/jobs" class="btn btn-ghost btn-sm">Manage</a>
+  </div>
+  <table>
+    <thead><tr>
+      <th>Type</th><th>Org</th><th>Account</th><th>Target</th><th>Status</th><th>Details</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for j in active_jobs %}
+    <tr>
+      <td><span class="badge badge-{{ j.job_type }}">{{ j.job_type }}</span></td>
+      <td>{{ j.org_name }}</td>
+      <td>{{ j.account_label }}</td>
+      <td>
+        {{ j.params.date or "—" }}
+        {% if j.params.time %}<span style="color:var(--muted)"> {{ j.params.time }}</span>{% endif %}
+      </td>
+      <td><span class="badge badge-{{ j.job_status }}">{{ j.job_status }}</span></td>
+      <td style="font-size:12px;color:var(--muted)">
+        {% if j.job_type == "watch" %}
+          {% if j.last_check %}
+            check: {{ j.last_check }}
+          {% elif j.run_status == "running" %}
+            <span style="color:var(--yellow)">starting…</span>
+          {% else %}
+            —
+          {% endif %}
+        {% else %}
+          {% if j.params.run_at %}
+            fires: {{ j.params.run_at }}
+          {% else %}
+            fires: org release time
+          {% endif %}
+        {% endif %}
+      </td>
+      <td>
+        {% if j.run_id %}
+        <a href="/jobs/{{ j.job_id }}/runs" class="btn btn-ghost btn-sm">Log</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if orgs %}
+<div class="card">
+  <div class="card-header">
+    <h2>Organizations</h2>
+    <a href="/orgs" class="btn btn-ghost btn-sm">Manage</a>
+  </div>
+  <table>
+    <thead><tr>
+      <th>Name</th><th>Org ID</th><th>Timezone</th><th>Days Out</th><th>Release Time</th>
+    </tr></thead>
+    <tbody>
+    {% for o in orgs %}
+    <tr>
+      <td>{{ o.name }}</td>
+      <td><code>{{ o.org_id }}</code></td>
+      <td>{{ o.timezone }}</td>
+      <td>{{ o.days_out }}</td>
+      <td>{{ "%02d"|format(o.release_hour) }}:{{ "%02d"|format(o.release_minute) }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card">
+  <div class="empty-state">
+    <p>No organizations yet.</p>
+    <br/>
+    <a href="/orgs" class="btn btn-primary">Add Organization</a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} — CourtReserve Manager{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px">
+  <a href="/jobs/{{ job.id }}/runs" style="color:var(--muted);text-decoration:none">← Back to runs</a>
+</div>
+<h1>Run #{{ run.id }}</h1>
+<p style="color:var(--muted);margin-bottom:6px">
+  Job: <strong>{{ job.type }}</strong> &nbsp;·&nbsp;
+  Org: <strong>{{ org.name }}</strong> &nbsp;·&nbsp;
+  Account: <strong>{{ account.label or account.email }}</strong>
+</p>
+<p style="color:var(--muted);margin-bottom:24px">
+  Started: {{ run.started_at }} &nbsp;·&nbsp;
+  Finished: {{ run.finished_at or "still running" }} &nbsp;·&nbsp;
+  Status: <span class="badge badge-{{ run.status }}">{{ run.status }}</span>
+</p>
+
+<div class="card">
+  <div class="card-header">
+    <h2>Log Output</h2>
+    {% if run.status == "running" %}
+    <span style="color:var(--yellow);font-size:12px">● live</span>
+    {% endif %}
+  </div>
+  <div class="log-box"
+    {% if run.status == "running" %}
+      id="log-content"
+      hx-get="/runs/{{ run.id }}/log"
+      hx-trigger="every 2s"
+      hx-target="#log-content"
+      hx-swap="innerHTML"
+    {% endif %}>
+    {{ run.log_text or "(no output)" }}
+  </div>
+</div>
+{% endblock %}

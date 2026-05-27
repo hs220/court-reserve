@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ org.name }} — CourtReserve Manager{% endblock %}
+{% block content %}
+<h1>Edit: {{ org.name }}</h1>
+<div class="card">
+  <form method="post" action="/orgs/{{ org.id }}/edit">
+    <div class="form-grid">
+      <div class="form-group"><label>Name</label><input name="name" value="{{ org.name }}" required></div>
+      <div class="form-group"><label>Org ID</label><input name="org_id" value="{{ org.org_id }}" required></div>
+      <div class="form-group"><label>Scheduler ID</label><input name="scheduler_id" value="{{ org.scheduler_id }}" required></div>
+      <div class="form-group"><label>Cost Type ID</label><input name="cost_type_id" value="{{ org.cost_type_id }}" required></div>
+      <div class="form-group"><label>Timezone</label>
+        <select name="timezone">
+          {% for tz in ["America/Los_Angeles","America/New_York","America/Chicago","America/Denver"] %}
+          <option value="{{ tz }}" {% if org.timezone == tz %}selected{% endif %}>{{ tz }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-group"><label>Days Out</label><input name="days_out" type="number" value="{{ org.days_out }}"></div>
+      <div class="form-group"><label>Default Duration (min)</label><input name="default_duration" type="number" value="{{ org.default_duration }}"></div>
+      <div class="form-group"><label>Release Hour (local)</label><input name="release_hour" type="number" value="{{ org.release_hour }}" min="0" max="23"></div>
+      <div class="form-group"><label>Release Minute</label><input name="release_minute" type="number" value="{{ org.release_minute }}" min="0" max="59"></div>
+      <div class="form-group" style="grid-column:span 2"><label>Preferred Times (comma-separated)</label><input name="preferred_times" value="{{ org.preferred_times }}"></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary">Save Changes</button>
+      <a href="/orgs" class="btn btn-ghost">Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

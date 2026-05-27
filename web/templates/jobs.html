@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Jobs — CourtReserve Manager{% endblock %}
+{% block content %}
+<div class="card-header">
+  <h1>Jobs</h1>
+  <div class="row-actions">
+    <button id="open-bn-modal" class="btn btn-primary" onclick="document.getElementById('add-book-next-modal').classList.add('open')">+ Book-Next Job</button>
+    <button id="open-watch-modal" class="btn btn-ghost" onclick="document.getElementById('add-watch-modal').classList.add('open')">+ Watch Job</button>
+  </div>
+</div>
+
+{% if jobs %}
+<div class="card">
+  <table>
+    <thead><tr>
+      <th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Next Run</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for j in jobs %}
+    <tr>
+      <td><strong>{{ j.type }}</strong></td>
+      <td>{{ j.org.name if j.org else "—" }}</td>
+      <td>{{ j.account.label or j.account.email if j.account else "—" }}</td>
+      <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+      <td>
+        {% if j.type == "book_next" %}
+          {{ j.params.date or "—" }}
+          <span style="color:var(--muted)">
+            {% if j.params.run_at %} @ {{ j.params.run_at }}{% else %} @ org release time{% endif %}
+          </span>
+        {% else %}
+          {{ j.params.date }} {{ j.params.time or "any time" }} ({{ j.params.duration ~ "min" if j.params.duration else "any duration" }}, poll {{ j.params.interval }}s)
+        {% endif %}
+      </td>
+      <td style="font-size:12px;color:var(--muted)">
+        {% if j.next_run_at %}{{ j.next_run_at.strftime("%m/%d %H:%M") }}{% else %}—{% endif %}
+      </td>
+      <td>
+        <div class="row-actions">
+          <a href="/jobs/{{ j.id }}/runs" class="btn btn-ghost btn-sm">Runs</a>
+          {% if j.type == "book_next" %}
+          <form method="post" action="/jobs/{{ j.id }}/run_now" style="display:inline">
+            <button class="btn btn-success btn-sm" title="Run immediately">▶ Now</button>
+          </form>
+          {% endif %}
+          {% if j.status == "active" %}
+          <form method="post" action="/jobs/{{ j.id }}/pause" style="display:inline">
+            <button class="btn btn-warning btn-sm">Pause</button>
+          </form>
+          {% elif j.status == "paused" %}
+          <form method="post" action="/jobs/{{ j.id }}/resume" style="display:inline">
+            <button class="btn btn-success btn-sm">Resume</button>
+          </form>
+          {% elif j.status in ("failed", "completed") %}
+          <form method="post" action="/jobs/{{ j.id }}/restart" style="display:inline">
+            <button class="btn btn-success btn-sm">↺ Restart</button>
+          </form>
+          {% endif %}
+          <form method="post" action="/jobs/{{ j.id }}/delete" style="display:inline" onsubmit="return confirm('Delete this job?')">
+            <button class="btn btn-danger btn-sm">✕</button>
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card"><div class="empty-state">No jobs scheduled yet.</div></div>
+{% endif %}
+
+<!-- Add Book-Next Modal -->
+<div class="modal-overlay" id="add-book-next-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('add-book-next-modal').classList.remove('open')">✕</button>
+    <h2>New Book-Next Job</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:16px">One-shot: fires at the scheduled time and books the target date. Uses org's release time if "Fire At" is left blank.</p>
+    <form method="post" action="/jobs/book_next">
+      <div class="form-grid">
+        <div class="form-group"><label>Organization</label>
+          <select name="org_db_id" id="bn-org" onchange="filterAccounts('bn')">
+            <option value="">— select —</option>
+            {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Account</label>
+          <select name="account_id" id="bn-account">
+            <option value="">— select org first —</option>
+            {% for a in accounts %}<option value="{{ a.id }}" data-org="{{ a.org_id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Target Date</label>
+          <input id="bn-date" name="date" placeholder="YYYY-MM-DD" autocomplete="off" required>
+        </div>
+        <div class="form-group">
+          <label>Fire At <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for org release time)</span></label>
+          <input id="bn-run-at" name="run_at" placeholder="YYYY-MM-DDTHH:MM" autocomplete="off">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary">Schedule</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('add-book-next-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Add Watch Modal -->
+<div class="modal-overlay" id="add-watch-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('add-watch-modal').classList.remove('open')">✕</button>
+    <h2>New Watch Job</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Polls until a slot opens, then books it immediately.</p>
+    <form method="post" action="/jobs/watch">
+      <div class="form-grid">
+        <div class="form-group"><label>Organization</label>
+          <select name="org_db_id" id="wt-org" onchange="filterAccounts('wt')">
+            <option value="">— select —</option>
+            {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Account</label>
+          <select name="account_id" id="wt-account">
+            <option value="">— select org first —</option>
+            {% for a in accounts %}<option value="{{ a.id }}" data-org="{{ a.org_id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Date</label><input id="wt-date" name="date" placeholder="YYYY-MM-DD" autocomplete="off" required></div>
+        <div class="form-group">
+          <label>Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
+          <input id="wt-time" name="time" placeholder="any available" autocomplete="off">
+        </div>
+        <div class="form-group"><label>Duration</label>
+          <select name="duration">
+            <option value="0">Any (use default)</option>
+            <option value="30">30 min</option>
+            <option value="60">60 min</option>
+            <option value="90">90 min</option>
+            <option value="120" selected>120 min</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Poll Interval (sec)</label><input name="interval" type="number" value="60"></div>
+        <div class="form-group"><label>Timeout (min, 0=∞)</label><input name="timeout" type="number" value="0"></div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary">Start Watching</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('add-watch-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+function filterAccounts(prefix) {
+  const orgId = document.getElementById(prefix + '-org').value;
+  const sel = document.getElementById(prefix + '-account');
+  for (const opt of sel.options) {
+    if (!opt.dataset.org) continue;
+    opt.hidden = opt.dataset.org !== orgId;
+  }
+  sel.value = "";
+}
+
+// Flatpickr for Watch modal
+let watchPickersInit = false;
+document.getElementById('open-watch-modal').addEventListener('click', () => {
+  if (watchPickersInit) return;
+  watchPickersInit = true;
+  flatpickr('#wt-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
+  flatpickr('#wt-time', {
+    enableTime: true, noCalendar: true, dateFormat: 'H:i',
+    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
+  });
+});
+
+// Flatpickr for Book-Next modal
+let bnPickersInit = false;
+document.getElementById('open-bn-modal').addEventListener('click', () => {
+  if (bnPickersInit) return;
+  bnPickersInit = true;
+  flatpickr('#bn-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
+  flatpickr('#bn-run-at', {
+    enableTime: true, dateFormat: 'Y-m-dTH:i',
+    time_24hr: true, minuteIncrement: 5, disableMobile: true, allowInput: true,
+  });
+});
+</script>
+{% endblock %}

@@ -19,3 +19,15 @@ def load_config() -> dict:
     if not cfg["email"] or not cfg["password"]:
         raise ValueError("CR_EMAIL and CR_PASSWORD must be set in .env")
     return cfg
+
+
+def default_org_config():
+    """Return an OrgConfig built from config.yaml. Avoids circular import at module level."""
+    from booking import OrgConfig
+    cfg = load_config()
+    return OrgConfig(
+        org_id=str(cfg.get("org_id", "13233")),
+        scheduler_id=str(cfg.get("scheduler_id", "16983")),
+        cost_type_id=str(cfg.get("cost_type_id", "141205")),
+        timezone=cfg.get("timezone", "America/Los_Angeles"),
+    )
