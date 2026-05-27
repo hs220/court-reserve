@@ -1,0 +1,8 @@
+.env
+*.pyc
+__pycache__/
+.playwright/
+~/.court-reserve-session.json
+*.session.json
+.venv/
+venv/

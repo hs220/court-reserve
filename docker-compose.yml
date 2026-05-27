@@ -1,0 +1,7 @@
+services:
+  court-reserve:
+    build: .
+    env_file: .env
+    environment:
+      TZ: America/Los_Angeles
+    command: python main.py book-next

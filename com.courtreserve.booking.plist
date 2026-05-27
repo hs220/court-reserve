@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.courtreserve.booking</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/hsheng/src/court-reserve/.venv/bin/python</string>
+    <string>/Users/hsheng/src/court-reserve/main.py</string>
+    <string>book-next</string>
+  </array>
+
+  <!-- 11:50 AM PT — browser pre-warms for 10 min, books at noon -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>11</integer>
+    <key>Minute</key><integer>50</integer>
+  </dict>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key><string>America/Los_Angeles</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/hsheng/src/court-reserve</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/court-reserve.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/court-reserve.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
