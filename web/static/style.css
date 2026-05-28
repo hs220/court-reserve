@@ -176,7 +176,7 @@ span.flatpickr-weekday { background: transparent; color: var(--muted); font-size
 .sidebar-backdrop { display: none; }
 
 /* ── Mobile responsive ── */
-@media (max-width: 700px) {
+@media (max-width: 768px) {
   .mobile-header {
     display: flex;
     align-items: center;
@@ -209,12 +209,13 @@ span.flatpickr-weekday { background: transparent; color: var(--muted); font-size
   .sidebar-backdrop.open { display: block; }
 
   .sidebar {
-    transform: translateX(-100%);
-    transition: transform .22s ease;
+    display: none;
+    position: fixed;
+    top: 0; left: 0;
+    height: 100vh;
     z-index: 300;
-    top: 0;
   }
-  .sidebar.open { transform: translateX(0); }
+  .sidebar.open { display: flex; }
   .sidebar-logo { display: block; }
 
   .content {
