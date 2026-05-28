@@ -35,13 +35,51 @@ DATA_DIR=~/.court-reserve-data python web_main.py
 
 # Docker — web UI (NAS deployment)
 docker compose up web --build
-# → http://<nas-ip>:8080
+# → http://<nas-ip>:7000
 
 # Docker — one-shot CLI runner
 docker build -t court-reserve .
 docker run --rm --env-file .env court-reserve python main.py list --date YYYY-MM-DD
 docker compose run --rm court-reserve
+
+# Deploy to Synology NAS (after initial setup below)
+./deploy.sh
 ```
+
+## Synology NAS Deployment
+
+**Target:** `hsheng@192.168.68.70`, repo at `/volume1/docker/court-reserve/court-reserve/`
+**URL:** http://192.168.68.70:7000
+
+**One-time NAS setup:**
+```bash
+# 1. Enable SSH: DSM → Control Panel → Terminal & SNMP
+# 2. Copy SSH public key from your Mac
+ssh-copy-id hsheng@192.168.68.70
+
+# 3. SSH in and add GitHub host key
+ssh hsheng@192.168.68.70
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+# 4. Allow passwordless docker (run as admin/root on NAS)
+echo 'hsheng ALL=(ALL) NOPASSWD: /usr/local/bin/docker' | sudo tee /etc/sudoers.d/docker-hsheng
+
+# 5. Clone the repo
+git clone git@github.com:hs220/court-reserve.git /volume1/docker/court-reserve/court-reserve
+
+# 6. Copy .env with credentials (run from your Mac)
+cat .env | ssh hsheng@192.168.68.70 "cat > /volume1/docker/court-reserve/court-reserve/.env"
+```
+
+**Ongoing deploys** (from your Mac, in the repo root):
+```bash
+./deploy.sh   # git pull on NAS + docker compose up web --build -d
+```
+
+**Notes:**
+- Docker binary is at `/usr/local/bin/docker` (not in default SSH `$PATH`)
+- `scp`/`sftp` subsystem is disabled on this NAS; use `cat | ssh` to transfer files
+- Data volume (`court_data`) is managed by Docker under `/volume1/@docker/volumes/`
 
 ## Architecture
 
