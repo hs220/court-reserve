@@ -140,10 +140,11 @@ async def dashboard(request: Request, week: str = None):
 async def list_orgs(request: Request):
     with engine.connect() as conn:
         orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
-        for o in orgs:
-            accs = conn.execute(accounts.select().where(accounts.c.org_id == o["id"])).fetchall()
-            o["accounts"] = [row_to_dict(a) for a in accs]
-    return templates.TemplateResponse(request, "orgs.html", context={"orgs": orgs})
+        all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
+    return templates.TemplateResponse(request, "orgs.html", context={
+        "orgs": orgs,
+        "all_accounts": all_accounts,
+    })
 
 
 @router.post("/orgs", response_class=HTMLResponse)
@@ -203,47 +204,45 @@ async def update_org(
 @router.post("/orgs/{org_db_id}/delete")
 async def delete_org(org_db_id: int):
     with engine.begin() as conn:
-        conn.execute(accounts.delete().where(accounts.c.org_id == org_db_id))
         conn.execute(organizations.delete().where(organizations.c.id == org_db_id))
     return RedirectResponse("/orgs", status_code=303)
 
 
 # ── Accounts ──────────────────────────────────────────────────────────────────
 
-@router.post("/orgs/{org_db_id}/accounts", response_class=HTMLResponse)
+@router.post("/accounts", response_class=HTMLResponse)
 async def create_account(
     request: Request,
-    org_db_id: int,
     label: str = Form(""),
     email: str = Form(...),
     password: str = Form(...),
+    verify_org_id: str = Form(""),
 ):
-    with engine.connect() as conn:
-        org = row_to_dict(conn.execute(
-            organizations.select().where(organizations.c.id == org_db_id)
-        ).fetchone())
-
-    session_file = DATA_DIR / f"session_{email.replace('@', '_').replace('.', '_')}.json"
-    org_url = f"https://app.courtreserve.com/Online/Reservations/Bookings/{org['org_id']}?sId={org['scheduler_id']}"
-
-    ok, msg = await run_in_threadpool(_verify_login, email, password, org_url, session_file)
+    ok, msg = True, ""
+    if verify_org_id:
+        with engine.connect() as conn:
+            org_row = conn.execute(
+                organizations.select().where(organizations.c.id == int(verify_org_id))
+            ).fetchone()
+        if org_row:
+            org = row_to_dict(org_row)
+            org_url = f"https://app.courtreserve.com/Online/Reservations/Bookings/{org['org_id']}?sId={org['scheduler_id']}"
+            tmp_session = DATA_DIR / f"session_verify_{email.replace('@','_').replace('.','_')}.json"
+            ok, msg = await run_in_threadpool(_verify_login, email, password, org_url, tmp_session)
 
     if not ok:
-        # Re-render the full orgs page with the error surfaced next to this org
         with engine.connect() as conn:
             orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
-            for o in orgs:
-                accs = conn.execute(accounts.select().where(accounts.c.org_id == o["id"])).fetchall()
-                o["accounts"] = [row_to_dict(a) for a in accs]
+            all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
         return templates.TemplateResponse(request, "orgs.html", context={
             "orgs": orgs,
-            "account_error": {"org_id": org_db_id, "message": msg},
+            "all_accounts": all_accounts,
+            "account_error": msg,
         }, status_code=200)
 
     with engine.begin() as conn:
         conn.execute(accounts.insert().values(
-            org_id=org_db_id, label=label, email=email,
-            password=password, session_file=str(session_file),
+            org_id=None, label=label, email=email, password=password, session_file="",
         ))
     return RedirectResponse("/orgs", status_code=303)
 

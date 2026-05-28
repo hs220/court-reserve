@@ -40,11 +40,11 @@ organizations = Table("organizations", metadata,
 
 accounts = Table("accounts", metadata,
     Column("id", Integer, primary_key=True),
-    Column("org_id", Integer, ForeignKey("organizations.id"), nullable=False),
+    Column("org_id", Integer, ForeignKey("organizations.id"), nullable=True),  # nullable: accounts are org-independent
     Column("label", String, default=""),             # friendly name e.g. "Alice"
     Column("email", String, nullable=False),
     Column("password", String, nullable=False),
-    Column("session_file", String, default=""),      # path to playwright storage state
+    Column("session_file", String, default=""),
 )
 
 jobs = Table("jobs", metadata,
@@ -91,6 +91,34 @@ SEED_ORGS = [
 def init_db():
     metadata.create_all(engine)
     _seed_orgs()
+    _migrate_accounts_org_optional()
+
+
+def _migrate_accounts_org_optional():
+    """Make accounts.org_id nullable if it isn't already (SQLite requires table recreation)."""
+    import re
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'"
+        )).fetchone()
+        if not row:
+            return
+        if not re.search(r'org_id[^,)]*NOT NULL', row[0] or "", re.IGNORECASE):
+            return  # already nullable
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE accounts_new (
+                id INTEGER NOT NULL PRIMARY KEY,
+                org_id INTEGER REFERENCES organizations (id),
+                label VARCHAR DEFAULT '',
+                email VARCHAR NOT NULL,
+                password VARCHAR NOT NULL,
+                session_file VARCHAR DEFAULT ''
+            )
+        """))
+        conn.execute(text("INSERT INTO accounts_new SELECT * FROM accounts"))
+        conn.execute(text("DROP TABLE accounts"))
+        conn.execute(text("ALTER TABLE accounts_new RENAME TO accounts"))
 
 
 def _seed_orgs():

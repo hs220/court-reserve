@@ -64,13 +64,17 @@ from scheduler import wait_until
 from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict
 
 
-def _get_account_and_org(account_id: int) -> tuple[dict, dict]:
+def _get_account_and_org(job_id: int, account_id: int) -> tuple[dict, dict]:
+    """Look up account and org; org comes from the job's org_id, not the account."""
     with engine.connect() as conn:
         acc = conn.execute(
             accounts.select().where(accounts.c.id == account_id)
         ).fetchone()
+        job_row = conn.execute(
+            jobs.select().where(jobs.c.id == job_id)
+        ).fetchone()
         org = conn.execute(
-            organizations.select().where(organizations.c.id == acc.org_id)
+            organizations.select().where(organizations.c.id == job_row.org_id)
         ).fetchone()
     return row_to_dict(acc), row_to_dict(org)
 
@@ -84,12 +88,10 @@ def _org_config(org: dict) -> OrgConfig:
     )
 
 
-def _session_file(account: dict) -> Path:
-    sf = account.get("session_file", "")
-    if sf:
-        return Path(sf)
+def _session_file(account: dict, org: dict) -> Path:
+    """Per-account-per-org session file so different orgs don't clobber each other's cookies."""
     from web.database import DATA_DIR
-    return DATA_DIR / f"session_{account['id']}.json"
+    return DATA_DIR / f"session_{account['id']}_{org['id']}.json"
 
 
 def _start_run(job_id: int) -> int:
@@ -136,9 +138,9 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
     buf = io.StringIO()
     status = "failed"
     try:
-        account, org = _get_account_and_org(account_id)
+        account, org = _get_account_and_org(job_id, account_id)
         org_cfg = _org_config(org)
-        session_file = _session_file(account)
+        session_file = _session_file(account, org)
         preferred_times = [target_time] if target_time else []
         default_duration = duration_override if duration_override > 0 else 0
         days_out = org.get("days_out", 7)
@@ -249,9 +251,9 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
     status = "failed"
     slot = None
     try:
-        account, org = _get_account_and_org(account_id)
+        account, org = _get_account_and_org(job_id, account_id)
         org_cfg = _org_config(org)
-        session_file = _session_file(account)
+        session_file = _session_file(account, org)
         target_date = date.fromisoformat(target_date_iso)
 
         time_desc = target_time if target_time else "any time"

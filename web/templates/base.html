@@ -10,7 +10,14 @@
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
 </head>
 <body>
-  <nav class="sidebar">
+  <header class="mobile-header">
+    <button class="hamburger" id="nav-toggle" aria-label="Menu">
+      <span></span><span></span><span></span>
+    </button>
+    <span class="mobile-logo">🎾 CR Manager</span>
+  </header>
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+  <nav class="sidebar" id="sidebar">
     <div class="sidebar-logo">🎾 CR Manager</div>
     <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}">Dashboard</a>
     <a href="/orgs" class="nav-link {% if '/orgs' in request.url.path %}active{% endif %}">Organizations</a>
@@ -21,6 +28,19 @@
     {% block content %}{% endblock %}
   </main>
   <script>
+  (function() {
+    var toggle = document.getElementById('nav-toggle');
+    var sidebar = document.getElementById('sidebar');
+    var backdrop = document.getElementById('sidebar-backdrop');
+    function close() { sidebar.classList.remove('open'); backdrop.classList.remove('open'); }
+    toggle.addEventListener('click', function() {
+      var open = sidebar.classList.toggle('open');
+      backdrop.classList.toggle('open', open);
+    });
+    backdrop.addEventListener('click', close);
+    sidebar.querySelectorAll('.nav-link').forEach(function(a) { a.addEventListener('click', close); });
+  })();
+
   document.addEventListener('submit', function(e) {
     var form = e.target;
     var btn = form.querySelector('button[type="submit"][data-loading], button[data-loading]:not([type])');

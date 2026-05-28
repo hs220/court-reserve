@@ -82,15 +82,15 @@
     <form method="post" action="/jobs/book_next">
       <div class="form-grid">
         <div class="form-group"><label>Organization</label>
-          <select name="org_db_id" id="bn-org" onchange="filterAccounts('bn')">
+          <select name="org_db_id" id="bn-org">
             <option value="">— select —</option>
             {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Account</label>
           <select name="account_id" id="bn-account">
-            <option value="">— select org first —</option>
-            {% for a in accounts %}<option value="{{ a.id }}" data-org="{{ a.org_id }}">{{ a.label or a.email }}</option>{% endfor %}
+            <option value="">— select —</option>
+            {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Target Date</label>
@@ -131,15 +131,15 @@
     <form method="post" action="/jobs/watch">
       <div class="form-grid">
         <div class="form-group"><label>Organization</label>
-          <select name="org_db_id" id="wt-org" onchange="filterAccounts('wt')">
+          <select name="org_db_id" id="wt-org">
             <option value="">— select —</option>
             {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Account</label>
           <select name="account_id" id="wt-account">
-            <option value="">— select org first —</option>
-            {% for a in accounts %}<option value="{{ a.id }}" data-org="{{ a.org_id }}">{{ a.label or a.email }}</option>{% endfor %}
+            <option value="">— select —</option>
+            {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Date</label><input id="wt-date" name="date" placeholder="YYYY-MM-DD" autocomplete="off" required></div>
@@ -168,16 +168,6 @@
 </div>
 
 <script>
-function filterAccounts(prefix) {
-  const orgId = document.getElementById(prefix + '-org').value;
-  const sel = document.getElementById(prefix + '-account');
-  for (const opt of sel.options) {
-    if (!opt.dataset.org) continue;
-    opt.hidden = opt.dataset.org !== orgId;
-  }
-  sel.value = "";
-}
-
 // Flatpickr for Watch modal
 let watchPickersInit = false;
 document.getElementById('open-watch-modal').addEventListener('click', () => {

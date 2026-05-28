@@ -2,36 +2,24 @@
 {% block title %}Organizations — CourtReserve Manager{% endblock %}
 {% block content %}
 <div class="card-header">
-  <h1>Organizations</h1>
-  <button class="btn btn-primary" onclick="document.getElementById('add-org-modal').classList.add('open')">+ Add Org</button>
+  <h1>Organizations &amp; Accounts</h1>
+  <div class="row-actions">
+    <button class="btn btn-ghost" onclick="document.getElementById('add-account-modal').classList.add('open')">+ Add Account</button>
+    <button class="btn btn-primary" onclick="document.getElementById('add-org-modal').classList.add('open')">+ Add Org</button>
+  </div>
 </div>
 
-{% for o in orgs %}
+<!-- Global Accounts -->
 <div class="card">
-  <div class="card-header">
-    <h2>{{ o.name }} <small style="color:var(--muted);font-weight:400;font-size:13px">org_id: {{ o.org_id }}</small></h2>
-    <div class="row-actions">
-      <a href="/orgs/{{ o.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
-      <form method="post" action="/orgs/{{ o.id }}/delete" style="display:inline" onsubmit="return confirm('Delete org and all accounts?')">
-        <button class="btn btn-danger btn-sm">Delete</button>
-      </form>
-    </div>
-  </div>
-
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;font-size:13px">
-    <div><span style="color:var(--muted)">Scheduler ID:</span> {{ o.scheduler_id }}</div>
-    <div><span style="color:var(--muted)">Cost Type ID:</span> {{ o.cost_type_id }}</div>
-    <div><span style="color:var(--muted)">Timezone:</span> {{ o.timezone }}</div>
-    <div><span style="color:var(--muted)">Days out:</span> {{ o.days_out }}</div>
-    <div><span style="color:var(--muted)">Release:</span> {{ "%02d"|format(o.release_hour) }}:{{ "%02d"|format(o.release_minute) }} local</div>
-  </div>
-
-  <h2>Accounts</h2>
-  {% if o.accounts %}
-  <table style="margin-bottom:16px">
+  <div class="card-header"><h2>Accounts</h2></div>
+  {% if all_accounts %}
+  {% if account_error %}
+  <div class="verify-error" style="margin-bottom:12px">✕ {{ account_error }}</div>
+  {% endif %}
+  <table>
     <thead><tr><th>Label</th><th>Email</th><th>Calendar</th><th></th></tr></thead>
     <tbody>
-    {% for a in o.accounts %}
+    {% for a in all_accounts %}
     <tr>
       <td>{{ a.label or "—" }}</td>
       <td>{{ a.email }}</td>
@@ -46,27 +34,61 @@
     </tbody>
   </table>
   {% else %}
-  <p style="color:var(--muted);margin-bottom:12px">No accounts yet.</p>
+  <p style="color:var(--muted)">No accounts yet.{% if account_error %} <span class="verify-error">✕ {{ account_error }}</span>{% endif %}</p>
   {% endif %}
+</div>
 
-  <details {% if account_error and account_error.org_id == o.id %}open{% endif %}>
-    <summary class="btn btn-ghost btn-sm" style="cursor:pointer">+ Add Account</summary>
-    <form method="post" action="/orgs/{{ o.id }}/accounts" style="margin-top:14px">
-      <div class="form-grid">
-        <div class="form-group"><label>Label (optional)</label><input name="label" placeholder="e.g. Alice"></div>
-        <div class="form-group"><label>Email</label><input name="email" type="email" required></div>
-        <div class="form-group"><label>Password</label><input name="password" type="password" required></div>
-      </div>
-      {% if account_error and account_error.org_id == o.id %}
-      <div class="verify-error" style="margin-top:8px">✕ {{ account_error.message }}</div>
-      {% endif %}
-      <div class="form-actions"><button type="submit" class="btn btn-primary" data-loading="Verifying…">Verify &amp; Add</button></div>
-    </form>
-  </details>
+<!-- Organizations -->
+{% for o in orgs %}
+<div class="card">
+  <div class="card-header">
+    <h2>{{ o.name }} <small style="color:var(--muted);font-weight:400;font-size:13px">org_id: {{ o.org_id }}</small></h2>
+    <div class="row-actions">
+      <a href="/orgs/{{ o.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
+      <form method="post" action="/orgs/{{ o.id }}/delete" style="display:inline" onsubmit="return confirm('Delete this org?')">
+        <button class="btn btn-danger btn-sm">Delete</button>
+      </form>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px">
+    <div><span style="color:var(--muted)">Scheduler ID:</span> {{ o.scheduler_id }}</div>
+    <div><span style="color:var(--muted)">Cost Type ID:</span> {{ o.cost_type_id }}</div>
+    <div><span style="color:var(--muted)">Timezone:</span> {{ o.timezone }}</div>
+    <div><span style="color:var(--muted)">Days out:</span> {{ o.days_out }}</div>
+    <div><span style="color:var(--muted)">Release:</span> {{ "%02d"|format(o.release_hour) }}:{{ "%02d"|format(o.release_minute) }} local</div>
+  </div>
 </div>
 {% else %}
 <div class="card"><div class="empty-state">No organizations yet. Add one below.</div></div>
 {% endfor %}
+
+<!-- Add Account Modal -->
+<div class="modal-overlay" id="add-account-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('add-account-modal').classList.remove('open')">✕</button>
+    <h2>Add Account</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Accounts can be used with any organization. Optionally verify credentials against an org now.</p>
+    <form method="post" action="/accounts">
+      <div class="form-grid">
+        <div class="form-group"><label>Label (optional)</label><input name="label" placeholder="e.g. Alice"></div>
+        <div class="form-group"><label>Email</label><input name="email" type="email" required></div>
+        <div class="form-group"><label>Password</label><input name="password" type="password" required></div>
+        <div class="form-group">
+          <label>Verify against org <span style="color:var(--muted);font-weight:400;text-transform:none">(optional)</span></label>
+          <select name="verify_org_id">
+            <option value="">— skip verification —</option>
+            {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary" data-loading="Saving…">Add Account</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('add-account-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <!-- Add Org Modal -->
 <div class="modal-overlay" id="add-org-modal" onclick="if(event.target===this)this.classList.remove('open')">

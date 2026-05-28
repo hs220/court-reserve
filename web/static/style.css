@@ -164,9 +164,74 @@ span.flatpickr-weekday { background: transparent; color: var(--muted); font-size
 .alert-banner { background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.3); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; color: var(--green); font-size: 13px; }
 
 /* ── Misc ── */
-.row-actions { display: flex; gap: 6px; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .empty-state { color: var(--muted); text-align: center; padding: 40px 0; }
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
 .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
 .stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
 .stat-value { font-size: 28px; font-weight: 700; }
+
+/* ── Mobile header (hidden on desktop) ── */
+.mobile-header { display: none; }
+.sidebar-backdrop { display: none; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 700px) {
+  .mobile-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 52px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 16px;
+    z-index: 200;
+  }
+  .mobile-logo { font-size: 15px; font-weight: 700; color: var(--accent); }
+
+  .hamburger {
+    background: none; border: none; cursor: pointer;
+    display: flex; flex-direction: column; gap: 5px; padding: 4px;
+  }
+  .hamburger span {
+    display: block; width: 22px; height: 2px;
+    background: var(--text); border-radius: 2px;
+  }
+
+  .sidebar-backdrop {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.55);
+    z-index: 299;
+  }
+  .sidebar-backdrop.open { display: block; }
+
+  .sidebar {
+    transform: translateX(-100%);
+    transition: transform .22s ease;
+    z-index: 300;
+    top: 0;
+  }
+  .sidebar.open { transform: translateX(0); }
+  .sidebar-logo { display: block; }
+
+  .content {
+    margin-left: 0;
+    padding: 16px;
+    padding-top: calc(52px + 16px);
+  }
+
+  .form-grid { grid-template-columns: 1fr; }
+
+  /* Make tables scroll horizontally instead of overflowing */
+  .card { overflow-x: auto; }
+  table { min-width: 480px; }
+
+  .card-header { flex-wrap: wrap; gap: 8px; }
+
+  .week-col-headers, .week-time-grid { min-width: 480px; }
+
+  h1 { font-size: 18px; }
+}
