@@ -64,6 +64,58 @@
 </div>
 {% endif %}
 
+<div class="card">
+  <div class="card-header">
+    <h2>{{ week_label }}</h2>
+    <div class="row-actions">
+      <a href="/?week={{ prev_week }}" class="btn btn-ghost btn-sm">‹ Prev</a>
+      <a href="/?week={{ this_week }}" class="btn btn-ghost btn-sm">This Week</a>
+      <a href="/?week={{ next_week }}" class="btn btn-ghost btn-sm">Next ›</a>
+      <form method="post" action="/reservations/sync" style="margin:0">
+        <button class="btn btn-ghost btn-sm" data-loading="⟳ Syncing…">⟳ Sync</button>
+      </form>
+    </div>
+  </div>
+  <!-- Day-name header -->
+  <div class="week-col-headers">
+    <div class="time-gutter-header"></div>
+    {% for d in week_days %}
+    <div class="week-col-header{% if d == today %} week-col-today{% endif %}">
+      <span class="week-day-name">{{ d.strftime("%a") }}</span>
+      <span class="week-day-num">{{ d.strftime("%-d") }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  <!-- Scrollable time grid -->
+  <div class="week-grid-scroll">
+    <div class="week-time-grid">
+      <!-- Time-label column -->
+      <div class="week-time-col">
+        {% for hour in cal_hours %}
+        <div class="time-slot-label">{{ "%02d:00" | format(hour) }}</div>
+        {% endfor %}
+      </div>
+      <!-- One column per day -->
+      {% for d in week_days %}
+      <div class="week-day-col{% if d == today %} week-day-today{% endif %}">
+        {% for b in bookings_by_date.get(d.isoformat(), []) %}
+        <div class="cal-booking-item"
+             style="top:{{ b.top_px }}px; height:{{ b.height_px }}px"
+             title="{{ b.court_type }} · {{ b.duration_min }}min · {{ b.account_label }}">
+          <form method="post" action="/bookings/{{ b.id }}/delete" style="float:right;margin:0"
+                onsubmit="return confirm('Remove this entry from local tracking only.\n\nThe actual CourtReserve reservation is NOT cancelled.')">
+            <button type="submit" class="cal-booking-del" title="Remove from local tracking (does not cancel the reservation)">✕</button>
+          </form>
+          <strong>{{ b.start_time }}</strong> {{ b.account_label }}
+          {% if b.duration_min %}<br><span style="opacity:.7;font-size:10px">{{ b.duration_min }}min</span>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
 {% if orgs %}
 <div class="card">
   <div class="card-header">

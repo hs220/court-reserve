@@ -23,9 +23,7 @@
     <div><span style="color:var(--muted)">Cost Type ID:</span> {{ o.cost_type_id }}</div>
     <div><span style="color:var(--muted)">Timezone:</span> {{ o.timezone }}</div>
     <div><span style="color:var(--muted)">Days out:</span> {{ o.days_out }}</div>
-    <div><span style="color:var(--muted)">Duration:</span> {{ o.default_duration }} min</div>
     <div><span style="color:var(--muted)">Release:</span> {{ "%02d"|format(o.release_hour) }}:{{ "%02d"|format(o.release_minute) }} local</div>
-    <div><span style="color:var(--muted)">Preferred times:</span> {{ o.preferred_times | join(", ") or "any" }}</div>
   </div>
 
   <h2>Accounts</h2>
@@ -62,7 +60,7 @@
       {% if account_error and account_error.org_id == o.id %}
       <div class="verify-error" style="margin-top:8px">✕ {{ account_error.message }}</div>
       {% endif %}
-      <div class="form-actions"><button type="submit" class="btn btn-primary">Verify &amp; Add</button></div>
+      <div class="form-actions"><button type="submit" class="btn btn-primary" data-loading="Verifying…">Verify &amp; Add</button></div>
     </form>
   </details>
 </div>
@@ -90,10 +88,8 @@
           </select>
         </div>
         <div class="form-group"><label>Days Out</label><input name="days_out" type="number" value="7"></div>
-        <div class="form-group"><label>Default Duration (min)</label><input name="default_duration" type="number" value="120"></div>
         <div class="form-group"><label>Release Hour (local)</label><input name="release_hour" type="number" value="12" min="0" max="23"></div>
         <div class="form-group"><label>Release Minute</label><input name="release_minute" type="number" value="0" min="0" max="59"></div>
-        <div class="form-group" style="grid-column:span 2"><label>Preferred Times (comma-separated, e.g. 10:00,11:00)</label><input name="preferred_times" placeholder="10:00,11:00"></div>
       </div>
       <div class="form-actions">
         <button class="btn btn-primary">Create</button>

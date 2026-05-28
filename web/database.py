@@ -33,9 +33,6 @@ organizations = Table("organizations", metadata,
     Column("scheduler_id", String, nullable=False),
     Column("cost_type_id", String, nullable=False),
     Column("timezone", String, nullable=False, default="America/Los_Angeles"),
-    Column("preferred_times", Text, default="[]"),   # JSON list
-    Column("preferred_courts", Text, default="[]"),  # JSON list
-    Column("default_duration", Integer, default=120),
     Column("days_out", Integer, default=7),
     Column("release_hour", Integer, default=12),     # local hour when slots open
     Column("release_minute", Integer, default=0),
@@ -108,9 +105,6 @@ def _seed_orgs():
                 scheduler_id=o["scheduler_id"],
                 cost_type_id=o["cost_type_id"],
                 timezone="America/Los_Angeles",
-                preferred_times=json.dumps(["10:00"]),
-                preferred_courts=json.dumps([]),
-                default_duration=120,
                 days_out=7,
                 release_hour=12,
                 release_minute=0,

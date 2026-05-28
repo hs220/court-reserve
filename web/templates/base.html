@@ -15,9 +15,22 @@
     <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}">Dashboard</a>
     <a href="/orgs" class="nav-link {% if '/orgs' in request.url.path %}active{% endif %}">Organizations</a>
     <a href="/jobs" class="nav-link {% if '/jobs' in request.url.path %}active{% endif %}">Jobs</a>
+    <a href="/reservations" class="nav-link {% if '/reservations' in request.url.path %}active{% endif %}">Reservations</a>
   </nav>
   <main class="content">
     {% block content %}{% endblock %}
   </main>
+  <script>
+  document.addEventListener('submit', function(e) {
+    var form = e.target;
+    var btn = form.querySelector('button[type="submit"][data-loading], button[data-loading]:not([type])');
+    if (!btn) btn = form.querySelector('button[type="submit"], button:not([type])');
+    if (btn && btn.dataset.loading !== undefined) {
+      var label = btn.dataset.loading || 'Working…';
+      btn.textContent = label;
+      btn.disabled = true;
+    }
+  });
+  </script>
 </body>
 </html>

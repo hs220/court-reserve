@@ -46,6 +46,8 @@ def schedule_book_next(job_id: int, account_id: int, params: dict):
             "job_id": job_id,
             "account_id": account_id,
             "target_date_iso": params.get("date"),
+            "target_time": params.get("time", ""),
+            "duration_override": int(params.get("duration") or 0),
         },
         replace_existing=True,
     )

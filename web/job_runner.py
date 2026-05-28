@@ -61,7 +61,7 @@ from booking import (OrgConfig, get_available_slots, find_best_slot, book_slot,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError)
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
-from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict, json_field
+from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict
 
 
 def _get_account_and_org(account_id: int) -> tuple[dict, dict]:
@@ -125,11 +125,12 @@ def _record_booking(run_id: int, account_id: int, slot, duration_min: int):
         ))
 
 
-def run_book_next(job_id: int, account_id: int, at_iso: str | None = None, target_date_iso: str | None = None):
+def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
+                  target_date_iso: str | None = None, target_time: str = "",
+                  duration_override: int = 0):
     """
-    Book a court for target_date_iso (or days_out from today if not given),
-    optionally waiting until at_iso (ISO datetime) to fire.
-    Called by APScheduler in a background thread.
+    Book a court for target_date_iso (or days_out from today if not given).
+    Blank target_time = any slot; duration_override=0 = any duration.
     """
     run_id = _start_run(job_id)
     buf = io.StringIO()
@@ -138,8 +139,8 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None, targe
         account, org = _get_account_and_org(account_id)
         org_cfg = _org_config(org)
         session_file = _session_file(account)
-        preferred_times = json_field(org.get("preferred_times"))
-        default_duration = org.get("default_duration", 120)
+        preferred_times = [target_time] if target_time else []
+        default_duration = duration_override if duration_override > 0 else 0
         days_out = org.get("days_out", 7)
         tz = pytz.timezone(org_cfg.timezone)
 
@@ -169,7 +170,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None, targe
                 if at_iso:
                     wait_until(datetime.fromisoformat(at_iso))
                 elif datetime.now(tz) < release_dt:
-                    wait_until(release_dt.replace(tzinfo=None))
+                    wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
 
                 slots = None
                 for attempt in range(12):
@@ -197,21 +198,27 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None, targe
                         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="failed"))
                     return
 
-                try:
-                    success = book_slot(page, org_cfg.booking_url, slot,
-                                        duration_minutes=default_duration, org=org_cfg)
-                except BookingWindowError as e:
-                    print(f"Booking window not open yet: {e}")
-                    success = False
-                except AlreadyBookedError as e:
-                    print(f"Already has a reservation: {e}")
-                    success = False
-                except NoAvailableCourtsError as e:
-                    print(f"No available courts: {e}")
-                    success = False
-                except BookingError as e:
-                    print(f"Booking rejected: {e}")
-                    success = False
+                success = False
+                for window_attempt in range(12):
+                    try:
+                        success = book_slot(page, org_cfg.booking_url, slot,
+                                            duration_minutes=default_duration, org=org_cfg)
+                        break
+                    except BookingWindowError as e:
+                        if window_attempt < 11:
+                            print(f"Booking window not open yet (attempt {window_attempt + 1}/12), retrying in 5s...")
+                            time.sleep(5)
+                        else:
+                            print(f"Booking window still not open after 12 attempts: {e}")
+                    except AlreadyBookedError as e:
+                        print(f"Already has a reservation: {e}")
+                        break
+                    except NoAvailableCourtsError as e:
+                        print(f"No available courts: {e}")
+                        break
+                    except BookingError as e:
+                        print(f"Booking rejected: {e}")
+                        break
                 browser.close()
 
         if success:
@@ -247,7 +254,6 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
         session_file = _session_file(account)
         target_date = date.fromisoformat(target_date_iso)
 
-        preferred_times = json_field(org.get("preferred_times"))
         time_desc = target_time if target_time else "any time"
 
         with _capture(buf):
@@ -268,7 +274,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
                             None,
                         )
                     else:
-                        match = find_best_slot(slots, preferred_times)
+                        match = find_best_slot(slots, [])
                     if match:
                         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         print(f"[{ts}] Found slot — booking now...")

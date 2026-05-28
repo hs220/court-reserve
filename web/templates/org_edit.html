@@ -17,10 +17,8 @@
         </select>
       </div>
       <div class="form-group"><label>Days Out</label><input name="days_out" type="number" value="{{ org.days_out }}"></div>
-      <div class="form-group"><label>Default Duration (min)</label><input name="default_duration" type="number" value="{{ org.default_duration }}"></div>
       <div class="form-group"><label>Release Hour (local)</label><input name="release_hour" type="number" value="{{ org.release_hour }}" min="0" max="23"></div>
       <div class="form-group"><label>Release Minute</label><input name="release_minute" type="number" value="{{ org.release_minute }}" min="0" max="59"></div>
-      <div class="form-group" style="grid-column:span 2"><label>Preferred Times (comma-separated)</label><input name="preferred_times" value="{{ org.preferred_times }}"></div>
     </div>
     <div class="form-actions">
       <button class="btn btn-primary">Save Changes</button>

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Edit Job — CourtReserve Manager{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px">
+  <a href="/jobs" style="color:var(--muted);text-decoration:none">← Jobs</a>
+</div>
+<h1>Edit {{ job.type }} — {{ job.org.name if job.org else "" }}</h1>
+<p style="color:var(--muted);margin-bottom:24px">Account: {{ job.account.label or job.account.email if job.account else "—" }}</p>
+
+<div class="card">
+  <form method="post" action="/jobs/{{ job.id }}/edit">
+    <div class="form-grid">
+      <div class="form-group"><label>Date</label>
+        <input id="edit-date" name="date" value="{{ job.params.date or '' }}" placeholder="YYYY-MM-DD" required autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label>Preferred Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
+        <input id="edit-time" name="time" value="{{ job.params.time or '' }}" placeholder="any available" autocomplete="off">
+      </div>
+      <div class="form-group"><label>Duration</label>
+        <select name="duration">
+          <option value="0" {% if not job.params.duration %}selected{% endif %}>Any</option>
+          <option value="30"  {% if job.params.duration == 30  %}selected{% endif %}>30 min</option>
+          <option value="60"  {% if job.params.duration == 60  %}selected{% endif %}>60 min</option>
+          <option value="90"  {% if job.params.duration == 90  %}selected{% endif %}>90 min</option>
+          <option value="120" {% if job.params.duration == 120 %}selected{% endif %}>120 min</option>
+        </select>
+      </div>
+
+      {% if job.type == "book_next" %}
+      <div class="form-group">
+        <label>Fire At <span style="color:var(--muted);font-weight:400;text-transform:none">(auto: release time − 2 min on booking day)</span></label>
+        <input id="edit-run-at" name="run_at" value="{{ job.params.run_at or '' }}" placeholder="YYYY-MM-DDTHH:MM" autocomplete="off">
+      </div>
+      {% else %}
+      <div class="form-group"><label>Poll Interval (sec)</label>
+        <input name="interval" type="number" value="{{ job.params.interval or 60 }}">
+      </div>
+      <div class="form-group"><label>Timeout (min, 0=∞)</label>
+        <input name="timeout" type="number" value="{{ job.params.timeout or 0 }}">
+      </div>
+      {% endif %}
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary">Save &amp; Reschedule</button>
+      <a href="/jobs" class="btn btn-ghost">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<script>
+flatpickr('#edit-date', { dateFormat: 'Y-m-d', disableMobile: true });
+flatpickr('#edit-time', {
+  enableTime: true, noCalendar: true, dateFormat: 'H:i',
+  time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
+});
+{% if job.type == "book_next" %}
+flatpickr('#edit-run-at', {
+  enableTime: true, dateFormat: 'Y-m-dTH:i',
+  time_24hr: true, minuteIncrement: 5, disableMobile: true, allowInput: true,
+});
+{% endif %}
+</script>
+{% endblock %}

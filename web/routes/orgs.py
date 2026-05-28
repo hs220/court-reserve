@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Form
@@ -6,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from sqlalchemy import text
-from web.database import engine, organizations, accounts, row_to_dict, json_field, DATA_DIR
+from web.database import engine, organizations, accounts, bookings, row_to_dict, DATA_DIR
 from web.templates_shared import templates
 
 router = APIRouter()
@@ -39,11 +40,19 @@ def _last_check_time(log_text: str) -> str | None:
 
 
 @router.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request, week: str = None):
+    today = date.today()
+    # week param is ISO date of the Monday; default to this week's Monday
+    if week:
+        week_start = date.fromisoformat(week)
+    else:
+        week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+    week_days = [week_start + timedelta(days=i) for i in range(7)]
+
     with engine.connect() as conn:
         orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
 
-        # All watch and book_next jobs with their latest run
         all_jobs = conn.execute(text("""
             SELECT j.id, j.type, j.params, j.status,
                    o.name as org_name,
@@ -59,6 +68,15 @@ async def dashboard(request: Request):
             WHERE j.type IN ('watch', 'book_next')
             ORDER BY j.id DESC
         """)).fetchall()
+
+        booking_rows = conn.execute(text("""
+            SELECT b.id, b.date, b.start_time, b.court_type, b.duration_min,
+                   COALESCE(a.label, a.email) as account_label
+            FROM bookings b
+            JOIN accounts a ON a.id = b.account_id
+            WHERE b.date >= :start AND b.date <= :end
+            ORDER BY b.date, b.start_time
+        """), {"start": week_start.isoformat(), "end": week_end.isoformat()}).fetchall()
 
     active_jobs = []
     for r in all_jobs:
@@ -79,9 +97,42 @@ async def dashboard(request: Request):
             "last_check": _last_check_time(r[9]) if r[1] == "watch" else None,
         })
 
+    # Each booking gets top_px/height_px pre-computed (60px per hour, 1px per minute)
+    CAL_START_HOUR = 8
+    PX_PER_HOUR = 60
+    bookings_by_date = {}
+    for r in booking_rows:
+        booking_id, date_str, start_time = r[0], r[1], r[2]
+        try:
+            h, m = int(start_time.split(":")[0]), int(start_time.split(":")[1])
+        except Exception:
+            h, m = CAL_START_HOUR, 0
+        top_px = (h - CAL_START_HOUR) * PX_PER_HOUR + m
+        height_px = max((r[4] or PX_PER_HOUR), 24)
+        bookings_by_date.setdefault(date_str, []).append({
+            "id": booking_id,
+            "start_time": start_time,
+            "court_type": r[3],
+            "duration_min": r[4],
+            "account_label": r[5],
+            "top_px": top_px,
+            "height_px": height_px,
+        })
+
+    prev_week = (week_start - timedelta(days=7)).isoformat()
+    next_week = (week_start + timedelta(days=7)).isoformat()
+
     return templates.TemplateResponse(request, "dashboard.html", context={
         "orgs": orgs,
         "active_jobs": active_jobs,
+        "week_days": week_days,
+        "week_label": f"{week_start.strftime('%b %-d')} – {week_end.strftime('%b %-d, %Y')}",
+        "bookings_by_date": bookings_by_date,
+        "cal_hours": list(range(8, 22)),
+        "today": today,
+        "prev_week": prev_week,
+        "next_week": next_week,
+        "this_week": (today - timedelta(days=today.weekday())).isoformat(),
     })
 
 
@@ -90,8 +141,6 @@ async def list_orgs(request: Request):
     with engine.connect() as conn:
         orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         for o in orgs:
-            o["preferred_times"] = json_field(o.get("preferred_times"))
-            o["preferred_courts"] = json_field(o.get("preferred_courts"))
             accs = conn.execute(accounts.select().where(accounts.c.org_id == o["id"])).fetchall()
             o["accounts"] = [row_to_dict(a) for a in accs]
     return templates.TemplateResponse(request, "orgs.html", context={"orgs": orgs})
@@ -105,20 +154,14 @@ async def create_org(
     scheduler_id: str = Form(...),
     cost_type_id: str = Form(...),
     timezone: str = Form("America/Los_Angeles"),
-    preferred_times: str = Form(""),
-    preferred_courts: str = Form(""),
-    default_duration: int = Form(120),
     days_out: int = Form(7),
     release_hour: int = Form(12),
     release_minute: int = Form(0),
 ):
-    pt = json.dumps([t.strip() for t in preferred_times.split(",") if t.strip()])
-    pc = json.dumps([c.strip() for c in preferred_courts.split(",") if c.strip()])
     with engine.begin() as conn:
         conn.execute(organizations.insert().values(
             name=name, org_id=org_id, scheduler_id=scheduler_id, cost_type_id=cost_type_id,
-            timezone=timezone, preferred_times=pt, preferred_courts=pc,
-            default_duration=default_duration, days_out=days_out,
+            timezone=timezone, days_out=days_out,
             release_hour=release_hour, release_minute=release_minute,
         ))
     return RedirectResponse("/orgs", status_code=303)
@@ -130,8 +173,6 @@ async def edit_org_form(request: Request, org_db_id: int):
         org = row_to_dict(conn.execute(
             organizations.select().where(organizations.c.id == org_db_id)
         ).fetchone())
-    org["preferred_times"] = ", ".join(json_field(org.get("preferred_times")))
-    org["preferred_courts"] = ", ".join(json_field(org.get("preferred_courts")))
     return templates.TemplateResponse(request, "org_edit.html", context={"org": org})
 
 
@@ -144,21 +185,15 @@ async def update_org(
     scheduler_id: str = Form(...),
     cost_type_id: str = Form(...),
     timezone: str = Form("America/Los_Angeles"),
-    preferred_times: str = Form(""),
-    preferred_courts: str = Form(""),
-    default_duration: int = Form(120),
     days_out: int = Form(7),
     release_hour: int = Form(12),
     release_minute: int = Form(0),
 ):
-    pt = json.dumps([t.strip() for t in preferred_times.split(",") if t.strip()])
-    pc = json.dumps([c.strip() for c in preferred_courts.split(",") if c.strip()])
     with engine.begin() as conn:
         conn.execute(
             organizations.update().where(organizations.c.id == org_db_id).values(
                 name=name, org_id=org_id, scheduler_id=scheduler_id, cost_type_id=cost_type_id,
-                timezone=timezone, preferred_times=pt, preferred_courts=pc,
-                default_duration=default_duration, days_out=days_out,
+                timezone=timezone, days_out=days_out,
                 release_hour=release_hour, release_minute=release_minute,
             )
         )
@@ -198,8 +233,6 @@ async def create_account(
         with engine.connect() as conn:
             orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
             for o in orgs:
-                o["preferred_times"] = json_field(o.get("preferred_times"))
-                o["preferred_courts"] = json_field(o.get("preferred_courts"))
                 accs = conn.execute(accounts.select().where(accounts.c.org_id == o["id"])).fetchall()
                 o["accounts"] = [row_to_dict(a) for a in accs]
         return templates.TemplateResponse(request, "orgs.html", context={
@@ -220,3 +253,11 @@ async def delete_account(account_id: int):
     with engine.begin() as conn:
         conn.execute(accounts.delete().where(accounts.c.id == account_id))
     return RedirectResponse("/orgs", status_code=303)
+
+
+@router.post("/bookings/{booking_id}/delete")
+async def delete_booking(booking_id: int, request: Request):
+    with engine.begin() as conn:
+        conn.execute(bookings.delete().where(bookings.c.id == booking_id))
+    referer = request.headers.get("referer", "/")
+    return RedirectResponse(referer, status_code=303)

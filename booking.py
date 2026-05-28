@@ -341,6 +341,60 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
     return True
 
 
+def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:
+    """Fetch upcoming reservations for the logged-in account from CourtReserve."""
+    captured = {}
+
+    def _on_response(resp):
+        if "my-bookings-portal/get-list" in resp.url:
+            try:
+                captured["body"] = resp.text()
+            except Exception:
+                pass
+
+    page.on("response", _on_response)
+    page.goto(
+        f"https://app.courtreserve.com/Online/Bookings/List/{org.org_id}?type=1",
+        wait_until="networkidle",
+        timeout=30000,
+    )
+    page.wait_for_timeout(2000)
+
+    raw_body = captured.get("body")
+    if not raw_body:
+        return []
+
+    try:
+        payload = json.loads(raw_body)
+        items = payload.get("Data") or []
+    except Exception:
+        return []
+
+    results = []
+    for item in items:
+        if item.get("IsCanceled"):
+            continue
+        start_str = item.get("ReservationStartDateTime", "")
+        end_str   = item.get("ReservationEndDateTime", "")
+        if not start_str:
+            continue
+        try:
+            start_dt = datetime.fromisoformat(start_str)
+            end_dt   = datetime.fromisoformat(end_str) if end_str else None
+        except ValueError:
+            continue
+        duration_min = int((end_dt - start_dt).total_seconds() / 60) if end_dt else 0
+        results.append({
+            "reservation_id": str(item.get("ReservationId") or ""),
+            "date": start_dt.strftime("%Y-%m-%d"),
+            "start_time": start_dt.strftime("%H:%M"),
+            "duration_min": duration_min,
+            "court_type": item.get("CourtsDisplay") or "",
+        })
+
+    return results
+
+
 def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT_ORG_CONFIG) -> bool:
     reason = random.choice(CANCEL_REASONS)
     detail_url = f"https://app.courtreserve.com/Online/MyProfile/Reservation/{org.org_id}/{reservation_id}"
