@@ -319,6 +319,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
                 else:
                     probe_page = booking_page
 
+                probe_label = (probe_account.get("label") or probe_account["email"]) if probe_account else (account.get("label") or account["email"])
                 started = time.monotonic()
                 while True:
                     slots = get_available_slots(probe_page, target_date, org_cfg)
@@ -374,7 +375,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
                     jitter = random.uniform(-0.2 * interval, 0.2 * interval)
                     wait = interval + jitter
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{ts}] No slot yet. Next check in {wait:.0f}s...")
+                    print(f"[{ts}] No slot yet (checked as {probe_label}). Next check in {wait:.0f}s...")
 
                     # append partial log while waiting
                     _finish_run(run_id, "running", buf.getvalue())
