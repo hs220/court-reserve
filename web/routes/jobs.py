@@ -13,6 +13,29 @@ from web.templates_shared import templates
 router = APIRouter()
 
 
+def _watch_window_run_at(account_id: int, org: dict, date_str: str) -> str:
+    """Return ISO datetime string when the booking window opens for this date, or '' if already open."""
+    tz = pytz.timezone(org["timezone"])
+    days_out = get_days_out(account_id, org)
+    window_open_date = date_cls.fromisoformat(date_str) - timedelta(days=days_out)
+    window_open_dt = tz.localize(datetime(
+        window_open_date.year, window_open_date.month, window_open_date.day,
+        org["release_hour"], org["release_minute"], 0,
+    ))
+    if window_open_dt > datetime.now(tz):
+        return window_open_dt.strftime("%Y-%m-%dT%H:%M")
+    return ""
+
+
+def _recurrent_cron_expr(account_id: int, org: dict, target_dow: int) -> str:
+    """Return a human-readable cron string for display/reference."""
+    days_out = get_days_out(account_id, org)
+    fire_dow, fire_hour, fire_minute = apscheduler_setup._recurrent_fire_params(
+        target_dow, days_out, org.get("release_hour", 12), org.get("release_minute", 0)
+    )
+    return f"{fire_minute} {fire_hour} * * {fire_dow}"
+
+
 def _enrich_job(j: dict, conn) -> dict:
     acc = conn.execute(accounts.select().where(accounts.c.id == j["account_id"])).fetchone()
     org = conn.execute(organizations.select().where(organizations.c.id == j["org_id"])).fetchone()
@@ -90,9 +113,15 @@ async def create_watch(
     probe_account_id: str = Form(""),
 ):
     probe_id = int(probe_account_id) if probe_account_id.strip() else None
+
+    with engine.connect() as conn:
+        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
+
+    run_at = _watch_window_run_at(account_id, org, date)
+
     params = json.dumps({"date": date, "time": time, "duration": duration,
                          "interval": interval, "timeout": timeout,
-                         "probe_account_id": probe_id})
+                         "probe_account_id": probe_id, "run_at": run_at})
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
             account_id=account_id,
@@ -107,7 +136,71 @@ async def create_watch(
     apscheduler_setup.schedule_watch(job_id, account_id,
                                      {"date": date, "time": time, "duration": duration,
                                       "interval": interval, "timeout": timeout,
-                                      "probe_account_id": probe_id})
+                                      "probe_account_id": probe_id, "run_at": run_at})
+    return RedirectResponse("/jobs", status_code=303)
+
+
+@router.post("/jobs/recurrent_book_next")
+async def create_recurrent_book_next(
+    account_id: int = Form(...),
+    org_db_id: int = Form(...),
+    target_day_of_week: int = Form(...),
+    time: str = Form(""),
+    duration: int = Form(0),
+):
+    with engine.connect() as conn:
+        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
+
+    params_dict = {"target_day_of_week": target_day_of_week, "time": time, "duration": duration}
+    cron_expr = _recurrent_cron_expr(account_id, org, target_day_of_week)
+
+    with engine.begin() as conn:
+        result = conn.execute(jobs.insert().values(
+            account_id=account_id,
+            org_id=org_db_id,
+            type="recurrent_book_next",
+            params=json.dumps(params_dict),
+            status="active",
+            cron_expr=cron_expr,
+        ))
+        job_id = result.inserted_primary_key[0]
+
+    apscheduler_setup.schedule_recurrent_book_next(job_id, account_id, params_dict, org)
+    return RedirectResponse("/jobs", status_code=303)
+
+
+@router.post("/jobs/recurrent_watch")
+async def create_recurrent_watch(
+    account_id: int = Form(...),
+    org_db_id: int = Form(...),
+    target_day_of_week: int = Form(...),
+    time: str = Form(""),
+    duration: int = Form(120),
+    interval: int = Form(60),
+    timeout: int = Form(0),
+    probe_account_id: str = Form(""),
+):
+    probe_id = int(probe_account_id) if probe_account_id.strip() else None
+
+    with engine.connect() as conn:
+        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
+
+    params_dict = {"target_day_of_week": target_day_of_week, "time": time, "duration": duration,
+                   "interval": interval, "timeout": timeout, "probe_account_id": probe_id}
+    cron_expr = _recurrent_cron_expr(account_id, org, target_day_of_week)
+
+    with engine.begin() as conn:
+        result = conn.execute(jobs.insert().values(
+            account_id=account_id,
+            org_id=org_db_id,
+            type="recurrent_watch",
+            params=json.dumps(params_dict),
+            status="active",
+            cron_expr=cron_expr,
+        ))
+        job_id = result.inserted_primary_key[0]
+
+    apscheduler_setup.schedule_recurrent_watch(job_id, account_id, params_dict, org)
     return RedirectResponse("/jobs", status_code=303)
 
 
@@ -152,11 +245,16 @@ async def restart_job(job_id: int):
     """Re-schedule a failed/completed job with the same parameters."""
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
+        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == j["org_id"])).fetchone())
     params = json.loads(j.get("params") or "{}")
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="active"))
     if j["type"] == "book_next":
         apscheduler_setup.schedule_book_next(job_id, j["account_id"], params)
+    elif j["type"] == "recurrent_book_next":
+        apscheduler_setup.schedule_recurrent_book_next(job_id, j["account_id"], params, org)
+    elif j["type"] == "recurrent_watch":
+        apscheduler_setup.schedule_recurrent_watch(job_id, j["account_id"], params, org)
     else:
         apscheduler_setup.schedule_watch(job_id, j["account_id"], params)
     return RedirectResponse("/jobs", status_code=303)
@@ -164,19 +262,21 @@ async def restart_job(job_id: int):
 
 @router.post("/jobs/{job_id}/run_now")
 async def run_now(job_id: int):
-    """Trigger a book_next job immediately, skipping any scheduled wait."""
+    """Trigger a book_next (or recurrent_book_next) job immediately, skipping any wait."""
     import threading
     from web.job_runner import run_book_next
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
     params = json.loads(j.get("params") or "{}")
+    is_recurrent = j["type"] == "recurrent_book_next"
     t = threading.Thread(target=run_book_next, kwargs={
         "job_id": job_id,
         "account_id": j["account_id"],
-        "at_iso": datetime.now().isoformat(),  # ensures wait_until returns immediately
-        "target_date_iso": params.get("date"),
+        "at_iso": datetime.now().isoformat(),
+        "target_date_iso": params.get("date"),  # None for recurrent — computes from days_out
         "target_time": params.get("time", ""),
         "duration_override": int(params.get("duration") or 0),
+        "is_recurrent": is_recurrent,
     }, daemon=True)
     t.start()
     return RedirectResponse(f"/jobs/{job_id}/runs", status_code=303)
@@ -193,7 +293,8 @@ async def edit_job_form(request: Request, job_id: int):
 @router.post("/jobs/{job_id}/edit")
 async def update_job(
     job_id: int,
-    date: str = Form(...),
+    date: str = Form(""),
+    target_day_of_week: str = Form(""),
     time: str = Form(""),
     duration: int = Form(0),
     run_at: str = Form(""),
@@ -204,6 +305,8 @@ async def update_job(
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == j["org_id"])).fetchone())
+
+    apscheduler_setup.remove_job(j.get("apscheduler_id", ""))
 
     if j["type"] == "book_next":
         if not run_at:
@@ -217,21 +320,37 @@ async def update_job(
             if fire_dt > datetime.now(tz):
                 run_at = fire_dt.strftime("%Y-%m-%dT%H:%M")
         new_params = json.dumps({"date": date, "time": time, "duration": duration, "run_at": run_at})
-    else:
+        with engine.begin() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == job_id).values(params=new_params, status="active"))
+        apscheduler_setup.schedule_book_next(job_id, j["account_id"], json.loads(new_params))
+
+    elif j["type"] == "watch":
         probe_id = int(probe_account_id) if probe_account_id.strip() else None
+        run_at = _watch_window_run_at(j["account_id"], org, date)
         new_params = json.dumps({"date": date, "time": time, "duration": duration,
                                   "interval": interval, "timeout": timeout,
-                                  "probe_account_id": probe_id})
+                                  "probe_account_id": probe_id, "run_at": run_at})
+        with engine.begin() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == job_id).values(params=new_params, status="active"))
+        apscheduler_setup.schedule_watch(job_id, j["account_id"], json.loads(new_params))
 
-    apscheduler_setup.remove_job(j.get("apscheduler_id", ""))
-    with engine.begin() as conn:
-        conn.execute(update(jobs).where(jobs.c.id == job_id).values(params=new_params, status="active"))
-
-    params_dict = json.loads(new_params)
-    if j["type"] == "book_next":
-        apscheduler_setup.schedule_book_next(job_id, j["account_id"], params_dict)
-    else:
-        apscheduler_setup.schedule_watch(job_id, j["account_id"], params_dict)
+    elif j["type"] in ("recurrent_book_next", "recurrent_watch"):
+        dow = int(target_day_of_week) if target_day_of_week.strip() else 0
+        cron_expr = _recurrent_cron_expr(j["account_id"], org, dow)
+        if j["type"] == "recurrent_book_next":
+            new_params = json.dumps({"target_day_of_week": dow, "time": time, "duration": duration})
+            with engine.begin() as conn:
+                conn.execute(update(jobs).where(jobs.c.id == job_id).values(
+                    params=new_params, cron_expr=cron_expr, status="active"))
+            apscheduler_setup.schedule_recurrent_book_next(job_id, j["account_id"], json.loads(new_params), org)
+        else:
+            probe_id = int(probe_account_id) if probe_account_id.strip() else None
+            new_params = json.dumps({"target_day_of_week": dow, "time": time, "duration": duration,
+                                      "interval": interval, "timeout": timeout, "probe_account_id": probe_id})
+            with engine.begin() as conn:
+                conn.execute(update(jobs).where(jobs.c.id == job_id).values(
+                    params=new_params, cron_expr=cron_expr, status="active"))
+            apscheduler_setup.schedule_recurrent_watch(job_id, j["account_id"], json.loads(new_params), org)
 
     return RedirectResponse("/jobs", status_code=303)
 

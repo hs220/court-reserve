@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
     apscheduler_setup.start()
     apscheduler_setup.reschedule_active_watch_jobs()
     apscheduler_setup.reschedule_active_book_next_jobs()
+    apscheduler_setup.reschedule_active_recurrent_jobs()
     yield
     apscheduler_setup.shutdown()
 

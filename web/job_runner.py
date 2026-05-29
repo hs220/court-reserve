@@ -143,7 +143,7 @@ def _record_booking(run_id: int, account_id: int, slot, duration_min: int):
 
 def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                   target_date_iso: str | None = None, target_time: str = "",
-                  duration_override: int = 0):
+                  duration_override: int = 0, is_recurrent: bool = False):
     """
     Book a court for target_date_iso (or days_out from today if not given).
     target_time may be a comma-separated list of preferred times in priority order.
@@ -259,14 +259,15 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
 
     _finish_run(run_id, status, buf.getvalue())
 
-    job_final = "completed" if status == "success" else "failed"
-    with engine.begin() as conn:
-        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
+    if not is_recurrent:
+        job_final = "completed" if status == "success" else "failed"
+        with engine.begin() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
 
 
-def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: str,
+def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_time: str,
               duration: int, interval: int = 60, timeout_minutes: int = 0,
-              probe_account_id: int | None = None):
+              probe_account_id: int | None = None, is_recurrent: bool = False):
     """
     Poll until a specific slot opens on target_date at target_time, then book it.
     If probe_account_id is set, that account is used only for slot-availability checks
@@ -281,7 +282,12 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
         account, org = _get_account_and_org(job_id, account_id)
         org_cfg = _org_config(org)
         session_file = _session_file(account, org)
-        target_date = date.fromisoformat(target_date_iso)
+        if target_date_iso:
+            target_date = date.fromisoformat(target_date_iso)
+        else:
+            tz_local = pytz.timezone(org_cfg.timezone)
+            days_out = get_days_out(account_id, org)
+            target_date = datetime.now(tz_local).date() + timedelta(days=days_out)
 
         # Resolve probe account (for slot detection only)
         if probe_account_id and probe_account_id != account_id:
@@ -390,7 +396,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
 
     _finish_run(run_id, status, buf.getvalue())
 
-    # Watch jobs are one-shot: sync job status with the run outcome.
-    job_final = "completed" if status == "success" else "failed"
-    with engine.begin() as conn:
-        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
+    if not is_recurrent:
+        job_final = "completed" if status == "success" else "failed"
+        with engine.begin() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))

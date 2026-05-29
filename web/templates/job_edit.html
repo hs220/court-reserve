@@ -10,9 +10,21 @@
 <div class="card">
   <form method="post" action="/jobs/{{ job.id }}/edit" id="edit-form">
     <div class="form-grid">
+
+      {% if job.type in ("recurrent_book_next", "recurrent_watch") %}
+      <div class="form-group"><label>Target Day of Week</label>
+        <select name="target_day_of_week">
+          {% for i, name in [(0,"Monday"),(1,"Tuesday"),(2,"Wednesday"),(3,"Thursday"),(4,"Friday"),(5,"Saturday"),(6,"Sunday")] %}
+          <option value="{{ i }}" {% if job.params.target_day_of_week == i %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      {% else %}
       <div class="form-group"><label>Date</label>
         <input id="edit-date" name="date" value="{{ job.params.date or '' }}" placeholder="YYYY-MM-DD" required autocomplete="off">
       </div>
+      {% endif %}
+
       <div class="form-group"><label>Duration</label>
         <select name="duration">
           <option value="0" {% if not job.params.duration %}selected{% endif %}>Any</option>
@@ -34,11 +46,19 @@
         <label>Fire At <span style="color:var(--muted);font-weight:400;text-transform:none">(auto: release time − 2 min on booking day)</span></label>
         <input id="edit-run-at" name="run_at" value="{{ job.params.run_at or '' }}" placeholder="YYYY-MM-DDTHH:MM" autocomplete="off">
       </div>
+      {% elif job.type == "recurrent_book_next" %}
+      <div class="form-group" style="grid-column:1/-1">
+        <label>Preferred Times <span style="color:var(--muted);font-weight:400;text-transform:none">(priority order — leave empty for any)</span></label>
+        <div id="edit-times-list" data-times="{{ job.params.time or '' }}"></div>
+        <button type="button" class="btn btn-ghost btn-sm" id="edit-add-time" style="margin-top:4px;align-self:flex-start">+ Add Time</button>
+        <input type="hidden" name="time" id="edit-times-value">
+      </div>
       {% else %}
       <div class="form-group">
         <label>Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
         <input id="edit-time" name="time" value="{{ job.params.time or '' }}" placeholder="any available" autocomplete="off">
       </div>
+      {% if job.type in ("watch", "recurrent_watch") %}
       <div class="form-group"><label>Poll Interval (sec)</label>
         <input name="interval" type="number" value="{{ job.params.interval or 60 }}">
       </div>
@@ -53,6 +73,7 @@
         </select>
       </div>
       {% endif %}
+      {% endif %}
     </div>
     <div class="form-actions">
       <button class="btn btn-primary">Save &amp; Reschedule</button>
@@ -62,14 +83,18 @@
 </div>
 
 <script>
+{% if job.type not in ("recurrent_book_next", "recurrent_watch") %}
 flatpickr('#edit-date', { dateFormat: 'Y-m-d', disableMobile: true });
+{% endif %}
 
 {% if job.type == "book_next" %}
 flatpickr('#edit-run-at', {
   enableTime: true, dateFormat: 'Y-m-dTH:i',
   time_24hr: true, minuteIncrement: 5, disableMobile: true, allowInput: true,
 });
+{% endif %}
 
+{% if job.type in ("book_next", "recurrent_book_next") %}
 function createTimeRow(container, value) {
   var row = document.createElement('div');
   row.className = 'time-entry-row';
@@ -92,7 +117,6 @@ function createTimeRow(container, value) {
   });
 }
 
-// Pre-populate from existing times
 (function() {
   var list = document.getElementById('edit-times-list');
   var existing = list.dataset.times || '';
@@ -111,7 +135,7 @@ document.getElementById('edit-form').addEventListener('submit', function() {
   document.getElementById('edit-times-value').value = vals.join(',');
 });
 
-{% else %}
+{% elif job.type in ("watch", "recurrent_watch") %}
 flatpickr('#edit-time', {
   enableTime: true, noCalendar: true, dateFormat: 'H:i',
   time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
