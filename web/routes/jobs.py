@@ -27,11 +27,12 @@ def _watch_window_run_at(account_id: int, org: dict, date_str: str) -> str:
     return ""
 
 
-def _recurrent_cron_expr(account_id: int, org: dict, target_dow: int) -> str:
-    """Return a human-readable cron string for display/reference."""
+def _recurrent_cron_expr(account_id: int, org: dict, target_dow: int, offset_minutes: int = -2) -> str:
+    """Return a cron string for display/reference."""
     days_out = get_days_out(account_id, org)
     fire_dow, fire_hour, fire_minute = apscheduler_setup._recurrent_fire_params(
-        target_dow, days_out, org.get("release_hour", 12), org.get("release_minute", 0)
+        target_dow, days_out, org.get("release_hour", 12), org.get("release_minute", 0),
+        offset_minutes=offset_minutes,
     )
     return f"{fire_minute} {fire_hour} * * {fire_dow}"
 
@@ -187,7 +188,7 @@ async def create_recurrent_watch(
 
     params_dict = {"target_day_of_week": target_day_of_week, "time": time, "duration": duration,
                    "interval": interval, "timeout": timeout, "probe_account_id": probe_id}
-    cron_expr = _recurrent_cron_expr(account_id, org, target_day_of_week)
+    cron_expr = _recurrent_cron_expr(account_id, org, target_day_of_week, offset_minutes=5)
 
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
@@ -347,6 +348,7 @@ async def update_job(
             probe_id = int(probe_account_id) if probe_account_id.strip() else None
             new_params = json.dumps({"target_day_of_week": dow, "time": time, "duration": duration,
                                       "interval": interval, "timeout": timeout, "probe_account_id": probe_id})
+            cron_expr = _recurrent_cron_expr(j["account_id"], org, dow, offset_minutes=5)
             with engine.begin() as conn:
                 conn.execute(update(jobs).where(jobs.c.id == job_id).values(
                     params=new_params, cron_expr=cron_expr, status="active"))

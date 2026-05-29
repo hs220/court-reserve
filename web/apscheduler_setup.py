@@ -59,15 +59,12 @@ def schedule_book_next(job_id: int, account_id: int, params: dict):
     return apscheduler_id
 
 
-def _recurrent_fire_params(target_dow: int, days_out: int, release_hour: int, release_minute: int):
+def _recurrent_fire_params(target_dow: int, days_out: int, release_hour: int, release_minute: int,
+                            offset_minutes: int = -2):
     """Return (fire_dow_name, fire_hour, fire_minute) for a recurrent job's CronTrigger."""
     fire_dow = DOW_NAMES[(target_dow - (days_out % 7) + 7) % 7]
-    fire_minute = release_minute - 2
-    fire_hour = release_hour
-    if fire_minute < 0:
-        fire_minute += 60
-        fire_hour -= 1
-    return fire_dow, fire_hour, fire_minute
+    total = release_hour * 60 + release_minute + offset_minutes
+    return fire_dow, (total // 60) % 24, total % 60
 
 
 # ── watch ─────────────────────────────────────────────────────────────────────
@@ -137,6 +134,7 @@ def schedule_recurrent_watch(job_id: int, account_id: int, params: dict, org: di
     fire_dow, fire_hour, fire_minute = _recurrent_fire_params(
         int(params["target_day_of_week"]), days_out,
         org.get("release_hour", 12), org.get("release_minute", 0),
+        offset_minutes=5,
     )
     tz = pytz.timezone(org.get("timezone", "America/Los_Angeles"))
     trigger = CronTrigger(day_of_week=fire_dow, hour=fire_hour, minute=fire_minute, timezone=tz)
