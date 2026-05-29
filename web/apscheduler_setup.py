@@ -64,6 +64,7 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
     run_at = params.get("run_at")
     trigger = DateTrigger(run_date=datetime.fromisoformat(run_at)) if run_at else DateTrigger(run_date=datetime.now())
 
+    probe_id = params.get("probe_account_id")
     scheduler.add_job(
         run_watch,
         trigger,
@@ -76,6 +77,7 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
             "duration": int(params.get("duration", 120)),
             "interval": int(params.get("interval", 60)),
             "timeout_minutes": int(params.get("timeout", 0)),
+            "probe_account_id": int(probe_id) if probe_id else None,
         },
         replace_existing=True,
     )

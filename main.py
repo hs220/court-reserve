@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pytz
 from playwright.sync_api import sync_playwright
@@ -15,6 +16,11 @@ from booking import get_available_slots, find_best_slot, book_slot
 from scheduler import wait_until
 
 PT = pytz.timezone("America/Los_Angeles")
+
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof"]
+
+def _is_network_error(exc: Exception) -> bool:
+    return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
 
 
 def _notify(title: str, message: str) -> None:
@@ -27,11 +33,13 @@ def _notify(title: str, message: str) -> None:
         pass
 
 
-def watch_and_book(page, target_date: date, target_time: str, duration: int,
+def watch_and_book(page, probe_page, target_date: date, target_time: str, duration: int,
                    interval: int = 60, timeout_minutes: int = 0, org=None) -> bool:
+    """Poll for an available slot and book it. probe_page is used for availability checks
+    (may be a different account); page is used for the actual booking."""
     started = time.monotonic()
     while True:
-        slots = get_available_slots(page, target_date, org) if org else get_available_slots(page, target_date)
+        slots = get_available_slots(probe_page, target_date, org) if org else get_available_slots(probe_page, target_date)
         match = next((s for s in slots if s.start_time == target_time and not s.is_wait_list), None)
         if match:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -75,7 +83,8 @@ def cmd_list(args, cfg):
 def cmd_book(args, cfg):
     org = default_org_config()
     target_date = date.fromisoformat(args.date)
-    preferred_times = [args.time] if args.time else cfg.get("preferred_times", [])
+    # args.time is a list when action="append" is used; None if not provided
+    preferred_times = args.time if args.time else cfg.get("preferred_times", [])
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not args.headed, args=BROWSER_ARGS)
@@ -118,13 +127,30 @@ def cmd_book(args, cfg):
 def cmd_watch(args, cfg):
     org = default_org_config()
     target_date = date.fromisoformat(args.date)
+    probe_email = getattr(args, 'probe_email', None) or cfg["email"]
+    probe_password = getattr(args, 'probe_password', None) or cfg["password"]
+    use_separate_probe = probe_email != cfg["email"]
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not args.headed, args=BROWSER_ARGS)
+
+        # Booking context (always)
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
         ensure_logged_in(context, page, cfg["email"], cfg["password"], org.booking_url, SESSION_FILE)
+
+        # Probe context (separate account for slot detection only)
+        if use_separate_probe:
+            probe_session_file = Path.home() / ".court-reserve-probe-session.json"
+            probe_context = browser.new_context(user_agent=USER_AGENT)
+            probe_page = probe_context.new_page()
+            ensure_logged_in(probe_context, probe_page, probe_email, probe_password, org.booking_url, probe_session_file)
+            print(f"watch: probe account {probe_email} for slot detection; booking account {cfg['email']}")
+        else:
+            probe_page = page
+
         success = watch_and_book(
-            page, target_date, args.time, args.duration,
+            page, probe_page, target_date, args.time, args.duration,
             interval=args.interval, timeout_minutes=args.timeout, org=org,
         )
         browser.close()
@@ -141,7 +167,22 @@ def cmd_book_next(args, cfg):
 
     args.date = target_date.isoformat()
     args.at = release_dt.strftime("%Y-%m-%d %H:%M:%S")
-    cmd_book(args, cfg)
+
+    MAX_RETRIES = 5
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            wait = 30 * attempt
+            print(f"Network error on attempt {attempt}/{MAX_RETRIES}, retrying in {wait}s...")
+            time.sleep(wait)
+        try:
+            cmd_book(args, cfg)  # raises SystemExit on completion (success or failure)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            if attempt < MAX_RETRIES and _is_network_error(exc):
+                print(f"Network error: {exc}")
+                continue
+            raise
 
 
 def main():
@@ -155,14 +196,16 @@ def main():
 
     p_book = sub.add_parser("book", help="Book a court slot")
     p_book.add_argument("--date", required=True, help="Target date YYYY-MM-DD")
-    p_book.add_argument("--time", help="Preferred start time HH:MM (24h)")
+    p_book.add_argument("--time", action="append", metavar="TIME",
+                        help="Preferred start time HH:MM (24h); repeat for priority list, e.g. --time 10:00 --time 12:00")
     p_book.add_argument("--duration", type=int, help="Duration in minutes (default from config)")
     p_book.add_argument("--at", help="Wait until this datetime before booking (ISO: 'YYYY-MM-DD HH:MM:SS')")
     p_book.add_argument("--headed", action="store_true", help="Show browser window")
     p_book.add_argument("--dry-run", action="store_true", dest="dry_run", help="Open modal and log duration options, but do not click Save")
 
     p_next = sub.add_parser("book-next", help="Book days_out from today, waiting for today's 12PM PT release")
-    p_next.add_argument("--time", help="Preferred start time HH:MM (24h)")
+    p_next.add_argument("--time", action="append", metavar="TIME",
+                        help="Preferred start time HH:MM (24h); repeat for priority list, e.g. --time 10:00 --time 12:00")
     p_next.add_argument("--duration", type=int, help="Duration in minutes (default from config)")
     p_next.add_argument("--headed", action="store_true", help="Show browser window")
 
@@ -173,6 +216,10 @@ def main():
     p_watch.add_argument("--interval", type=int, default=60, help="Seconds between polls (default: 60)")
     p_watch.add_argument("--timeout", type=int, default=0, help="Stop after N minutes with no match (default: 0 = infinite)")
     p_watch.add_argument("--headed", action="store_true", help="Show browser window")
+    p_watch.add_argument("--probe-email", dest="probe_email", default="",
+                        help="Email for probe account used to check availability (default: same as booking account)")
+    p_watch.add_argument("--probe-password", dest="probe_password", default="",
+                        help="Password for probe account (default: same as booking account)")
 
     args = parser.parse_args()
     cfg = load_config()

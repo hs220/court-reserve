@@ -8,14 +8,10 @@
 <p style="color:var(--muted);margin-bottom:24px">Account: {{ job.account.label or job.account.email if job.account else "—" }}</p>
 
 <div class="card">
-  <form method="post" action="/jobs/{{ job.id }}/edit">
+  <form method="post" action="/jobs/{{ job.id }}/edit" id="edit-form">
     <div class="form-grid">
       <div class="form-group"><label>Date</label>
         <input id="edit-date" name="date" value="{{ job.params.date or '' }}" placeholder="YYYY-MM-DD" required autocomplete="off">
-      </div>
-      <div class="form-group">
-        <label>Preferred Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
-        <input id="edit-time" name="time" value="{{ job.params.time or '' }}" placeholder="any available" autocomplete="off">
       </div>
       <div class="form-group"><label>Duration</label>
         <select name="duration">
@@ -28,16 +24,33 @@
       </div>
 
       {% if job.type == "book_next" %}
-      <div class="form-group">
+      <div class="form-group" style="grid-column:1/-1">
+        <label>Preferred Times <span style="color:var(--muted);font-weight:400;text-transform:none">(priority order — leave empty for any)</span></label>
+        <div id="edit-times-list" data-times="{{ job.params.time or '' }}"></div>
+        <button type="button" class="btn btn-ghost btn-sm" id="edit-add-time" style="margin-top:4px;align-self:flex-start">+ Add Time</button>
+        <input type="hidden" name="time" id="edit-times-value">
+      </div>
+      <div class="form-group" style="grid-column:1/-1">
         <label>Fire At <span style="color:var(--muted);font-weight:400;text-transform:none">(auto: release time − 2 min on booking day)</span></label>
         <input id="edit-run-at" name="run_at" value="{{ job.params.run_at or '' }}" placeholder="YYYY-MM-DDTHH:MM" autocomplete="off">
       </div>
       {% else %}
+      <div class="form-group">
+        <label>Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
+        <input id="edit-time" name="time" value="{{ job.params.time or '' }}" placeholder="any available" autocomplete="off">
+      </div>
       <div class="form-group"><label>Poll Interval (sec)</label>
         <input name="interval" type="number" value="{{ job.params.interval or 60 }}">
       </div>
       <div class="form-group"><label>Timeout (min, 0=∞)</label>
         <input name="timeout" type="number" value="{{ job.params.timeout or 0 }}">
+      </div>
+      <div class="form-group" style="grid-column:1/-1">
+        <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — used only for slot detection)</span></label>
+        <select name="probe_account_id">
+          <option value="">— same as booking account —</option>
+          {% for a in accounts %}<option value="{{ a.id }}" {% if job.params.probe_account_id == a.id %}selected{% endif %}>{{ a.label or a.email }}</option>{% endfor %}
+        </select>
       </div>
       {% endif %}
     </div>
@@ -50,14 +63,58 @@
 
 <script>
 flatpickr('#edit-date', { dateFormat: 'Y-m-d', disableMobile: true });
-flatpickr('#edit-time', {
-  enableTime: true, noCalendar: true, dateFormat: 'H:i',
-  time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
-});
+
 {% if job.type == "book_next" %}
 flatpickr('#edit-run-at', {
   enableTime: true, dateFormat: 'Y-m-dTH:i',
   time_24hr: true, minuteIncrement: 5, disableMobile: true, allowInput: true,
+});
+
+function createTimeRow(container, value) {
+  var row = document.createElement('div');
+  row.className = 'time-entry-row';
+  var inp = document.createElement('input');
+  inp.placeholder = 'HH:MM';
+  inp.value = value || '';
+  inp.autocomplete = 'off';
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-ghost btn-sm';
+  btn.textContent = '−';
+  btn.title = 'Remove';
+  btn.onclick = function() { row.remove(); };
+  row.appendChild(inp);
+  row.appendChild(btn);
+  container.appendChild(row);
+  flatpickr(inp, {
+    enableTime: true, noCalendar: true, dateFormat: 'H:i',
+    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
+  });
+}
+
+// Pre-populate from existing times
+(function() {
+  var list = document.getElementById('edit-times-list');
+  var existing = list.dataset.times || '';
+  var times = existing ? existing.split(',').map(function(t){ return t.trim(); }).filter(Boolean) : [];
+  if (times.length === 0) times = [''];
+  times.forEach(function(t) { createTimeRow(list, t); });
+})();
+
+document.getElementById('edit-add-time').addEventListener('click', function() {
+  createTimeRow(document.getElementById('edit-times-list'), '');
+});
+
+document.getElementById('edit-form').addEventListener('submit', function() {
+  var vals = Array.from(document.querySelectorAll('#edit-times-list .time-entry-row input'))
+    .map(function(i) { return i.value.trim(); }).filter(Boolean);
+  document.getElementById('edit-times-value').value = vals.join(',');
+});
+
+{% else %}
+flatpickr('#edit-time', {
+  enableTime: true, noCalendar: true, dateFormat: 'H:i',
+  time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
 });
 {% endif %}
 </script>

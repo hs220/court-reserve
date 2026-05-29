@@ -63,6 +63,20 @@ from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
 from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict
 
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof"]
+
+def _is_network_error(exc: Exception) -> bool:
+    return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
+
+
+def _parse_preferred_times(time_val) -> list[str]:
+    """Parse time_val which may be a list, comma-separated string, or single string."""
+    if isinstance(time_val, list):
+        return [t.strip() for t in time_val if t.strip()]
+    if time_val and "," in str(time_val):
+        return [t.strip() for t in str(time_val).split(",") if t.strip()]
+    return [str(time_val).strip()] if time_val else []
+
 
 def _get_account_and_org(job_id: int, account_id: int) -> tuple[dict, dict]:
     """Look up account and org; org comes from the job's org_id, not the account."""
@@ -132,106 +146,116 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                   duration_override: int = 0):
     """
     Book a court for target_date_iso (or days_out from today if not given).
-    Blank target_time = any slot; duration_override=0 = any duration.
+    target_time may be a comma-separated list of preferred times in priority order.
+    duration_override=0 = any duration.
+    Retries automatically on transient network errors.
     """
     run_id = _start_run(job_id)
     buf = io.StringIO()
     status = "failed"
-    try:
-        account, org = _get_account_and_org(job_id, account_id)
-        org_cfg = _org_config(org)
-        session_file = _session_file(account, org)
-        preferred_times = [target_time] if target_time else []
-        default_duration = duration_override if duration_override > 0 else 0
-        days_out = org.get("days_out", 7)
-        tz = pytz.timezone(org_cfg.timezone)
+    slot = None
+    success = False
 
-        today_local = datetime.now(tz).date()
-        if target_date_iso:
-            target_date = date.fromisoformat(target_date_iso)
-        else:
-            target_date = today_local + timedelta(days=days_out)
+    account, org = _get_account_and_org(job_id, account_id)
+    org_cfg = _org_config(org)
+    session_file = _session_file(account, org)
+    preferred_times = _parse_preferred_times(target_time)
+    default_duration = duration_override if duration_override > 0 else 0
+    days_out = org.get("days_out", 7)
+    tz = pytz.timezone(org_cfg.timezone)
 
-        release_hour = org.get("release_hour", 12)
-        release_minute = org.get("release_minute", 0)
-        release_dt = tz.localize(datetime(
-            today_local.year, today_local.month, today_local.day,
-            release_hour, release_minute, 0
-        ))
+    today_local = datetime.now(tz).date()
+    if target_date_iso:
+        target_date = date.fromisoformat(target_date_iso)
+    else:
+        target_date = today_local + timedelta(days=days_out)
 
-        with _capture(buf):
-            print(f"book_next: targeting {target_date} (days_out={days_out}), release at {release_dt}")
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
-                context = browser.new_context(user_agent=USER_AGENT)
-                page = context.new_page()
+    release_hour = org.get("release_hour", 12)
+    release_minute = org.get("release_minute", 0)
+    release_dt = tz.localize(datetime(
+        today_local.year, today_local.month, today_local.day,
+        release_hour, release_minute, 0
+    ))
 
-                ensure_logged_in(context, page, account["email"], account["password"],
-                                 org_cfg.booking_url, session_file)
+    MAX_NET_RETRIES = 5
+    for net_attempt in range(MAX_NET_RETRIES + 1):
+        if net_attempt > 0:
+            wait_sec = 30 * net_attempt
+            buf.write(f"\nNetwork glitch (attempt {net_attempt}/{MAX_NET_RETRIES}), retrying in {wait_sec}s...\n")
+            time.sleep(wait_sec)
 
-                if at_iso:
-                    wait_until(datetime.fromisoformat(at_iso))
-                elif datetime.now(tz) < release_dt:
-                    wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
+        try:
+            with _capture(buf):
+                if net_attempt > 0:
+                    print(f"[Retry {net_attempt}/{MAX_NET_RETRIES}]")
+                print(f"book_next: targeting {target_date} (days_out={days_out}), release at {release_dt}")
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
+                    context = browser.new_context(user_agent=USER_AGENT)
+                    page = context.new_page()
 
-                slots = None
-                for attempt in range(12):
-                    slots = get_available_slots(page, target_date, org_cfg)
-                    if slots:
-                        break
-                    if attempt < 11:
-                        print(f"No slots yet, retrying... ({attempt + 1}/12)")
-                        time.sleep(0.5)
+                    ensure_logged_in(context, page, account["email"], account["password"],
+                                     org_cfg.booking_url, session_file)
 
-                if not slots:
-                    print("No available slots — nothing to book.")
-                    browser.close()
-                    _finish_run(run_id, "failed", buf.getvalue())
-                    with engine.begin() as conn:
-                        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="failed"))
-                    return
+                    if at_iso:
+                        wait_until(datetime.fromisoformat(at_iso))
+                    elif datetime.now(tz) < release_dt:
+                        wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
 
-                slot = find_best_slot(slots, preferred_times)
-                if slot is None:
-                    print("No matching slot found.")
-                    browser.close()
-                    _finish_run(run_id, "failed", buf.getvalue())
-                    with engine.begin() as conn:
-                        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="failed"))
-                    return
+                    slots = None
+                    for attempt in range(12):
+                        slots = get_available_slots(page, target_date, org_cfg)
+                        if slots:
+                            break
+                        if attempt < 11:
+                            print(f"No slots yet, retrying... ({attempt + 1}/12)")
+                            time.sleep(0.5)
 
-                success = False
-                for window_attempt in range(12):
-                    try:
-                        success = book_slot(page, org_cfg.booking_url, slot,
-                                            duration_minutes=default_duration, org=org_cfg)
-                        break
-                    except BookingWindowError as e:
-                        if window_attempt < 11:
-                            print(f"Booking window not open yet (attempt {window_attempt + 1}/12), retrying in 5s...")
-                            time.sleep(5)
+                    if not slots:
+                        print("No available slots — nothing to book.")
+                        browser.close()
+                        status = "failed"
+                    else:
+                        slot = find_best_slot(slots, preferred_times)
+                        if slot is None:
+                            print("No matching slot found.")
+                            browser.close()
+                            status = "failed"
                         else:
-                            print(f"Booking window still not open after 12 attempts: {e}")
-                    except AlreadyBookedError as e:
-                        print(f"Already has a reservation: {e}")
-                        break
-                    except NoAvailableCourtsError as e:
-                        print(f"No available courts: {e}")
-                        break
-                    except BookingError as e:
-                        print(f"Booking rejected: {e}")
-                        break
-                browser.close()
+                            for window_attempt in range(12):
+                                try:
+                                    success = book_slot(page, org_cfg.booking_url, slot,
+                                                        duration_minutes=default_duration, org=org_cfg)
+                                    break
+                                except BookingWindowError as e:
+                                    if window_attempt < 11:
+                                        print(f"Booking window not open yet (attempt {window_attempt + 1}/12), retrying in 5s...")
+                                        time.sleep(5)
+                                    else:
+                                        print(f"Booking window still not open after 12 attempts: {e}")
+                                except AlreadyBookedError as e:
+                                    print(f"Already has a reservation: {e}")
+                                    break
+                                except NoAvailableCourtsError as e:
+                                    print(f"No available courts: {e}")
+                                    break
+                                except BookingError as e:
+                                    print(f"Booking rejected: {e}")
+                                    break
+                            browser.close()
+                            status = "success" if success else "failed"
+            break  # completed (success or expected failure) — do not retry
 
-        if success:
-            _record_booking(run_id, account_id, slot, default_duration)
-            status = "success"
-        else:
+        except Exception as exc:
+            if net_attempt < MAX_NET_RETRIES and _is_network_error(exc):
+                buf.write(f"\nNetwork error: {exc}\n")
+                continue
+            buf.write(f"\nERROR: {exc}\n")
             status = "failed"
+            break
 
-    except Exception as exc:
-        buf.write(f"\nERROR: {exc}\n")
-        status = "failed"
+    if success and slot is not None:
+        _record_booking(run_id, account_id, slot, default_duration)
 
     _finish_run(run_id, status, buf.getvalue())
 
@@ -241,9 +265,12 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
 
 
 def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: str,
-              duration: int, interval: int = 60, timeout_minutes: int = 0):
+              duration: int, interval: int = 60, timeout_minutes: int = 0,
+              probe_account_id: int | None = None):
     """
     Poll until a specific slot opens on target_date at target_time, then book it.
+    If probe_account_id is set, that account is used only for slot-availability checks
+    while account_id is used for the actual booking.
     Called by APScheduler in a background thread.
     """
     run_id = _start_run(job_id)
@@ -256,20 +283,45 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
         session_file = _session_file(account, org)
         target_date = date.fromisoformat(target_date_iso)
 
+        # Resolve probe account (for slot detection only)
+        if probe_account_id and probe_account_id != account_id:
+            with engine.connect() as conn:
+                probe_row = conn.execute(
+                    accounts.select().where(accounts.c.id == probe_account_id)
+                ).fetchone()
+            probe_account = row_to_dict(probe_row) if probe_row else None
+        else:
+            probe_account = None
+
         time_desc = target_time if target_time else "any time"
 
         with _capture(buf):
+            if probe_account:
+                print(f"watch: probe account '{probe_account.get('label') or probe_account['email']}' for detection; "
+                      f"booking account '{account.get('label') or account['email']}'")
             print(f"watch: polling for {time_desc} on {target_date_iso} (interval={interval}s, timeout={timeout_minutes}m)")
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
-                context = browser.new_context(user_agent=USER_AGENT)
-                page = context.new_page()
-                ensure_logged_in(context, page, account["email"], account["password"],
+
+                # Booking context
+                booking_context = browser.new_context(user_agent=USER_AGENT)
+                booking_page = booking_context.new_page()
+                ensure_logged_in(booking_context, booking_page, account["email"], account["password"],
                                  org_cfg.booking_url, session_file)
+
+                # Probe context (separate browser context with different cookies)
+                if probe_account:
+                    probe_session_file = _session_file(probe_account, org)
+                    probe_context = browser.new_context(user_agent=USER_AGENT)
+                    probe_page = probe_context.new_page()
+                    ensure_logged_in(probe_context, probe_page, probe_account["email"], probe_account["password"],
+                                     org_cfg.booking_url, probe_session_file)
+                else:
+                    probe_page = booking_page
 
                 started = time.monotonic()
                 while True:
-                    slots = get_available_slots(page, target_date, org_cfg)
+                    slots = get_available_slots(probe_page, target_date, org_cfg)
                     if target_time:
                         match = next(
                             (s for s in slots if s.start_time == target_time and not s.is_wait_list),
@@ -281,7 +333,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str, target_time: s
                         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         print(f"[{ts}] Found slot — booking now...")
                         try:
-                            success = book_slot(page, org_cfg.booking_url, match,
+                            success = book_slot(booking_page, org_cfg.booking_url, match,
                                                 duration_minutes=duration, org=org_cfg)
                         except NoAvailableCourtsError as e:
                             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

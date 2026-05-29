@@ -4,40 +4,41 @@
 <div class="card-header">
   <h1>Jobs</h1>
   <div class="row-actions">
-    <button id="open-bn-modal" class="btn btn-primary" onclick="document.getElementById('add-book-next-modal').classList.add('open')">+ Book-Next Job</button>
+    <button id="open-bn-modal" class="btn btn-primary" onclick="openBnModal()">+ Book-Next Job</button>
     <button id="open-watch-modal" class="btn btn-ghost" onclick="document.getElementById('add-watch-modal').classList.add('open')">+ Watch Job</button>
   </div>
 </div>
 
 {% if jobs %}
-<div class="card">
-  <table>
+<div class="card" style="padding:0;overflow-x:auto">
+  <table class="jobs-table">
     <thead><tr>
       <th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Next Run</th><th></th>
     </tr></thead>
     <tbody>
     {% for j in jobs %}
     <tr>
-      <td><strong>{{ j.type }}</strong></td>
-      <td>{{ j.org.name if j.org else "—" }}</td>
-      <td>{{ j.account.label or j.account.email if j.account else "—" }}</td>
-      <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
-      <td>
+      <td data-label="Type"><strong>{{ j.type }}</strong></td>
+      <td data-label="Org">{{ j.org.name if j.org else "—" }}</td>
+      <td data-label="Account">{{ j.account.label or j.account.email if j.account else "—" }}</td>
+      <td data-label="Status"><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+      <td data-label="Target">
         {% if j.type == "book_next" %}
           {{ j.params.date or "—" }}
-          {{ j.params.time or "any time" }}
+          {{ j.params.time.replace(",", " / ") if j.params.time else "any time" }}
           ({{ j.params.duration ~ "min" if j.params.duration else "org default" }})
           <span style="color:var(--muted)">
             {% if j.params.run_at %} @ {{ j.params.run_at.replace("T", " ") }}{% else %} → now{% endif %}
           </span>
         {% else %}
           {{ j.params.date }} {{ j.params.time or "any time" }} ({{ j.params.duration ~ "min" if j.params.duration else "any duration" }}, poll {{ j.params.interval }}s)
+          {% if j.params.probe_account_id %}<span style="color:var(--muted)"> [probe acct]</span>{% endif %}
         {% endif %}
       </td>
-      <td style="font-size:12px;color:var(--muted)">
-        {% if j.next_run_at %}{{ j.next_run_at.strftime("%m/%d %H:%M") }}{% else %}—{% endif %}
+      <td data-label="Next Run" style="font-size:12px;color:var(--muted)">
+        {% if j.next_run_at %}{{ j.next_run_at | localdt }}{% else %}—{% endif %}
       </td>
-      <td>
+      <td data-label="">
         <div class="row-actions">
           <a href="/jobs/{{ j.id }}/runs" class="btn btn-ghost btn-sm">Runs</a>
           <a href="/jobs/{{ j.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
@@ -79,26 +80,22 @@
     <button class="modal-close" onclick="document.getElementById('add-book-next-modal').classList.remove('open')">✕</button>
     <h2>New Book-Next Job</h2>
     <p style="color:var(--muted);font-size:13px;margin-bottom:16px">One-shot: fires at the scheduled time and books the target date. Uses org's release time if "Fire At" is left blank.</p>
-    <form method="post" action="/jobs/book_next">
+    <form method="post" action="/jobs/book_next" id="bn-form">
       <div class="form-grid">
         <div class="form-group"><label>Organization</label>
-          <select name="org_db_id" id="bn-org">
+          <select name="org_db_id">
             <option value="">— select —</option>
             {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Account</label>
-          <select name="account_id" id="bn-account">
+          <select name="account_id">
             <option value="">— select —</option>
             {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Target Date</label>
           <input id="bn-date" name="date" placeholder="YYYY-MM-DD" autocomplete="off" required>
-        </div>
-        <div class="form-group">
-          <label>Preferred Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
-          <input id="bn-time" name="time" placeholder="any available" autocomplete="off">
         </div>
         <div class="form-group"><label>Duration</label>
           <select name="duration">
@@ -109,7 +106,13 @@
             <option value="120">120 min</option>
           </select>
         </div>
-        <div class="form-group">
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Preferred Times <span style="color:var(--muted);font-weight:400;text-transform:none">(priority order — leave empty to take any available slot)</span></label>
+          <div id="bn-times-list"></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="bn-add-time" style="margin-top:4px;align-self:flex-start">+ Add Time</button>
+          <input type="hidden" name="time" id="bn-times-value">
+        </div>
+        <div class="form-group" style="grid-column:1/-1">
           <label>Fire At <span style="color:var(--muted);font-weight:400;text-transform:none">(auto: release time − 2 min on booking day)</span></label>
           <input id="bn-run-at" name="run_at" placeholder="YYYY-MM-DDTHH:MM" autocomplete="off">
         </div>
@@ -131,13 +134,13 @@
     <form method="post" action="/jobs/watch">
       <div class="form-grid">
         <div class="form-group"><label>Organization</label>
-          <select name="org_db_id" id="wt-org">
+          <select name="org_db_id">
             <option value="">— select —</option>
             {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
           </select>
         </div>
         <div class="form-group"><label>Account</label>
-          <select name="account_id" id="wt-account">
+          <select name="account_id">
             <option value="">— select —</option>
             {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
           </select>
@@ -158,6 +161,13 @@
         </div>
         <div class="form-group"><label>Poll Interval (sec)</label><input name="interval" type="number" value="60"></div>
         <div class="form-group"><label>Timeout (min, 0=∞)</label><input name="timeout" type="number" value="0"></div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — used only for slot detection, booking uses Account above)</span></label>
+          <select name="probe_account_id">
+            <option value="">— same as booking account —</option>
+            {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
       </div>
       <div class="form-actions">
         <button class="btn btn-primary">Start Watching</button>
@@ -168,31 +178,67 @@
 </div>
 
 <script>
-// Flatpickr for Watch modal
-let watchPickersInit = false;
-document.getElementById('open-watch-modal').addEventListener('click', () => {
+// ── Shared: create a flatpickr time-picker row ─────────────────────────────
+function createTimeRow(container, value) {
+  const row = document.createElement('div');
+  row.className = 'time-entry-row';
+  const inp = document.createElement('input');
+  inp.placeholder = 'HH:MM';
+  inp.value = value || '';
+  inp.autocomplete = 'off';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-ghost btn-sm';
+  btn.textContent = '−';
+  btn.title = 'Remove';
+  btn.onclick = function() { row.remove(); };
+  row.appendChild(inp);
+  row.appendChild(btn);
+  container.appendChild(row);
+  flatpickr(inp, {
+    enableTime: true, noCalendar: true, dateFormat: 'H:i',
+    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
+  });
+}
+
+// ── Book-Next modal ────────────────────────────────────────────────────────
+var bnDatePicker = null, bnRunAtPicker = null;
+
+function openBnModal() {
+  document.getElementById('add-book-next-modal').classList.add('open');
+  // Init date/run-at pickers once
+  if (!bnDatePicker) {
+    bnDatePicker = flatpickr('#bn-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
+    bnRunAtPicker = flatpickr('#bn-run-at', {
+      enableTime: true, dateFormat: 'Y-m-dTH:i',
+      time_24hr: true, minuteIncrement: 5, disableMobile: true, allowInput: true,
+    });
+  }
+  // Reset time rows to one empty row each open
+  const list = document.getElementById('bn-times-list');
+  list.innerHTML = '';
+  createTimeRow(list, '');
+}
+
+document.getElementById('bn-add-time').addEventListener('click', function() {
+  createTimeRow(document.getElementById('bn-times-list'), '');
+});
+
+document.getElementById('bn-form').addEventListener('submit', function() {
+  const vals = Array.from(document.querySelectorAll('#bn-times-list .time-entry-row input'))
+    .map(function(i) { return i.value.trim(); }).filter(Boolean);
+  document.getElementById('bn-times-value').value = vals.join(',');
+});
+
+// ── Watch modal ────────────────────────────────────────────────────────────
+var watchPickersInit = false;
+document.getElementById('open-watch-modal').addEventListener('click', function() {
   if (watchPickersInit) return;
   watchPickersInit = true;
   flatpickr('#wt-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
   flatpickr('#wt-time', {
     enableTime: true, noCalendar: true, dateFormat: 'H:i',
     time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
-  });
-});
-
-// Flatpickr for Book-Next modal
-let bnPickersInit = false;
-document.getElementById('open-bn-modal').addEventListener('click', () => {
-  if (bnPickersInit) return;
-  bnPickersInit = true;
-  flatpickr('#bn-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
-  flatpickr('#bn-time', {
-    enableTime: true, noCalendar: true, dateFormat: 'H:i',
-    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
-  });
-  flatpickr('#bn-run-at', {
-    enableTime: true, dateFormat: 'Y-m-dTH:i',
-    time_24hr: true, minuteIncrement: 5, disableMobile: true, allowInput: true,
   });
 });
 </script>

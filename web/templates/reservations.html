@@ -20,10 +20,11 @@
 {% endif %}
 
 {% if reservations %}
-<div class="card">
+<div class="card" style="padding:0">
+  <div class="scroll-table-wrap">
   <table>
     <thead><tr>
-      <th>Date</th><th>Time</th><th>Duration</th><th>Court</th><th>Account</th><th>Org</th><th>Synced</th><th></th>
+      <th>Date</th><th>Time</th><th>Duration</th><th>Court</th><th>Account</th><th>Org</th><th>Synced (PT)</th><th></th>
     </tr></thead>
     <tbody>
     {% for r in reservations %}
@@ -34,7 +35,7 @@
       <td>{{ r.court_type or "—" }}</td>
       <td>{{ r.account_label }}</td>
       <td>{{ r.org_name }}</td>
-      <td style="font-size:12px;color:var(--muted)">{{ r.confirmed_at }}</td>
+      <td style="font-size:12px;color:var(--muted)">{{ r.confirmed_at | localdt }}</td>
       <td>
         <form method="post" action="/bookings/{{ r.id }}/delete" style="display:inline"
               onsubmit="return confirm('Remove this entry from local tracking only.\n\nThe actual CourtReserve reservation is NOT cancelled.')">
@@ -45,6 +46,7 @@
     {% endfor %}
     </tbody>
   </table>
+  </div>
 </div>
 {% else %}
 <div class="card">

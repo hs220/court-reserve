@@ -86,9 +86,12 @@ async def create_watch(
     duration: int = Form(120),
     interval: int = Form(60),
     timeout: int = Form(0),
+    probe_account_id: str = Form(""),
 ):
+    probe_id = int(probe_account_id) if probe_account_id.strip() else None
     params = json.dumps({"date": date, "time": time, "duration": duration,
-                         "interval": interval, "timeout": timeout})
+                         "interval": interval, "timeout": timeout,
+                         "probe_account_id": probe_id})
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
             account_id=account_id,
@@ -102,7 +105,8 @@ async def create_watch(
 
     apscheduler_setup.schedule_watch(job_id, account_id,
                                      {"date": date, "time": time, "duration": duration,
-                                      "interval": interval, "timeout": timeout})
+                                      "interval": interval, "timeout": timeout,
+                                      "probe_account_id": probe_id})
     return RedirectResponse("/jobs", status_code=303)
 
 
@@ -181,7 +185,8 @@ async def run_now(job_id: int):
 async def edit_job_form(request: Request, job_id: int):
     with engine.connect() as conn:
         j = _enrich_job(row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone()), conn)
-    return templates.TemplateResponse(request, "job_edit.html", context={"job": j})
+        all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
+    return templates.TemplateResponse(request, "job_edit.html", context={"job": j, "accounts": all_accounts})
 
 
 @router.post("/jobs/{job_id}/edit")
@@ -193,6 +198,7 @@ async def update_job(
     run_at: str = Form(""),
     interval: int = Form(60),
     timeout: int = Form(0),
+    probe_account_id: str = Form(""),
 ):
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
@@ -210,8 +216,10 @@ async def update_job(
                 run_at = fire_dt.strftime("%Y-%m-%dT%H:%M")
         new_params = json.dumps({"date": date, "time": time, "duration": duration, "run_at": run_at})
     else:
+        probe_id = int(probe_account_id) if probe_account_id.strip() else None
         new_params = json.dumps({"date": date, "time": time, "duration": duration,
-                                  "interval": interval, "timeout": timeout})
+                                  "interval": interval, "timeout": timeout,
+                                  "probe_account_id": probe_id})
 
     apscheduler_setup.remove_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
