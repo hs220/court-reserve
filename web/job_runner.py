@@ -268,7 +268,7 @@ def _deadline_timeout_minutes(deadline_mode: str, target_date, target_time: str,
     """Convert deadline_mode to minutes-from-now for the poll timeout. Returns 0 for infinite."""
     if deadline_mode == "infinite" or not target_time:
         return 0
-    offset_mins = 240 if deadline_mode == "4h" else 30
+    offset_mins = {"5h10m": 310, "4h10m": 250, "30m": 30}.get(deadline_mode, 250)
     tz = pytz.timezone(org_timezone)
     hour, minute = map(int, target_time.split(":"))
     court_naive = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
