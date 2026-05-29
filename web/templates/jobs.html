@@ -39,8 +39,8 @@
       <td data-label="Next Run" style="font-size:12px;color:var(--muted)">
         {% if j.next_run_at %}{{ j.next_run_at | localdt }}{% else %}—{% endif %}
       </td>
-      <td data-label="">
-        <div class="row-actions">
+      <td data-label="" style="white-space:nowrap">
+        <div class="row-actions" style="flex-wrap:nowrap;gap:4px">
           <a href="/jobs/{{ j.id }}/runs" class="btn btn-ghost btn-sm">Runs</a>
           <a href="/jobs/{{ j.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
           {% if j.type == "book_next" %}
