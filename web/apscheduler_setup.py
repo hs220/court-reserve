@@ -59,14 +59,6 @@ def schedule_book_next(job_id: int, account_id: int, params: dict):
     return apscheduler_id
 
 
-def _recurrent_fire_params(target_dow: int, days_out: int, release_hour: int, release_minute: int,
-                            offset_minutes: int = -2):
-    """Return (fire_dow_name, fire_hour, fire_minute) for a recurrent job's CronTrigger."""
-    fire_dow = DOW_NAMES[(target_dow - (days_out % 7) + 7) % 7]
-    total = release_hour * 60 + release_minute + offset_minutes
-    return fire_dow, (total // 60) % 24, total % 60
-
-
 # ── watch ─────────────────────────────────────────────────────────────────────
 
 def schedule_watch(job_id: int, account_id: int, params: dict):
@@ -99,61 +91,39 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
 # ── recurrent jobs ────────────────────────────────────────────────────────────
 
 def schedule_recurrent_book_next(job_id: int, account_id: int, params: dict, org: dict):
-    """Weekly CronTrigger: fires at the window-open time for the target day of week."""
-    from web.job_runner import run_book_next
+    """Weekly CronTrigger: fires 1 day before the release date at 6AM to create a book_next child job."""
+    from web.job_runner import run_recurrent_book_next
     apscheduler_id = f"recurrent_book_next_{job_id}_{int(time.time())}"
     days_out = get_days_out(account_id, org)
-    fire_dow, fire_hour, fire_minute = _recurrent_fire_params(
-        int(params["target_day_of_week"]), days_out,
-        org.get("release_hour", 12), org.get("release_minute", 0),
-    )
+    target_dow = int(params["target_day_of_week"])
+    fire_dow = DOW_NAMES[(target_dow - days_out - 1 + 70) % 7]
     tz = pytz.timezone(org.get("timezone", "America/Los_Angeles"))
-    trigger = CronTrigger(day_of_week=fire_dow, hour=fire_hour, minute=fire_minute, timezone=tz)
+    trigger = CronTrigger(day_of_week=fire_dow, hour=6, minute=0, timezone=tz)
     scheduler.add_job(
-        run_book_next,
+        run_recurrent_book_next,
         trigger,
         id=apscheduler_id,
-        kwargs={
-            "job_id": job_id,
-            "account_id": account_id,
-            "target_date_iso": None,
-            "target_time": params.get("time", ""),
-            "duration_override": int(params.get("duration") or 0),
-            "is_recurrent": True,
-        },
+        kwargs={"job_id": job_id, "account_id": account_id},
     )
     _persist_scheduler_id(job_id, apscheduler_id)
     return apscheduler_id
 
 
 def schedule_recurrent_watch(job_id: int, account_id: int, params: dict, org: dict):
-    """Weekly CronTrigger: starts a watch at window-open time for the target day of week."""
-    from web.job_runner import run_watch
+    """Weekly CronTrigger: fires at release+5min on the release date to create a watch child job."""
+    from web.job_runner import run_recurrent_watch
     apscheduler_id = f"recurrent_watch_{job_id}_{int(time.time())}"
     days_out = get_days_out(account_id, org)
-    fire_dow, fire_hour, fire_minute = _recurrent_fire_params(
-        int(params["target_day_of_week"]), days_out,
-        org.get("release_hour", 12), org.get("release_minute", 0),
-        offset_minutes=5,
-    )
+    target_dow = int(params["target_day_of_week"])
+    fire_dow = DOW_NAMES[(target_dow - days_out + 70) % 7]
+    total = org.get("release_hour", 12) * 60 + org.get("release_minute", 0) + 5
     tz = pytz.timezone(org.get("timezone", "America/Los_Angeles"))
-    trigger = CronTrigger(day_of_week=fire_dow, hour=fire_hour, minute=fire_minute, timezone=tz)
-    probe_id = params.get("probe_account_id")
+    trigger = CronTrigger(day_of_week=fire_dow, hour=total // 60, minute=total % 60, timezone=tz)
     scheduler.add_job(
-        run_watch,
+        run_recurrent_watch,
         trigger,
         id=apscheduler_id,
-        kwargs={
-            "job_id": job_id,
-            "account_id": account_id,
-            "target_date_iso": None,
-            "target_time": params.get("time", ""),
-            "duration": int(params.get("duration", 120)),
-            "interval": int(params.get("interval", 60)),
-            "timeout_minutes": int(params.get("timeout", 0)),
-            "probe_account_id": int(probe_id) if probe_id else None,
-            "is_recurrent": True,
-        },
+        kwargs={"job_id": job_id, "account_id": account_id},
     )
     _persist_scheduler_id(job_id, apscheduler_id)
     return apscheduler_id

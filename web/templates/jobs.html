@@ -16,8 +16,7 @@
   <button class="tab-btn active" onclick="filterJobs(event,'all')">All</button>
   <button class="tab-btn" onclick="filterJobs(event,'book_next')">Book-Next</button>
   <button class="tab-btn" onclick="filterJobs(event,'watch')">Watch</button>
-  <button class="tab-btn" onclick="filterJobs(event,'recurrent_book_next')">Recurring Book-Next</button>
-  <button class="tab-btn" onclick="filterJobs(event,'recurrent_watch')">Recurring Watch</button>
+  <button class="tab-btn" onclick="filterJobs(event,'recurrent')">Recurring</button>
 </div>
 
 {% if jobs %}
@@ -64,7 +63,7 @@
         <div class="row-actions">
           <a href="/jobs/{{ j.id }}/runs" class="btn btn-ghost btn-sm">Runs</a>
           <a href="/jobs/{{ j.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
-          {% if j.type in ("book_next", "recurrent_book_next") %}
+          {% if j.type in ("book_next", "recurrent_book_next", "recurrent_watch") %}
           <form method="post" action="/jobs/{{ j.id }}/run_now" style="display:inline">
             <button class="btn btn-success btn-sm" data-loading="Starting…" title="Run immediately">▶ Now</button>
           </form>
@@ -323,7 +322,9 @@ function filterJobs(event, type) {
   event.target.classList.add('active');
   document.querySelectorAll('tbody tr').forEach(function(row) {
     var jobType = row.dataset.jobType || '';
-    var show = type === 'all' || jobType === type;
+    var show = type === 'all'
+      || (type === 'recurrent' && jobType.startsWith('recurrent_'))
+      || (type !== 'recurrent' && jobType === type);
     row.style.display = show ? '' : 'none';
   });
 }

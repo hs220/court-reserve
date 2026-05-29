@@ -143,7 +143,7 @@ def _record_booking(run_id: int, account_id: int, slot, duration_min: int):
 
 def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                   target_date_iso: str | None = None, target_time: str = "",
-                  duration_override: int = 0, is_recurrent: bool = False):
+                  duration_override: int = 0):
     """
     Book a court for target_date_iso (or days_out from today if not given).
     target_time may be a comma-separated list of preferred times in priority order.
@@ -259,15 +259,14 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
 
     _finish_run(run_id, status, buf.getvalue())
 
-    if not is_recurrent:
-        job_final = "completed" if status == "success" else "failed"
-        with engine.begin() as conn:
-            conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
+    job_final = "completed" if status == "success" else "failed"
+    with engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
 
 
 def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_time: str,
               duration: int, interval: int = 60, timeout_minutes: int = 0,
-              probe_account_id: int | None = None, is_recurrent: bool = False):
+              probe_account_id: int | None = None):
     """
     Poll until a specific slot opens on target_date at target_time, then book it.
     If probe_account_id is set, that account is used only for slot-availability checks
@@ -396,7 +395,110 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
 
     _finish_run(run_id, status, buf.getvalue())
 
-    if not is_recurrent:
-        job_final = "completed" if status == "success" else "failed"
+    job_final = "completed" if status == "success" else "failed"
+    with engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
+
+
+def run_recurrent_book_next(job_id: int, account_id: int):
+    """Create a one-shot book_next child job for the upcoming target date.
+    Called 1 day before the release date; target_date = today + days_out + 1."""
+    run_id = _start_run(job_id)
+    buf = io.StringIO()
+    status = "failed"
+    try:
+        account, org = _get_account_and_org(job_id, account_id)
+        tz = pytz.timezone(org["timezone"])
+        days_out = get_days_out(account_id, org)
+        today_local = datetime.now(tz).date()
+        target_date = today_local + timedelta(days=days_out + 1)
+
+        with engine.connect() as conn:
+            job_row = conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone()
+        params = json.loads(job_row.params or "{}")
+
+        release_date = today_local + timedelta(days=1)
+        release_hour = org.get("release_hour", 12)
+        release_minute = org.get("release_minute", 0)
+        fire_dt = tz.localize(datetime(
+            release_date.year, release_date.month, release_date.day,
+            release_hour, release_minute, 0,
+        )) - timedelta(minutes=2)
+        run_at = fire_dt.strftime("%Y-%m-%dT%H:%M") if fire_dt > datetime.now(tz) else ""
+
+        child_params = {
+            "date": target_date.isoformat(),
+            "time": params.get("time", ""),
+            "duration": params.get("duration", 0),
+            "run_at": run_at,
+        }
         with engine.begin() as conn:
-            conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
+            result = conn.execute(jobs.insert().values(
+                account_id=account_id,
+                org_id=job_row.org_id,
+                type="book_next",
+                params=json.dumps(child_params),
+                status="active",
+                cron_expr="",
+            ))
+            child_id = result.inserted_primary_key[0]
+
+        from web import apscheduler_setup as _aps
+        _aps.schedule_book_next(child_id, account_id, child_params)
+
+        buf.write(f"Created book_next job #{child_id} for {target_date}"
+                  f" (fires {run_at or 'at org release time'})\n")
+        status = "success"
+    except Exception as exc:
+        buf.write(f"ERROR: {exc}\n")
+
+    _finish_run(run_id, status, buf.getvalue())
+
+
+def run_recurrent_watch(job_id: int, account_id: int):
+    """Create a one-shot watch child job for the target date.
+    Called at release+5min on the release date; target_date = today + days_out."""
+    run_id = _start_run(job_id)
+    buf = io.StringIO()
+    status = "failed"
+    try:
+        account, org = _get_account_and_org(job_id, account_id)
+        tz = pytz.timezone(org["timezone"])
+        days_out = get_days_out(account_id, org)
+        today_local = datetime.now(tz).date()
+        target_date = today_local + timedelta(days=days_out)
+
+        with engine.connect() as conn:
+            job_row = conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone()
+        params = json.loads(job_row.params or "{}")
+        probe_id = params.get("probe_account_id")
+
+        child_params = {
+            "date": target_date.isoformat(),
+            "time": params.get("time", ""),
+            "duration": params.get("duration", 120),
+            "interval": params.get("interval", 60),
+            "timeout": params.get("timeout", 0),
+            "probe_account_id": probe_id,
+            "run_at": "",  # start immediately — window is already open
+        }
+        with engine.begin() as conn:
+            result = conn.execute(jobs.insert().values(
+                account_id=account_id,
+                org_id=job_row.org_id,
+                type="watch",
+                params=json.dumps(child_params),
+                status="active",
+                cron_expr="",
+            ))
+            child_id = result.inserted_primary_key[0]
+
+        from web import apscheduler_setup as _aps
+        _aps.schedule_watch(child_id, account_id, child_params)
+
+        buf.write(f"Created watch job #{child_id} for {target_date}\n")
+        status = "success"
+    except Exception as exc:
+        buf.write(f"ERROR: {exc}\n")
+
+    _finish_run(run_id, status, buf.getvalue())

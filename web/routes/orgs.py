@@ -54,7 +54,7 @@ async def dashboard(request: Request, week: str = None):
         orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
 
         all_jobs = conn.execute(text("""
-            SELECT j.id, j.type, j.params, j.status,
+            SELECT j.id, j.type, j.params, j.status, j.apscheduler_id, j.cron_expr,
                    o.name as org_name,
                    COALESCE(a.label, a.email) as account_label,
                    jr.id as run_id, jr.status as run_status,
@@ -65,7 +65,7 @@ async def dashboard(request: Request, week: str = None):
             LEFT JOIN job_runs jr ON jr.id = (
                 SELECT id FROM job_runs WHERE job_id = j.id ORDER BY id DESC LIMIT 1
             )
-            WHERE j.type IN ('watch', 'book_next')
+            WHERE j.type IN ('watch', 'book_next', 'recurrent_book_next', 'recurrent_watch')
             ORDER BY j.id DESC
         """)).fetchall()
 
@@ -79,23 +79,30 @@ async def dashboard(request: Request, week: str = None):
         """), {"start": week_start.isoformat(), "end": week_end.isoformat()}).fetchall()
 
     active_jobs = []
+    recurrent_jobs = []
     for r in all_jobs:
         try:
             params = json.loads(r[2] or "{}")
         except Exception:
             params = {}
-        active_jobs.append({
+        entry = {
             "job_id": r[0],
             "job_type": r[1],
             "params": params,
             "job_status": r[3],
-            "org_name": r[4],
-            "account_label": r[5],
-            "run_id": r[6],
-            "run_status": r[7],
-            "started_at": r[8],
-            "last_check": _last_check_time(r[9]) if r[1] == "watch" else None,
-        })
+            "apscheduler_id": r[4],
+            "cron_expr": r[5],
+            "org_name": r[6],
+            "account_label": r[7],
+            "run_id": r[8],
+            "run_status": r[9],
+            "started_at": r[10],
+            "last_check": _last_check_time(r[11]) if r[1] == "watch" else None,
+        }
+        if r[1] in ("recurrent_book_next", "recurrent_watch"):
+            recurrent_jobs.append(entry)
+        else:
+            active_jobs.append(entry)
 
     # Each booking gets top_px/height_px pre-computed (60px per hour, 1px per minute)
     CAL_START_HOUR = 8
@@ -122,9 +129,14 @@ async def dashboard(request: Request, week: str = None):
     prev_week = (week_start - timedelta(days=7)).isoformat()
     next_week = (week_start + timedelta(days=7)).isoformat()
 
+    from web import apscheduler_setup
+    for j in recurrent_jobs:
+        j["next_run_at"] = apscheduler_setup.get_next_run(j.get("apscheduler_id", ""))
+
     return templates.TemplateResponse(request, "dashboard.html", context={
         "orgs": orgs,
         "active_jobs": active_jobs,
+        "recurrent_jobs": recurrent_jobs,
         "week_days": week_days,
         "week_label": f"{week_start.strftime('%b %-d')} – {week_end.strftime('%b %-d, %Y')}",
         "bookings_by_date": bookings_by_date,
