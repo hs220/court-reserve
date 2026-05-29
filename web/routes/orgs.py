@@ -115,8 +115,10 @@ async def dashboard(request: Request, week: str = None):
             t = params.get("time", "")
             if d:
                 try:
-                    if t:
-                        court_dt = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")
+                    # time may be comma-separated (book_next); use first value
+                    first_t = t.split(",")[0].strip() if t else ""
+                    if first_t:
+                        court_dt = datetime.strptime(f"{d} {first_t}", "%Y-%m-%d %H:%M")
                     else:
                         court_dt = datetime.strptime(d, "%Y-%m-%d")
                     if court_dt > now:
