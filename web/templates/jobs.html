@@ -13,10 +13,10 @@
 
 <!-- Job type tabs -->
 <div class="job-tabs" style="margin-bottom:12px;display:flex;gap:4px;flex-wrap:wrap">
-  <button class="tab-btn active" onclick="filterJobs(event,'all')">All</button>
-  <button class="tab-btn" onclick="filterJobs(event,'book_next')">Book-Next</button>
-  <button class="tab-btn" onclick="filterJobs(event,'watch')">Watch</button>
-  <button class="tab-btn" onclick="filterJobs(event,'recurrent')">Recurring</button>
+  <button class="tab-btn" id="tab-all" onclick="filterJobs(event,'all')">All</button>
+  <button class="tab-btn" id="tab-book_next" onclick="filterJobs(event,'book_next')">Book-Next</button>
+  <button class="tab-btn" id="tab-watch" onclick="filterJobs(event,'watch')">Watch</button>
+  <button class="tab-btn" id="tab-recurrent" onclick="filterJobs(event,'recurrent')">Recurring</button>
 </div>
 
 {% if jobs %}
@@ -320,6 +320,10 @@
 function filterJobs(event, type) {
   document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
   event.target.classList.add('active');
+  _applyFilter(type);
+}
+
+function _applyFilter(type) {
   document.querySelectorAll('tbody tr').forEach(function(row) {
     var jobType = row.dataset.jobType || '';
     var show = type === 'all'
@@ -328,6 +332,19 @@ function filterJobs(event, type) {
     row.style.display = show ? '' : 'none';
   });
 }
+
+// Auto-activate tab from ?tab= query param
+(function() {
+  var params = new URLSearchParams(window.location.search);
+  var tab = params.get('tab') || 'all';
+  var btn = document.getElementById('tab-' + tab);
+  if (btn) {
+    btn.classList.add('active');
+    _applyFilter(tab);
+  } else {
+    document.getElementById('tab-all').classList.add('active');
+  }
+})();
 
 // ── Shared: create a flatpickr time-picker row ─────────────────────────────
 function createTimeRow(container, value) {
