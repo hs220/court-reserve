@@ -16,7 +16,8 @@
           {% endfor %}
         </select>
       </div>
-      <div class="form-group"><label>Days Out</label><input name="days_out" type="number" value="{{ org.days_out }}"></div>
+      <div class="form-group"><label>Resident Days Out</label><input name="resident_days_out" type="number" value="{{ org.resident_days_out }}"></div>
+      <div class="form-group"><label>Non-Resident Days Out</label><input name="nonresident_days_out" type="number" value="{{ org.nonresident_days_out }}"></div>
       <div class="form-group"><label>Release Hour (local)</label><input name="release_hour" type="number" value="{{ org.release_hour }}" min="0" max="23"></div>
       <div class="form-group"><label>Release Minute</label><input name="release_minute" type="number" value="{{ org.release_minute }}" min="0" max="59"></div>
     </div>

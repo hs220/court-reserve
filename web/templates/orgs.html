@@ -51,17 +51,84 @@
     </div>
   </div>
 
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;margin-bottom:16px">
     <div><span style="color:var(--muted)">Scheduler ID:</span> {{ o.scheduler_id }}</div>
     <div><span style="color:var(--muted)">Cost Type ID:</span> {{ o.cost_type_id }}</div>
     <div><span style="color:var(--muted)">Timezone:</span> {{ o.timezone }}</div>
-    <div><span style="color:var(--muted)">Days out:</span> {{ o.days_out }}</div>
     <div><span style="color:var(--muted)">Release:</span> {{ "%02d"|format(o.release_hour) }}:{{ "%02d"|format(o.release_minute) }} local</div>
+    <div><span style="color:var(--muted)">Resident days out:</span> {{ o.resident_days_out }}</div>
+    <div><span style="color:var(--muted)">Non-resident days out:</span> {{ o.nonresident_days_out }}</div>
+  </div>
+
+  <!-- Linked Accounts -->
+  <div style="border-top:1px solid var(--border);padding-top:12px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">Linked Accounts</span>
+      {% if all_accounts %}
+      <button class="btn btn-ghost btn-sm" onclick="openLinkModal({{ o.id }}, '{{ o.name | replace("'", "\\'") }}')">+ Link Account</button>
+      {% endif %}
+    </div>
+    {% set linked = org_accounts.get(o.id, []) %}
+    {% if linked %}
+    <table style="font-size:13px">
+      <thead><tr><th>Account</th><th>Resident?</th><th></th></tr></thead>
+      <tbody>
+      {% for acct in linked %}
+      <tr>
+        <td>{{ acct.account_label }}</td>
+        <td>
+          <form method="post" action="/orgs/{{ o.id }}/accounts/{{ acct.account_id }}/toggle_resident" style="display:inline">
+            <button class="btn btn-sm {% if acct.is_resident %}btn-success{% else %}btn-ghost{% endif %}" title="Click to toggle">
+              {% if acct.is_resident %}Resident{% else %}Non-resident{% endif %}
+            </button>
+          </form>
+        </td>
+        <td>
+          <form method="post" action="/orgs/{{ o.id }}/accounts/{{ acct.account_id }}/remove" style="display:inline" onsubmit="return confirm('Unlink this account?')">
+            <button class="btn btn-danger btn-sm">−</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p style="color:var(--muted);font-size:13px;margin:0">No accounts linked yet.</p>
+    {% endif %}
   </div>
 </div>
 {% else %}
 <div class="card"><div class="empty-state">No organizations yet. Add one below.</div></div>
 {% endfor %}
+
+<!-- Link Account Modal (shared, JS-controlled) -->
+<div class="modal-overlay" id="link-account-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('link-account-modal').classList.remove('open')">✕</button>
+    <h2>Link Account to <span id="link-modal-org-name"></span></h2>
+    <form method="post" id="link-account-form">
+      <div class="form-grid">
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Account</label>
+          <select name="account_id" required>
+            <option value="">— select —</option>
+            {% for a in all_accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" name="is_resident" value="1" style="width:auto;accent-color:var(--primary)">
+            Resident member
+          </label>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary">Link</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('link-account-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <!-- Add Account Modal -->
 <div class="modal-overlay" id="add-account-modal" onclick="if(event.target===this)this.classList.remove('open')">
@@ -109,7 +176,8 @@
             <option value="America/Denver">America/Denver</option>
           </select>
         </div>
-        <div class="form-group"><label>Days Out</label><input name="days_out" type="number" value="7"></div>
+        <div class="form-group"><label>Resident Days Out</label><input name="resident_days_out" type="number" value="7"></div>
+        <div class="form-group"><label>Non-Resident Days Out</label><input name="nonresident_days_out" type="number" value="7"></div>
         <div class="form-group"><label>Release Hour (local)</label><input name="release_hour" type="number" value="12" min="0" max="23"></div>
         <div class="form-group"><label>Release Minute</label><input name="release_minute" type="number" value="0" min="0" max="59"></div>
       </div>
@@ -120,4 +188,12 @@
     </form>
   </div>
 </div>
+
+<script>
+function openLinkModal(orgId, orgName) {
+  document.getElementById('link-modal-org-name').textContent = orgName;
+  document.getElementById('link-account-form').action = '/orgs/' + orgId + '/accounts';
+  document.getElementById('link-account-modal').classList.add('open');
+}
+</script>
 {% endblock %}

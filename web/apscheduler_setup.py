@@ -1,6 +1,7 @@
 """APScheduler configuration with SQLite job store for persistence across restarts."""
 
 import json
+import time
 from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -34,7 +35,7 @@ def shutdown():
 def schedule_book_next(job_id: int, account_id: int, params: dict):
     """Schedule a one-shot book_next job. Fires at params['run_at'] if provided, else immediately."""
     from web.job_runner import run_book_next
-    apscheduler_id = f"book_next_{job_id}"
+    apscheduler_id = f"book_next_{job_id}_{int(time.time())}"
     run_at = params.get("run_at")
     trigger = DateTrigger(run_date=datetime.fromisoformat(run_at)) if run_at else DateTrigger(run_date=datetime.now())
 
@@ -49,7 +50,6 @@ def schedule_book_next(job_id: int, account_id: int, params: dict):
             "target_time": params.get("time", ""),
             "duration_override": int(params.get("duration") or 0),
         },
-        replace_existing=True,
     )
     _persist_scheduler_id(job_id, apscheduler_id)
     return apscheduler_id
@@ -60,7 +60,7 @@ def schedule_book_next(job_id: int, account_id: int, params: dict):
 def schedule_watch(job_id: int, account_id: int, params: dict):
     """Schedule a one-shot watch job to run immediately (or at run_at if provided)."""
     from web.job_runner import run_watch
-    apscheduler_id = f"watch_{job_id}"
+    apscheduler_id = f"watch_{job_id}_{int(time.time())}"
     run_at = params.get("run_at")
     trigger = DateTrigger(run_date=datetime.fromisoformat(run_at)) if run_at else DateTrigger(run_date=datetime.now())
 
@@ -79,7 +79,6 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
             "timeout_minutes": int(params.get("timeout", 0)),
             "probe_account_id": int(probe_id) if probe_id else None,
         },
-        replace_existing=True,
     )
     _persist_scheduler_id(job_id, apscheduler_id)
     return apscheduler_id

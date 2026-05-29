@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, event, text
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, Boolean, ForeignKey,
-    MetaData, Table,
+    MetaData, Table, UniqueConstraint,
 )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / ".court-reserve-data"))
@@ -33,9 +33,18 @@ organizations = Table("organizations", metadata,
     Column("scheduler_id", String, nullable=False),
     Column("cost_type_id", String, nullable=False),
     Column("timezone", String, nullable=False, default="America/Los_Angeles"),
-    Column("days_out", Integer, default=7),
+    Column("resident_days_out", Integer, default=7),
+    Column("nonresident_days_out", Integer, default=7),
     Column("release_hour", Integer, default=12),     # local hour when slots open
     Column("release_minute", Integer, default=0),
+)
+
+account_orgs = Table("account_orgs", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("account_id", Integer, ForeignKey("accounts.id"), nullable=False),
+    Column("org_id", Integer, ForeignKey("organizations.id"), nullable=False),
+    Column("is_resident", Boolean, default=False),
+    UniqueConstraint("account_id", "org_id"),
 )
 
 accounts = Table("accounts", metadata,
@@ -90,8 +99,9 @@ SEED_ORGS = [
 
 def init_db():
     metadata.create_all(engine)
-    _seed_orgs()
     _migrate_accounts_org_optional()
+    _migrate_orgs_resident_days_out()
+    _seed_orgs()
 
 
 def _migrate_accounts_org_optional():
@@ -121,6 +131,27 @@ def _migrate_accounts_org_optional():
         conn.execute(text("ALTER TABLE accounts_new RENAME TO accounts"))
 
 
+def _migrate_orgs_resident_days_out():
+    """Add resident_days_out / nonresident_days_out if missing, seeding from days_out."""
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='organizations'"
+        )).fetchone()
+        if not row:
+            return
+        sql = row[0] or ""
+        if "resident_days_out" in sql:
+            return
+        has_days_out = "days_out" in sql
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE organizations ADD COLUMN resident_days_out INTEGER DEFAULT 7"))
+        conn.execute(text("ALTER TABLE organizations ADD COLUMN nonresident_days_out INTEGER DEFAULT 7"))
+        if has_days_out:
+            conn.execute(text(
+                "UPDATE organizations SET resident_days_out = days_out, nonresident_days_out = days_out"
+            ))
+
+
 def _seed_orgs():
     with engine.connect() as conn:
         if conn.execute(organizations.select().limit(1)).fetchone():
@@ -133,7 +164,8 @@ def _seed_orgs():
                 scheduler_id=o["scheduler_id"],
                 cost_type_id=o["cost_type_id"],
                 timezone="America/Los_Angeles",
-                days_out=7,
+                resident_days_out=7,
+                nonresident_days_out=7,
                 release_hour=12,
                 release_minute=0,
             ))
@@ -156,3 +188,17 @@ def json_field(val) -> list:
         return json.loads(val or "[]")
     except Exception:
         return []
+
+
+def get_days_out(account_id: int, org: dict) -> int:
+    """Return days_out for account+org based on residency (defaults to nonresident)."""
+    with engine.connect() as conn:
+        link = conn.execute(
+            account_orgs.select().where(
+                (account_orgs.c.account_id == account_id) &
+                (account_orgs.c.org_id == org["id"])
+            )
+        ).fetchone()
+    if link and link.is_resident:
+        return org.get("resident_days_out", 7)
+    return org.get("nonresident_days_out", 7)

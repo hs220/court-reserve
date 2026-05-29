@@ -61,7 +61,7 @@ from booking import (OrgConfig, get_available_slots, find_best_slot, book_slot,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError)
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
-from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict
+from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict, get_days_out
 
 _NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof"]
 
@@ -161,7 +161,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
     session_file = _session_file(account, org)
     preferred_times = _parse_preferred_times(target_time)
     default_duration = duration_override if duration_override > 0 else 0
-    days_out = org.get("days_out", 7)
+    days_out = get_days_out(account_id, org)
     tz = pytz.timezone(org_cfg.timezone)
 
     today_local = datetime.now(tz).date()

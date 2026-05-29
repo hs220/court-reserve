@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select, update
 
-from web.database import engine, jobs, accounts, organizations, job_runs, bookings, row_to_dict, json_field
+from web.database import engine, jobs, accounts, organizations, job_runs, bookings, row_to_dict, json_field, get_days_out
 from web import apscheduler_setup
 from web.templates_shared import templates
 
@@ -52,7 +52,8 @@ async def create_book_next(
 
     if not run_at:
         tz = pytz.timezone(org["timezone"])
-        fire_date = date_cls.fromisoformat(date) - timedelta(days=org["days_out"])
+        days_out = get_days_out(account_id, org)
+        fire_date = date_cls.fromisoformat(date) - timedelta(days=days_out)
         fire_dt = tz.localize(datetime(
             fire_date.year, fire_date.month, fire_date.day,
             org["release_hour"], org["release_minute"], 0,
@@ -207,7 +208,8 @@ async def update_job(
     if j["type"] == "book_next":
         if not run_at:
             tz = pytz.timezone(org["timezone"])
-            fire_date = date_cls.fromisoformat(date) - timedelta(days=org["days_out"])
+            days_out = get_days_out(j["account_id"], org)
+            fire_date = date_cls.fromisoformat(date) - timedelta(days=days_out)
             fire_dt = tz.localize(datetime(
                 fire_date.year, fire_date.month, fire_date.day,
                 org["release_hour"], org["release_minute"], 0,

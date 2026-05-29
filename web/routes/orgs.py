@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from sqlalchemy import text
-from web.database import engine, organizations, accounts, bookings, row_to_dict, DATA_DIR
+from web.database import engine, organizations, accounts, account_orgs, bookings, row_to_dict, DATA_DIR
 from web.templates_shared import templates
 
 router = APIRouter()
@@ -141,9 +141,23 @@ async def list_orgs(request: Request):
     with engine.connect() as conn:
         orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
+        link_rows = conn.execute(text("""
+            SELECT ao.org_id, ao.account_id, ao.is_resident,
+                   COALESCE(a.label, a.email) as account_label
+            FROM account_orgs ao
+            JOIN accounts a ON a.id = ao.account_id
+        """)).fetchall()
+    org_accounts = {}
+    for r in link_rows:
+        org_accounts.setdefault(r[0], []).append({
+            "account_id": r[1],
+            "is_resident": bool(r[2]),
+            "account_label": r[3],
+        })
     return templates.TemplateResponse(request, "orgs.html", context={
         "orgs": orgs,
         "all_accounts": all_accounts,
+        "org_accounts": org_accounts,
     })
 
 
@@ -155,14 +169,16 @@ async def create_org(
     scheduler_id: str = Form(...),
     cost_type_id: str = Form(...),
     timezone: str = Form("America/Los_Angeles"),
-    days_out: int = Form(7),
+    resident_days_out: int = Form(7),
+    nonresident_days_out: int = Form(7),
     release_hour: int = Form(12),
     release_minute: int = Form(0),
 ):
     with engine.begin() as conn:
         conn.execute(organizations.insert().values(
             name=name, org_id=org_id, scheduler_id=scheduler_id, cost_type_id=cost_type_id,
-            timezone=timezone, days_out=days_out,
+            timezone=timezone, resident_days_out=resident_days_out,
+            nonresident_days_out=nonresident_days_out,
             release_hour=release_hour, release_minute=release_minute,
         ))
     return RedirectResponse("/orgs", status_code=303)
@@ -186,7 +202,8 @@ async def update_org(
     scheduler_id: str = Form(...),
     cost_type_id: str = Form(...),
     timezone: str = Form("America/Los_Angeles"),
-    days_out: int = Form(7),
+    resident_days_out: int = Form(7),
+    nonresident_days_out: int = Form(7),
     release_hour: int = Form(12),
     release_minute: int = Form(0),
 ):
@@ -194,7 +211,8 @@ async def update_org(
         conn.execute(
             organizations.update().where(organizations.c.id == org_db_id).values(
                 name=name, org_id=org_id, scheduler_id=scheduler_id, cost_type_id=cost_type_id,
-                timezone=timezone, days_out=days_out,
+                timezone=timezone, resident_days_out=resident_days_out,
+                nonresident_days_out=nonresident_days_out,
                 release_hour=release_hour, release_minute=release_minute,
             )
         )
@@ -251,6 +269,48 @@ async def create_account(
 async def delete_account(account_id: int):
     with engine.begin() as conn:
         conn.execute(accounts.delete().where(accounts.c.id == account_id))
+    return RedirectResponse("/orgs", status_code=303)
+
+
+@router.post("/orgs/{org_db_id}/accounts")
+async def link_account_to_org(
+    org_db_id: int,
+    account_id: int = Form(...),
+    is_resident: str = Form(""),
+):
+    is_res = is_resident == "1"
+    with engine.connect() as conn:
+        exists = conn.execute(
+            account_orgs.select().where(
+                (account_orgs.c.account_id == account_id) &
+                (account_orgs.c.org_id == org_db_id)
+            )
+        ).fetchone()
+    if not exists:
+        with engine.begin() as conn:
+            conn.execute(account_orgs.insert().values(
+                account_id=account_id, org_id=org_db_id, is_resident=is_res,
+            ))
+    return RedirectResponse("/orgs", status_code=303)
+
+
+@router.post("/orgs/{org_db_id}/accounts/{account_id}/remove")
+async def unlink_account_from_org(org_db_id: int, account_id: int):
+    with engine.begin() as conn:
+        conn.execute(account_orgs.delete().where(
+            (account_orgs.c.account_id == account_id) &
+            (account_orgs.c.org_id == org_db_id)
+        ))
+    return RedirectResponse("/orgs", status_code=303)
+
+
+@router.post("/orgs/{org_db_id}/accounts/{account_id}/toggle_resident")
+async def toggle_resident(org_db_id: int, account_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE account_orgs SET is_resident = NOT is_resident
+            WHERE account_id = :aid AND org_id = :oid
+        """), {"aid": account_id, "oid": org_db_id})
     return RedirectResponse("/orgs", status_code=303)
 
 
