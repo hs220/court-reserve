@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import random
+import smtplib
 import subprocess
 import sys
 import time
+import traceback
 from datetime import date, datetime, timedelta
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import pytz
@@ -31,6 +35,29 @@ def _notify(title: str, message: str) -> None:
         )
     except Exception:
         pass
+
+
+def _send_failure_email(subject: str, body: str) -> None:
+    """Send a failure notification email via SMTP. Requires NOTIFY_EMAIL and SMTP_PASSWORD env vars."""
+    to_addr = os.environ.get("NOTIFY_EMAIL")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    if not to_addr or not smtp_password:
+        return
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", to_addr)
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = f"[court-reserve] {subject}"
+        msg["From"] = smtp_user
+        msg["To"] = to_addr
+        with smtplib.SMTP(smtp_host, smtp_port) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_password)
+            s.sendmail(smtp_user, [to_addr], msg.as_string())
+        print(f"Failure email sent to {to_addr}")
+    except Exception as e:
+        print(f"Failed to send notification email: {e}")
 
 
 def watch_and_book(page, probe_page, target_date: date, target_time: str, duration: int,
@@ -176,12 +203,21 @@ def cmd_book_next(args, cfg):
             time.sleep(wait)
         try:
             cmd_book(args, cfg)  # raises SystemExit on completion (success or failure)
-        except SystemExit:
+        except SystemExit as exc:
+            if exc.code != 0:
+                _send_failure_email(
+                    f"Booking failed for {target_date}",
+                    f"book-next exited with failure for {target_date}.\n\nNo court was booked.",
+                )
             raise
         except Exception as exc:
             if attempt < MAX_RETRIES and _is_network_error(exc):
                 print(f"Network error: {exc}")
                 continue
+            _send_failure_email(
+                f"Booking error for {target_date}",
+                f"book-next failed for {target_date} after {attempt + 1} attempt(s).\n\n{traceback.format_exc()}",
+            )
             raise
 
 
