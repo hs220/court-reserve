@@ -75,7 +75,9 @@ def watch_and_book(page, probe_page, target_date: date, target_time: str, durati
             success = book_slot(page, booking_url, match, duration_minutes=duration, org=org) if org else book_slot(page, booking_url, match, duration_minutes=duration)
             if success:
                 _notify("CourtReserve", f"Court booked for {target_time} on {target_date}")
-            return success
+                return True
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}] Booking attempt failed (slot may not be fully released yet) — will retry in {interval}s...")
 
         if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
             print(f"Timeout after {timeout_minutes}m — no slot found at {target_time} on {target_date}.")

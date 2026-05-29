@@ -80,7 +80,7 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
             "target_time": params["time"],
             "duration": int(params.get("duration", 120)),
             "interval": int(params.get("interval", 60)),
-            "timeout_minutes": int(params.get("timeout", 0)),
+            "deadline_mode": params.get("deadline_mode", "4h"),
             "probe_account_id": int(probe_id) if probe_id else None,
         },
     )

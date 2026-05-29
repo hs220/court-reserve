@@ -264,8 +264,21 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
 
 
+def _deadline_timeout_minutes(deadline_mode: str, target_date, target_time: str, org_timezone: str) -> int:
+    """Convert deadline_mode to minutes-from-now for the poll timeout. Returns 0 for infinite."""
+    if deadline_mode == "infinite" or not target_time:
+        return 0
+    offset_mins = 240 if deadline_mode == "4h" else 30
+    tz = pytz.timezone(org_timezone)
+    hour, minute = map(int, target_time.split(":"))
+    court_naive = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+    deadline_dt = tz.localize(court_naive) - timedelta(minutes=offset_mins)
+    remaining = (deadline_dt - datetime.now(tz)).total_seconds() / 60
+    return max(0, int(remaining))
+
+
 def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_time: str,
-              duration: int, interval: int = 60, timeout_minutes: int = 0,
+              duration: int, interval: int = 60, deadline_mode: str = "4h",
               probe_account_id: int | None = None):
     """
     Poll until a specific slot opens on target_date at target_time, then book it.
@@ -299,12 +312,14 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
             probe_account = None
 
         time_desc = target_time if target_time else "any time"
+        timeout_minutes = _deadline_timeout_minutes(deadline_mode, target_date, target_time, org_cfg.timezone)
+        deadline_desc = f"stop {deadline_mode} before court" if deadline_mode != "infinite" else "no timeout"
 
         with _capture(buf):
             if probe_account:
                 print(f"watch: probe account '{probe_account.get('label') or probe_account['email']}' for detection; "
                       f"booking account '{account.get('label') or account['email']}'")
-            print(f"watch: polling for {time_desc} on {target_date_iso} (interval={interval}s, timeout={timeout_minutes}m)")
+            print(f"watch: polling for {time_desc} on {target_date_iso} (interval={interval}s, {deadline_desc}, ~{timeout_minutes}m remaining)")
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
 
@@ -478,7 +493,7 @@ def run_recurrent_watch(job_id: int, account_id: int):
             "time": params.get("time", ""),
             "duration": params.get("duration", 120),
             "interval": params.get("interval", 60),
-            "timeout": params.get("timeout", 0),
+            "deadline_mode": params.get("deadline_mode", "4h"),
             "probe_account_id": probe_id,
             "run_at": "",  # start immediately — window is already open
         }

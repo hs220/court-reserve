@@ -139,7 +139,7 @@ async def create_watch(
     time: str = Form(""),
     duration: int = Form(120),
     interval: int = Form(60),
-    timeout: int = Form(0),
+    deadline_mode: str = Form("4h"),
     probe_account_id: str = Form(""),
 ):
     probe_id = int(probe_account_id) if probe_account_id.strip() else None
@@ -150,7 +150,7 @@ async def create_watch(
     run_at = _watch_window_run_at(account_id, org, date)
 
     params = json.dumps({"date": date, "time": time, "duration": duration,
-                         "interval": interval, "timeout": timeout,
+                         "interval": interval, "deadline_mode": deadline_mode,
                          "probe_account_id": probe_id, "run_at": run_at})
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
@@ -165,7 +165,7 @@ async def create_watch(
 
     apscheduler_setup.schedule_watch(job_id, account_id,
                                      {"date": date, "time": time, "duration": duration,
-                                      "interval": interval, "timeout": timeout,
+                                      "interval": interval, "deadline_mode": deadline_mode,
                                       "probe_account_id": probe_id, "run_at": run_at})
     return RedirectResponse("/jobs", status_code=303)
 
@@ -207,7 +207,7 @@ async def create_recurrent_watch(
     time: str = Form(""),
     duration: int = Form(120),
     interval: int = Form(60),
-    timeout: int = Form(0),
+    deadline_mode: str = Form("4h"),
     probe_account_id: str = Form(""),
 ):
     probe_id = int(probe_account_id) if probe_account_id.strip() else None
@@ -216,7 +216,7 @@ async def create_recurrent_watch(
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
 
     params_dict = {"target_day_of_week": target_day_of_week, "time": time, "duration": duration,
-                   "interval": interval, "timeout": timeout, "probe_account_id": probe_id}
+                   "interval": interval, "deadline_mode": deadline_mode, "probe_account_id": probe_id}
     cron_expr = _recurrent_cron_expr(account_id, org, target_day_of_week, "recurrent_watch")
 
     with engine.begin() as conn:
@@ -335,7 +335,7 @@ async def update_job(
     duration: int = Form(0),
     run_at: str = Form(""),
     interval: int = Form(60),
-    timeout: int = Form(0),
+    deadline_mode: str = Form("4h"),
     probe_account_id: str = Form(""),
 ):
     with engine.connect() as conn:
@@ -364,7 +364,7 @@ async def update_job(
         probe_id = int(probe_account_id) if probe_account_id.strip() else None
         run_at = _watch_window_run_at(j["account_id"], org, date)
         new_params = json.dumps({"date": date, "time": time, "duration": duration,
-                                  "interval": interval, "timeout": timeout,
+                                  "interval": interval, "deadline_mode": deadline_mode,
                                   "probe_account_id": probe_id, "run_at": run_at})
         with engine.begin() as conn:
             conn.execute(update(jobs).where(jobs.c.id == job_id).values(params=new_params, status="active"))
@@ -383,7 +383,7 @@ async def update_job(
             cron_expr = _recurrent_cron_expr(j["account_id"], org, dow, "recurrent_watch")
             probe_id = int(probe_account_id) if probe_account_id.strip() else None
             new_params = json.dumps({"target_day_of_week": dow, "time": time, "duration": duration,
-                                      "interval": interval, "timeout": timeout, "probe_account_id": probe_id})
+                                      "interval": interval, "deadline_mode": deadline_mode, "probe_account_id": probe_id})
             with engine.begin() as conn:
                 conn.execute(update(jobs).where(jobs.c.id == job_id).values(
                     params=new_params, cron_expr=cron_expr, status="active"))
