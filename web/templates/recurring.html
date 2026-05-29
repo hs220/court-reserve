@@ -1,0 +1,238 @@
+{% extends "base.html" %}
+{% block title %}Recurring — CourtReserve Manager{% endblock %}
+{% block content %}
+<div class="card-header">
+  <h1>Recurring Jobs</h1>
+  <div class="row-actions">
+    <button class="btn btn-primary" onclick="openRbnModal()">+ Recurring Book-Next</button>
+    <button class="btn btn-ghost" id="open-rwatch-btn" onclick="openRwatchModal()">+ Recurring Watch</button>
+  </div>
+</div>
+
+{% if jobs %}
+<div class="card" style="padding:0;overflow-x:auto">
+  <table class="jobs-table">
+    <thead><tr>
+      <th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target</th><th>Schedule</th><th>Next Run</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% set dow_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] %}
+    {% for j in jobs %}
+    <tr>
+      <td data-label="Type"><strong>{{ "book-next" if j.type == "recurrent_book_next" else "watch" }}</strong></td>
+      <td data-label="Org">{{ j.org.name if j.org else "—" }}</td>
+      <td data-label="Account">{{ j.account.label or j.account.email if j.account else "—" }}</td>
+      <td data-label="Status"><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+      <td data-label="Target">
+        Every {{ dow_names[j.params.target_day_of_week] if j.params.target_day_of_week is not none else "?" }}
+        {{ j.params.time.replace(",", " / ") if j.params.time else "any time" }}
+        ({{ j.params.duration ~ "min" if j.params.duration else "org default" }})
+        {% if j.type == "recurrent_watch" %}
+          <span style="color:var(--muted)">, poll {{ j.params.interval }}s</span>
+          {% if j.params.probe_account_id %}<span style="color:var(--muted)"> [probe acct]</span>{% endif %}
+        {% endif %}
+      </td>
+      <td data-label="Schedule" style="font-size:12px;color:var(--muted)">{{ j.cron_expr or "—" }}</td>
+      <td data-label="Next Run" style="font-size:12px;color:var(--muted)">
+        {% if j.next_run_at %}{{ j.next_run_at | localdt }}{% else %}—{% endif %}
+      </td>
+      <td data-label="">
+        <div class="row-actions">
+          <a href="/jobs/{{ j.id }}/runs" class="btn btn-ghost btn-sm">Runs</a>
+          <a href="/jobs/{{ j.id }}/edit" class="btn btn-ghost btn-sm">Edit</a>
+          <form method="post" action="/jobs/{{ j.id }}/run_now" style="display:inline">
+            <button class="btn btn-success btn-sm" data-loading="Creating…" title="Create child job now">▶ Now</button>
+          </form>
+          {% if j.status == "active" %}
+          <form method="post" action="/jobs/{{ j.id }}/pause" style="display:inline">
+            <button class="btn btn-warning btn-sm">Pause</button>
+          </form>
+          {% elif j.status == "paused" %}
+          <form method="post" action="/jobs/{{ j.id }}/resume" style="display:inline">
+            <button class="btn btn-success btn-sm">Resume</button>
+          </form>
+          {% endif %}
+          <form method="post" action="/jobs/{{ j.id }}/delete" style="display:inline" onsubmit="return confirm('Delete this recurring job?')">
+            <button class="btn btn-danger btn-sm">✕</button>
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card"><div class="empty-state">No recurring jobs yet.</div></div>
+{% endif %}
+
+<!-- Add Recurring Book-Next Modal -->
+<div class="modal-overlay" id="add-rbn-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('add-rbn-modal').classList.remove('open')">✕</button>
+    <h2>New Recurring Book-Next</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Creates a book-next job each week — fires 1 day before the release date at 6 AM.</p>
+    <form method="post" action="/jobs/recurrent_book_next" id="rbn-form">
+      <div class="form-grid">
+        <div class="form-group"><label>Organization</label>
+          <select name="org_db_id">
+            <option value="">— select —</option>
+            {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Account</label>
+          <select name="account_id">
+            <option value="">— select —</option>
+            {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Target Day of Week</label>
+          <select name="target_day_of_week">
+            <option value="0">Monday</option>
+            <option value="1">Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Duration</label>
+          <select name="duration">
+            <option value="0">Any</option>
+            <option value="30">30 min</option>
+            <option value="60">60 min</option>
+            <option value="90">90 min</option>
+            <option value="120">120 min</option>
+          </select>
+        </div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Preferred Times <span style="color:var(--muted);font-weight:400;text-transform:none">(priority order — leave empty for any)</span></label>
+          <div id="rbn-times-list"></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="rbn-add-time" style="margin-top:4px;align-self:flex-start">+ Add Time</button>
+          <input type="hidden" name="time" id="rbn-times-value">
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary">Create</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('add-rbn-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Add Recurring Watch Modal -->
+<div class="modal-overlay" id="add-rwatch-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal">
+    <button class="modal-close" onclick="document.getElementById('add-rwatch-modal').classList.remove('open')">✕</button>
+    <h2>New Recurring Watch</h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Creates a watch job each week — fires 5 min after the booking window opens.</p>
+    <form method="post" action="/jobs/recurrent_watch">
+      <div class="form-grid">
+        <div class="form-group"><label>Organization</label>
+          <select name="org_db_id">
+            <option value="">— select —</option>
+            {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Account</label>
+          <select name="account_id">
+            <option value="">— select —</option>
+            {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="form-group"><label>Target Day of Week</label>
+          <select name="target_day_of_week">
+            <option value="0">Monday</option>
+            <option value="1">Tuesday</option>
+            <option value="2">Wednesday</option>
+            <option value="3">Thursday</option>
+            <option value="4">Friday</option>
+            <option value="5">Saturday</option>
+            <option value="6">Sunday</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
+          <input id="rw-time" name="time" placeholder="any available" autocomplete="off">
+        </div>
+        <div class="form-group"><label>Duration</label>
+          <select name="duration">
+            <option value="0">Any (use default)</option>
+            <option value="30">30 min</option>
+            <option value="60">60 min</option>
+            <option value="90">90 min</option>
+            <option value="120" selected>120 min</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Poll Interval (sec)</label><input name="interval" type="number" value="60"></div>
+        <div class="form-group"><label>Timeout (min, 0=∞)</label><input name="timeout" type="number" value="0"></div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — slot detection only)</span></label>
+          <select name="probe_account_id">
+            <option value="">— same as booking account —</option>
+            {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary">Create</button>
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('add-rwatch-modal').classList.remove('open')">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+function createTimeRow(container, value) {
+  const row = document.createElement('div');
+  row.className = 'time-entry-row';
+  const inp = document.createElement('input');
+  inp.placeholder = 'HH:MM';
+  inp.value = value || '';
+  inp.autocomplete = 'off';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-ghost btn-sm';
+  btn.textContent = '−';
+  btn.onclick = function() { row.remove(); };
+  row.appendChild(inp);
+  row.appendChild(btn);
+  container.appendChild(row);
+  flatpickr(inp, {
+    enableTime: true, noCalendar: true, dateFormat: 'H:i',
+    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
+  });
+}
+
+var rbnInit = false;
+function openRbnModal() {
+  document.getElementById('add-rbn-modal').classList.add('open');
+  if (rbnInit) return;
+  rbnInit = true;
+  const list = document.getElementById('rbn-times-list');
+  createTimeRow(list, '');
+}
+
+document.getElementById('rbn-add-time').addEventListener('click', function() {
+  createTimeRow(document.getElementById('rbn-times-list'), '');
+});
+
+document.getElementById('rbn-form').addEventListener('submit', function() {
+  const vals = Array.from(document.querySelectorAll('#rbn-times-list .time-entry-row input'))
+    .map(function(i) { return i.value.trim(); }).filter(Boolean);
+  document.getElementById('rbn-times-value').value = vals.join(',');
+});
+
+var rwInit = false;
+function openRwatchModal() {
+  document.getElementById('add-rwatch-modal').classList.add('open');
+  if (rwInit) return;
+  rwInit = true;
+  flatpickr('#rw-time', {
+    enableTime: true, noCalendar: true, dateFormat: 'H:i',
+    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
+  });
+}
+</script>
+{% endblock %}

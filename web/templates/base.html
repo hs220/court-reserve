@@ -21,9 +21,9 @@
     <div class="sidebar-logo">🎾 CR Manager</div>
     <a href="/" class="nav-link {% if request.url.path == '/' %}active{% endif %}">Dashboard</a>
     <a href="/orgs" class="nav-link {% if '/orgs' in request.url.path %}active{% endif %}">Organizations</a>
-    <a href="/jobs" class="nav-link {% if '/jobs' in request.url.path and request.query_params.get('tab') != 'recurring' %}active{% endif %}">Jobs</a>
+    <a href="/jobs" class="nav-link {% if request.url.path == '/jobs' or (request.url.path.startswith('/jobs/') and 'recurring' not in request.url.path) %}active{% endif %}">Jobs</a>
     <a href="/reservations" class="nav-link {% if '/reservations' in request.url.path %}active{% endif %}">Reservations</a>
-    <a href="/jobs?tab=recurring" class="nav-link {% if request.query_params.get('tab') == 'recurring' %}active{% endif %}">Recurring</a>
+    <a href="/recurring" class="nav-link {% if request.url.path == '/recurring' %}active{% endif %}">Recurring</a>
   </nav>
   <main class="content">
     {% block content %}{% endblock %}

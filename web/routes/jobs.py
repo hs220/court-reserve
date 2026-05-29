@@ -13,6 +13,10 @@ from web.templates_shared import templates
 router = APIRouter()
 
 
+def _job_list_url(job_type: str) -> str:
+    return "/recurring" if job_type.startswith("recurrent_") else "/jobs"
+
+
 def _watch_window_run_at(account_id: int, org: dict, date_str: str) -> str:
     """Return ISO datetime string when the booking window opens for this date, or '' if already open."""
     tz = pytz.timezone(org["timezone"])
@@ -55,10 +59,32 @@ def _enrich_job(j: dict, conn) -> dict:
 async def list_jobs(request: Request):
     with engine.connect() as conn:
         all_jobs = [_enrich_job(row_to_dict(r), conn)
-                    for r in conn.execute(jobs.select().order_by(jobs.c.created_at.desc()))]
+                    for r in conn.execute(
+                        jobs.select()
+                        .where(jobs.c.type.in_(["book_next", "watch"]))
+                        .order_by(jobs.c.created_at.desc())
+                    )]
         all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
     return templates.TemplateResponse(request, "jobs.html", context={
+        "jobs": all_jobs,
+        "orgs": all_orgs,
+        "accounts": all_accounts,
+    })
+
+
+@router.get("/recurring", response_class=HTMLResponse)
+async def list_recurring(request: Request):
+    with engine.connect() as conn:
+        all_jobs = [_enrich_job(row_to_dict(r), conn)
+                    for r in conn.execute(
+                        jobs.select()
+                        .where(jobs.c.type.in_(["recurrent_book_next", "recurrent_watch"]))
+                        .order_by(jobs.c.created_at.desc())
+                    )]
+        all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
+        all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
+    return templates.TemplateResponse(request, "recurring.html", context={
         "jobs": all_jobs,
         "orgs": all_orgs,
         "accounts": all_accounts,
@@ -170,7 +196,7 @@ async def create_recurrent_book_next(
         job_id = result.inserted_primary_key[0]
 
     apscheduler_setup.schedule_recurrent_book_next(job_id, account_id, params_dict, org)
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse("/recurring", status_code=303)
 
 
 @router.post("/jobs/recurrent_watch")
@@ -205,7 +231,7 @@ async def create_recurrent_watch(
         job_id = result.inserted_primary_key[0]
 
     apscheduler_setup.schedule_recurrent_watch(job_id, account_id, params_dict, org)
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse("/recurring", status_code=303)
 
 
 @router.post("/jobs/{job_id}/pause")
@@ -215,7 +241,7 @@ async def pause_job(job_id: int):
     apscheduler_setup.pause_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="paused"))
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
 @router.post("/jobs/{job_id}/resume")
@@ -225,7 +251,7 @@ async def resume_job(job_id: int):
     apscheduler_setup.resume_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="active"))
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
 @router.post("/jobs/{job_id}/delete")
@@ -241,7 +267,7 @@ async def delete_job(job_id: int):
             conn.execute(bookings.delete().where(bookings.c.job_run_id.in_(run_ids)))
         conn.execute(job_runs.delete().where(job_runs.c.job_id == job_id))
         conn.execute(jobs.delete().where(jobs.c.id == job_id))
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
 @router.post("/jobs/{job_id}/restart")
@@ -261,7 +287,7 @@ async def restart_job(job_id: int):
         apscheduler_setup.schedule_recurrent_watch(job_id, j["account_id"], params, org)
     else:
         apscheduler_setup.schedule_watch(job_id, j["account_id"], params)
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
 @router.post("/jobs/{job_id}/run_now")
@@ -363,7 +389,7 @@ async def update_job(
                     params=new_params, cron_expr=cron_expr, status="active"))
             apscheduler_setup.schedule_recurrent_watch(job_id, j["account_id"], json.loads(new_params), org)
 
-    return RedirectResponse("/jobs", status_code=303)
+    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
 @router.get("/jobs/{job_id}/runs", response_class=HTMLResponse)
