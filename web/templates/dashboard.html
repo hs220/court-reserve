@@ -10,7 +10,7 @@
   </div>
   <div class="stat-card">
     <div class="stat-label">Active Jobs</div>
-    <div class="stat-value">{{ active_jobs | selectattr("job_status", "equalto", "active") | list | length }}</div>
+    <div class="stat-value">{{ pending_jobs | length }}</div>
   </div>
 </div>
 
@@ -51,10 +51,10 @@
 </div>
 {% endif %}
 
-{% if active_jobs %}
+{% if pending_jobs %}
 <div class="card">
   <div class="card-header">
-    <h2>Scheduled Jobs</h2>
+    <h2>Active Jobs</h2>
     <a href="/jobs" class="btn btn-ghost btn-sm">Manage</a>
   </div>
   <table>
@@ -62,7 +62,7 @@
       <th>Type</th><th>Org</th><th>Account</th><th>Target</th><th>Status</th><th>Details</th><th></th>
     </tr></thead>
     <tbody>
-    {% for j in active_jobs %}
+    {% for j in pending_jobs %}
     <tr>
       <td><span class="badge badge-{{ j.job_type }}">{{ j.job_type }}</span></td>
       <td>{{ j.org_name }}</td>
@@ -74,25 +74,46 @@
       <td><span class="badge badge-{{ j.job_status }}">{{ j.job_status }}</span></td>
       <td style="font-size:12px;color:var(--muted)">
         {% if j.job_type == "watch" %}
-          {% if j.last_check %}
-            check: {{ j.last_check }}
-          {% elif j.run_status == "running" %}
-            <span style="color:var(--yellow)">starting…</span>
-          {% else %}
-            —
-          {% endif %}
+          {% if j.last_check %}check: {{ j.last_check }}
+          {% elif j.run_status == "running" %}<span style="color:var(--yellow)">starting…</span>
+          {% else %}—{% endif %}
         {% else %}
-          {% if j.params.run_at %}
-            fires: {{ j.params.run_at }}
-          {% else %}
-            fires: org release time
-          {% endif %}
+          {% if j.params.run_at %}fires: {{ j.params.run_at }}{% else %}fires: org release time{% endif %}
         {% endif %}
       </td>
       <td>
-        {% if j.run_id %}
-        <a href="/jobs/{{ j.job_id }}/runs" class="btn btn-ghost btn-sm">Log</a>
-        {% endif %}
+        {% if j.run_id %}<a href="/jobs/{{ j.job_id }}/runs" class="btn btn-ghost btn-sm">Log</a>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if completed_jobs %}
+<div class="card">
+  <div class="card-header">
+    <h2>Completed / Failed</h2>
+    <a href="/jobs" class="btn btn-ghost btn-sm">Manage</a>
+  </div>
+  <table>
+    <thead><tr>
+      <th>Type</th><th>Org</th><th>Account</th><th>Target</th><th>Status</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for j in completed_jobs %}
+    <tr>
+      <td><span class="badge badge-{{ j.job_type }}">{{ j.job_type }}</span></td>
+      <td>{{ j.org_name }}</td>
+      <td>{{ j.account_label }}</td>
+      <td>
+        {{ j.params.date or "—" }}
+        {% if j.params.time %}<span style="color:var(--muted)"> {{ j.params.time }}</span>{% endif %}
+      </td>
+      <td><span class="badge badge-{{ j.job_status }}">{{ j.job_status }}</span></td>
+      <td>
+        {% if j.run_id %}<a href="/jobs/{{ j.job_id }}/runs" class="btn btn-ghost btn-sm">Log</a>{% endif %}
       </td>
     </tr>
     {% endfor %}
@@ -138,13 +159,14 @@
         {% for b in bookings_by_date.get(d.isoformat(), []) %}
         <div class="cal-booking-item"
              style="top:{{ b.top_px }}px; height:{{ b.height_px }}px"
-             title="{{ b.court_type }} · {{ b.duration_min }}min · {{ b.account_label }}">
+             title="{{ b.court_type }} · {{ b.duration_min }}min · {{ b.account_label }}{% if b.org_name %} · {{ b.org_name }}{% endif %}">
           <form method="post" action="/bookings/{{ b.id }}/delete" style="float:right;margin:0"
                 onsubmit="return confirm('Remove this entry from local tracking only.\n\nThe actual CourtReserve reservation is NOT cancelled.')">
             <button type="submit" class="cal-booking-del" title="Remove from local tracking (does not cancel the reservation)">✕</button>
           </form>
           <strong>{{ b.start_time }}</strong> {{ b.account_label }}
-          {% if b.duration_min %}<br><span style="opacity:.7;font-size:10px">{{ b.duration_min }}min</span>{% endif %}
+          {% if b.org_name %}<br><span style="opacity:.7;font-size:10px">{{ b.org_name }}</span>{% endif %}
+          {% if b.duration_min %}<span style="opacity:.7;font-size:10px"> · {{ b.duration_min }}min</span>{% endif %}
         </div>
         {% endfor %}
       </div>

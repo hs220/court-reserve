@@ -1,5 +1,5 @@
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Form
@@ -71,14 +71,20 @@ async def dashboard(request: Request, week: str = None):
 
         booking_rows = conn.execute(text("""
             SELECT b.id, b.date, b.start_time, b.court_type, b.duration_min,
-                   COALESCE(a.label, a.email) as account_label
+                   COALESCE(a.label, a.email) as account_label,
+                   o.name as org_name
             FROM bookings b
             JOIN accounts a ON a.id = b.account_id
+            LEFT JOIN job_runs jr ON jr.id = b.job_run_id
+            LEFT JOIN jobs jb ON jb.id = jr.job_id
+            LEFT JOIN organizations o ON o.id = jb.org_id
             WHERE b.date >= :start AND b.date <= :end
             ORDER BY b.date, b.start_time
         """), {"start": week_start.isoformat(), "end": week_end.isoformat()}).fetchall()
 
-    active_jobs = []
+    now = datetime.now()
+    pending_jobs = []
+    completed_jobs = []
     recurrent_jobs = []
     for r in all_jobs:
         try:
@@ -101,8 +107,22 @@ async def dashboard(request: Request, week: str = None):
         }
         if r[1] in ("recurrent_book_next", "recurrent_watch"):
             recurrent_jobs.append(entry)
+        elif r[3] in ("active", "paused"):
+            pending_jobs.append(entry)
         else:
-            active_jobs.append(entry)
+            # completed/failed — only show if court time is in the future
+            d = params.get("date", "")
+            t = params.get("time", "")
+            if d:
+                try:
+                    if t:
+                        court_dt = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")
+                    else:
+                        court_dt = datetime.strptime(d, "%Y-%m-%d")
+                    if court_dt > now:
+                        completed_jobs.append(entry)
+                except ValueError:
+                    pass
 
     # Each booking gets top_px/height_px pre-computed (60px per hour, 1px per minute)
     CAL_START_HOUR = 8
@@ -122,6 +142,7 @@ async def dashboard(request: Request, week: str = None):
             "court_type": r[3],
             "duration_min": r[4],
             "account_label": r[5],
+            "org_name": r[6],
             "top_px": top_px,
             "height_px": height_px,
         })
@@ -135,7 +156,8 @@ async def dashboard(request: Request, week: str = None):
 
     return templates.TemplateResponse(request, "dashboard.html", context={
         "orgs": orgs,
-        "active_jobs": active_jobs,
+        "pending_jobs": pending_jobs,
+        "completed_jobs": completed_jobs,
         "recurrent_jobs": recurrent_jobs,
         "week_days": week_days,
         "week_label": f"{week_start.strftime('%b %-d')} – {week_end.strftime('%b %-d, %Y')}",

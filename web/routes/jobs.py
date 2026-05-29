@@ -66,8 +66,11 @@ async def list_jobs(request: Request):
                     )]
         all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
+    active_jobs = [j for j in all_jobs if j["status"] in ("active", "paused")]
+    completed_jobs = [j for j in all_jobs if j["status"] not in ("active", "paused")]
     return templates.TemplateResponse(request, "jobs.html", context={
-        "jobs": all_jobs,
+        "active_jobs": active_jobs,
+        "completed_jobs": completed_jobs,
         "orgs": all_orgs,
         "accounts": all_accounts,
     })
