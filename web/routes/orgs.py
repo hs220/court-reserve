@@ -126,9 +126,9 @@ async def dashboard(request: Request, week: str = None):
                 except ValueError:
                     pass
 
-    # Each booking gets top_px/height_px pre-computed (60px per hour, 1px per minute)
+    # Each booking gets top_px/height_px pre-computed (30px per hour, 0.5px per minute)
     CAL_START_HOUR = 8
-    PX_PER_HOUR = 60
+    PX_PER_HOUR = 30
     bookings_by_date = {}
     for r in booking_rows:
         booking_id, date_str, start_time = r[0], r[1], r[2]
@@ -136,8 +136,8 @@ async def dashboard(request: Request, week: str = None):
             h, m = int(start_time.split(":")[0]), int(start_time.split(":")[1])
         except Exception:
             h, m = CAL_START_HOUR, 0
-        top_px = (h - CAL_START_HOUR) * PX_PER_HOUR + m
-        height_px = max((r[4] or PX_PER_HOUR), 24)
+        top_px = (h - CAL_START_HOUR) * PX_PER_HOUR + round(m * PX_PER_HOUR / 60)
+        height_px = max(round((r[4] or 60) * PX_PER_HOUR / 60), 18)
         bookings_by_date.setdefault(date_str, []).append({
             "id": booking_id,
             "start_time": start_time,
