@@ -27,6 +27,10 @@ def _is_network_error(exc: Exception) -> bool:
     return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
 
 
+def _ts() -> str:
+    return datetime.now(PT).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def _notify(title: str, message: str) -> None:
     try:
         subprocess.run(
@@ -129,25 +133,33 @@ def cmd_book(args, cfg):
         # Retry loop: slots may not appear the instant 12PM ticks
         slots = None
         for attempt in range(12):
-            slots = get_available_slots(page, target_date, org)
+            try:
+                slots = get_available_slots(page, target_date, org)
+            except Exception as exc:
+                if attempt < 11 and _is_network_error(exc):
+                    print(f"[{_ts()}] Network error fetching slots, retrying... ({attempt + 1}/12): {exc}")
+                    time.sleep(1)
+                    continue
+                raise
             if slots:
                 break
             if attempt < 11:
-                print(f"No slots yet, retrying... ({attempt + 1}/12)")
+                print(f"[{_ts()}] No slots yet, retrying... ({attempt + 1}/12)")
                 time.sleep(0.5)
 
         if not slots:
-            print("No available slots — nothing to book.")
+            print(f"[{_ts()}] No available slots — nothing to book.")
             browser.close()
             sys.exit(1)
 
         slot = find_best_slot(slots, preferred_times)
         if slot is None:
-            print("No matching slot found.")
+            print(f"[{_ts()}] No matching slot found.")
             browser.close()
             sys.exit(1)
 
         duration = args.duration or cfg.get("default_duration", 60)
+        print(f"[{_ts()}] Booking {slot.court_type} at {slot.start_time} on {target_date} for {duration} min...")
         success = book_slot(page, org.booking_url, slot, duration_minutes=duration, org=org, dry_run=getattr(args, 'dry_run', False))
         browser.close()
         sys.exit(0 if success else 1)
@@ -198,27 +210,36 @@ def cmd_book_next(args, cfg):
     args.at = release_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     MAX_RETRIES = 5
+    last_exc_tb = None
     for attempt in range(MAX_RETRIES + 1):
         if attempt > 0:
             wait = 30 * attempt
-            print(f"Network error on attempt {attempt}/{MAX_RETRIES}, retrying in {wait}s...")
+            print(f"[{_ts()}] Attempt {attempt}/{MAX_RETRIES} failed — retrying in {wait}s...")
             time.sleep(wait)
         try:
+            print(f"[{_ts()}] book-next attempt {attempt + 1}/{MAX_RETRIES + 1}")
             cmd_book(args, cfg)  # raises SystemExit on completion (success or failure)
         except SystemExit as exc:
-            if exc.code != 0:
+            if exc.code == 0:
+                raise
+            # Booking failed (modal timeout, no slots, etc.) — retry
+            last_exc_tb = f"SystemExit({exc.code})"
+            print(f"[{_ts()}] Booking attempt {attempt + 1} failed (exit {exc.code}).")
+            if attempt >= MAX_RETRIES:
                 _send_failure_email(
                     f"Booking failed for {target_date}",
-                    f"book-next exited with failure for {target_date}.\n\nNo court was booked.",
+                    f"book-next failed for {target_date} after {MAX_RETRIES + 1} attempt(s).\n\nNo court was booked.",
                 )
-            raise
+                raise
+            continue
         except Exception as exc:
+            last_exc_tb = traceback.format_exc()
             if attempt < MAX_RETRIES and _is_network_error(exc):
-                print(f"Network error: {exc}")
+                print(f"[{_ts()}] Network error on attempt {attempt + 1}: {exc}")
                 continue
             _send_failure_email(
                 f"Booking error for {target_date}",
-                f"book-next failed for {target_date} after {attempt + 1} attempt(s).\n\n{traceback.format_exc()}",
+                f"book-next failed for {target_date} after {attempt + 1} attempt(s).\n\n{last_exc_tb}",
             )
             raise
 

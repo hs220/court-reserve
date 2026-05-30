@@ -186,7 +186,8 @@ def _navigate_to_date(page: Page, target_date: date) -> None:
 
 
 def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
-    print(f"Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
+    ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
 
     # Ensure we're on the booking page
     if org_url not in page.url:
@@ -235,7 +236,8 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
 def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run: bool = False) -> bool:
     modal = page.query_selector("#create-res-modal, .modal-content")
     if not modal:
-        print("No booking modal appeared after clicking slot.")
+        ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        print(f"[{ts}] No booking modal appeared after clicking slot.")
         return False
     print("Booking modal opened — waiting for full AJAX load...")
 
