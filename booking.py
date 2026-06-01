@@ -269,17 +269,25 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
     # Set duration via Kendo DropDownList.
     # duration_minutes=0 means "any" — leave the widget at its default.
     if duration_minutes > 0:
-        duration_options = page.evaluate("""(function() {
+        _GET_DURATION_OPTIONS = """(function() {
             var w = $("#Duration").data("kendoDropDownList");
             if (!w) return [];
             var vf = w.options.dataValueField;
-            var opts = [];
             var ds = w.dataSource.data();
+            var opts = [];
             for (var i = 0; i < ds.length; i++) {
                 opts.push(String(ds[i][vf] !== undefined ? ds[i][vf] : ds[i][w.options.dataTextField]));
             }
             return opts;
-        })()""")
+        })()"""
+
+        # The Kendo widget may still be initializing — wait up to 3s for it to populate.
+        duration_options = []
+        for _wait_attempt in range(6):
+            duration_options = page.evaluate(_GET_DURATION_OPTIONS)
+            if duration_options:
+                break
+            page.wait_for_timeout(500)
 
         target_str = str(duration_minutes)
         if target_str in duration_options:
