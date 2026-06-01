@@ -33,9 +33,9 @@ def _verify_login(email: str, password: str, org_url: str, session_file: Path) -
 
 
 def _last_check_time(log_text: str) -> str | None:
-    """Extract the most recent [YYYY-MM-DD HH:MM:SS] timestamp from a watch log."""
+    """Extract the most recent [YYYY-MM-DD HH:MM:SS ...] timestamp from a watch log."""
     import re
-    matches = re.findall(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', log_text or "")
+    matches = re.findall(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})[^\]]*\]', log_text or "")
     return matches[-1] if matches else None
 
 
