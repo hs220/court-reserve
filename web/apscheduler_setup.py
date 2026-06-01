@@ -110,13 +110,13 @@ def schedule_recurrent_book_next(job_id: int, account_id: int, params: dict, org
 
 
 def schedule_recurrent_watch(job_id: int, account_id: int, params: dict, org: dict):
-    """Weekly CronTrigger: fires at release+5min on the release date to create a watch child job."""
+    """Weekly CronTrigger: fires 2min before release on the release date to create a watch child job."""
     from web.job_runner import run_recurrent_watch
     apscheduler_id = f"recurrent_watch_{job_id}_{int(time.time())}"
     days_out = get_days_out(account_id, org)
     target_dow = int(params["target_day_of_week"])
     fire_dow = DOW_NAMES[(target_dow - days_out + 70) % 7]
-    total = org.get("release_hour", 12) * 60 + org.get("release_minute", 0) + 5
+    total = org.get("release_hour", 12) * 60 + org.get("release_minute", 0) - 2
     tz = pytz.timezone(org.get("timezone", "America/Los_Angeles"))
     trigger = CronTrigger(day_of_week=fire_dow, hour=total // 60, minute=total % 60, timezone=tz)
     scheduler.add_job(

@@ -18,7 +18,7 @@ def _job_list_url(job_type: str) -> str:
 
 
 def _watch_window_run_at(account_id: int, org: dict, date_str: str) -> str:
-    """Return ISO datetime string when the booking window opens for this date, or '' if already open."""
+    """Return ISO datetime string 2min before the booking window opens, or '' if already past."""
     tz = pytz.timezone(org["timezone"])
     days_out = get_days_out(account_id, org)
     window_open_date = date_cls.fromisoformat(date_str) - timedelta(days=days_out)
@@ -26,8 +26,9 @@ def _watch_window_run_at(account_id: int, org: dict, date_str: str) -> str:
         window_open_date.year, window_open_date.month, window_open_date.day,
         org["release_hour"], org["release_minute"], 0,
     ))
-    if window_open_dt > datetime.now(tz):
-        return window_open_dt.strftime("%Y-%m-%dT%H:%M")
+    fire_dt = window_open_dt - timedelta(minutes=2)
+    if fire_dt > datetime.now(tz):
+        return fire_dt.strftime("%Y-%m-%dT%H:%M")
     return ""
 
 
@@ -40,7 +41,7 @@ def _recurrent_cron_expr(account_id: int, org: dict, target_dow: int, job_type: 
         return f"0 6 * * {fire_dow}"
     else:  # recurrent_watch
         fire_dow = dow[(target_dow - days_out + 70) % 7]
-        total = org.get("release_hour", 12) * 60 + org.get("release_minute", 0) + 5
+        total = org.get("release_hour", 12) * 60 + org.get("release_minute", 0) - 2
         return f"{total % 60} {total // 60} * * {fire_dow}"
 
 

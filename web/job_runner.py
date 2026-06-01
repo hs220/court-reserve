@@ -315,6 +315,16 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
         timeout_minutes = _deadline_timeout_minutes(deadline_mode, target_date, target_time, org_cfg.timezone)
         deadline_desc = f"stop {deadline_mode} before court" if deadline_mode != "infinite" else "no timeout"
 
+        tz_obj = pytz.timezone(org_cfg.timezone)
+        release_hour = org.get("release_hour", 12)
+        release_minute = org.get("release_minute", 0)
+        days_out_val = get_days_out(account_id, org)
+        release_date = target_date - timedelta(days=days_out_val)
+        release_dt = tz_obj.localize(datetime(
+            release_date.year, release_date.month, release_date.day,
+            release_hour, release_minute, 0,
+        ))
+
         with _capture(buf):
             if probe_account:
                 print(f"watch: probe account '{probe_account.get('label') or probe_account['email']}' for detection; "
@@ -328,6 +338,13 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                 booking_page = booking_context.new_page()
                 ensure_logged_in(booking_context, booking_page, account["email"], account["password"],
                                  org_cfg.booking_url, session_file)
+
+                # If we're within 10 minutes of the booking window opening, pre-warm and
+                # wait until release - 8s (same strategy as run_book_next).
+                time_to_release = (release_dt - datetime.now(tz_obj)).total_seconds()
+                if 0 < time_to_release < 600:
+                    print(f"Pre-warming: release at {release_dt.strftime('%H:%M:%S %Z')}, waiting {time_to_release:.0f}s...")
+                    wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
 
                 # Probe context (separate browser context with different cookies)
                 if probe_account:
