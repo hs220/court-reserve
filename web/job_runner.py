@@ -489,7 +489,7 @@ def run_recurrent_book_next(job_id: int, account_id: int):
 
 def run_recurrent_watch(job_id: int, account_id: int):
     """Create a one-shot watch child job for the target date.
-    Called at release+5min on the release date; target_date = today + days_out."""
+    Called 2min before release on the release date; target_date = today + days_out."""
     run_id = _start_run(job_id)
     buf = io.StringIO()
     status = "failed"
