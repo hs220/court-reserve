@@ -185,24 +185,9 @@ def _navigate_to_date(page: Page, target_date: date) -> None:
     page.wait_for_timeout(3000)
 
 
-def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
-    ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
-    print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
-
-    # Ensure we're on the booking page
-    if org_url not in page.url:
-        page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(2000)
-
-    # Navigate the Kendo Scheduler to the target date
-    _navigate_to_date(page, slot.start_dt.date())
-
-    slot_label = slot.start_dt.strftime("%-I:%M %p").upper()  # e.g. "9:30 AM"
-
-    # Find the time cell, scroll it into view, then return its viewport coordinates.
-    # Without scrollIntoView, cells below the fold have y > viewport height and the
-    # mouse click lands off-screen, producing no modal.
-    bbox = page.evaluate(f"""
+def _find_slot_bbox(page: Page, slot_label: str):
+    """Return viewport {x, y} for the Kendo scheduler cell matching slot_label, or None."""
+    return page.evaluate(f"""
         (function() {{
             var timeRows = document.querySelectorAll(".k-scheduler-times tr");
             var firstLabelIdx = -1, targetLabelIdx = -1;
@@ -223,9 +208,38 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
         }})()
     """)
 
-    if not bbox:
-        print(f"Could not find time slot for {slot_label} in the scheduler grid.")
-        return False
+
+def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
+    ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
+
+    # Ensure we're on the booking page
+    if org_url not in page.url:
+        page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(2000)
+
+    # Navigate the Kendo Scheduler to the target date
+    _navigate_to_date(page, slot.start_dt.date())
+
+    slot_label = slot.start_dt.strftime("%-I:%M %p").upper()  # e.g. "9:30 AM"
+
+    # Kendo grid may lag behind the API — retry navigation until the cell appears.
+    # Without scrollIntoView, cells below the fold have y > viewport height and the
+    # mouse click lands off-screen, producing no modal.
+    GRID_RETRIES = 5
+    bbox = None
+    for grid_attempt in range(GRID_RETRIES):
+        bbox = _find_slot_bbox(page, slot_label)
+        if bbox:
+            break
+        ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        if grid_attempt < GRID_RETRIES - 1:
+            print(f"[{ts}] {slot_label} not in grid yet (attempt {grid_attempt + 1}/{GRID_RETRIES}) — re-navigating in 5s...")
+            page.wait_for_timeout(5000)
+            _navigate_to_date(page, slot.start_dt.date())
+        else:
+            print(f"[{ts}] Could not find time slot for {slot_label} in the scheduler grid after {GRID_RETRIES} attempts.")
+            return False
 
     page.wait_for_timeout(300)  # let scroll settle
     page.mouse.click(bbox['x'], bbox['y'])
