@@ -63,10 +63,33 @@ from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
 from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict, get_days_out
 
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof"]
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout"]
 
 def _is_network_error(exc: Exception) -> bool:
     return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
+
+
+def _send_warning_email(subject: str, body: str) -> None:
+    import os, smtplib
+    from email.mime.text import MIMEText
+    to_addr = os.environ.get("NOTIFY_EMAIL")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    if not to_addr or not smtp_password:
+        return
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", to_addr)
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = f"[court-reserve] {subject}"
+        msg["From"] = smtp_user
+        msg["To"] = to_addr
+        with smtplib.SMTP(smtp_host, smtp_port) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_password)
+            s.sendmail(smtp_user, [to_addr], msg.as_string())
+    except Exception as e:
+        print(f"Warning email send failed: {e}")
 
 
 def _parse_preferred_times(time_val) -> list[str]:
@@ -284,7 +307,8 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
     Poll until a specific slot opens on target_date at target_time, then book it.
     If probe_account_id is set, that account is used only for slot-availability checks
     while account_id is used for the actual booking.
-    Called by APScheduler in a background thread.
+    Transient network/timeout errors restart the browser session automatically.
+    After 20 consecutive errors a warning email is sent, but the job keeps running.
     """
     run_id = _start_run(job_id)
     buf = io.StringIO()
@@ -301,7 +325,6 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
             days_out = get_days_out(account_id, org)
             target_date = datetime.now(tz_local).date() + timedelta(days=days_out)
 
-        # Resolve probe account (for slot detection only)
         if probe_account_id and probe_account_id != account_id:
             with engine.connect() as conn:
                 probe_row = conn.execute(
@@ -325,98 +348,162 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
             release_hour, release_minute, 0,
         ))
 
+        WARNING_THRESHOLD = 20
+        consecutive_errors = 0
+        done = False  # set True on terminal exits (success / non-retriable error / deadline)
+
         with _capture(buf):
             if probe_account:
                 print(f"watch: probe account '{probe_account.get('label') or probe_account['email']}' for detection; "
                       f"booking account '{account.get('label') or account['email']}'")
             print(f"watch: polling for {time_desc} on {target_date_iso} (interval={interval}s, {deadline_desc}, ~{timeout_minutes}m remaining)")
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
 
-                # Booking context
-                booking_context = browser.new_context(user_agent=USER_AGENT)
-                booking_page = booking_context.new_page()
-                ensure_logged_in(booking_context, booking_page, account["email"], account["password"],
-                                 org_cfg.booking_url, session_file)
+            started = time.monotonic()
 
-                # If we're within 10 minutes of the booking window opening, pre-warm and
-                # wait until release - 8s (same strategy as run_book_next).
-                time_to_release = (release_dt - datetime.now(tz_obj)).total_seconds()
-                if 0 < time_to_release < 600:
-                    print(f"Pre-warming: release at {release_dt.strftime('%H:%M:%S %Z')}, waiting {time_to_release:.0f}s...")
-                    wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
+            while not done:  # outer session-retry loop
+                try:
+                    with sync_playwright() as pw:
+                        browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
 
-                # Probe context (separate browser context with different cookies)
-                if probe_account:
-                    probe_session_file = _session_file(probe_account, org)
-                    probe_context = browser.new_context(user_agent=USER_AGENT)
-                    probe_page = probe_context.new_page()
-                    ensure_logged_in(probe_context, probe_page, probe_account["email"], probe_account["password"],
-                                     org_cfg.booking_url, probe_session_file)
-                else:
-                    probe_page = booking_page
+                        booking_context = browser.new_context(user_agent=USER_AGENT)
+                        booking_page = booking_context.new_page()
+                        ensure_logged_in(booking_context, booking_page, account["email"], account["password"],
+                                         org_cfg.booking_url, session_file)
 
-                probe_label = (probe_account.get("label") or probe_account["email"]) if probe_account else (account.get("label") or account["email"])
-                started = time.monotonic()
-                while True:
-                    slots = get_available_slots(probe_page, target_date, org_cfg)
-                    if target_time:
-                        match = next(
-                            (s for s in slots if s.start_time == target_time and not s.is_wait_list),
-                            None,
-                        )
-                    else:
-                        match = find_best_slot(slots, [])
-                    if match:
-                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"[{ts}] Found slot — booking now...")
-                        try:
-                            success = book_slot(booking_page, org_cfg.booking_url, match,
-                                                duration_minutes=duration, org=org_cfg)
-                        except NoAvailableCourtsError as e:
-                            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            print(f"[{ts}] Race condition — courts taken before booking completed. Continuing poll...\n  ({e})")
-                        except BookingWindowError as e:
-                            print(f"Booking window not open yet: {e}")
-                            browser.close()
-                            status = "failed"
-                            break
-                        except AlreadyBookedError as e:
-                            print(f"Already has a reservation — no booking needed: {e}")
-                            browser.close()
-                            status = "failed"
-                            break
-                        except BookingError as e:
-                            print(f"Booking rejected: {e}")
-                            browser.close()
-                            status = "failed"
-                            break
+                        # Pre-warm if we're within 10 minutes of the booking window opening.
+                        time_to_release = (release_dt - datetime.now(tz_obj)).total_seconds()
+                        if 0 < time_to_release < 600:
+                            print(f"Pre-warming: release at {release_dt.strftime('%H:%M:%S %Z')}, waiting {time_to_release:.0f}s...")
+                            wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
+
+                        if probe_account:
+                            probe_session_file = _session_file(probe_account, org)
+                            probe_context = browser.new_context(user_agent=USER_AGENT)
+                            probe_page = probe_context.new_page()
+                            ensure_logged_in(probe_context, probe_page, probe_account["email"], probe_account["password"],
+                                             org_cfg.booking_url, probe_session_file)
                         else:
-                            if success:
-                                slot = match
-                                browser.close()
-                                status = "success"
-                                break
+                            probe_page = booking_page
+
+                        probe_label = (probe_account.get("label") or probe_account["email"]) if probe_account else (account.get("label") or account["email"])
+                        consecutive_errors = 0  # session established — reset streak
+
+                        while not done:  # poll loop
+                            try:
+                                slots = get_available_slots(probe_page, target_date, org_cfg)
+                            except Exception as exc:
+                                if _is_network_error(exc):
+                                    # Break inner loop cleanly; outer try/else will restart session.
+                                    ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                    print(f"[{ts}] Network error during poll — restarting session: {exc}")
+                                    break
+                                raise
+
+                            if target_time:
+                                match = next(
+                                    (s for s in slots if s.start_time == target_time and not s.is_wait_list),
+                                    None,
+                                )
                             else:
-                                # book_slot returned False without a typed error — likely a
-                                # transient UI issue (off-screen click, modal timing). Keep polling.
-                                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                print(f"[{ts}] Booking attempt did not complete (transient), continuing poll...")
+                                match = find_best_slot(slots, [])
 
-                    if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
-                        print(f"Timeout after {timeout_minutes}m — no slot found.")
-                        browser.close()
-                        status = "failed"
-                        break
+                            if match:
+                                ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                print(f"[{ts}] Found slot — booking now...")
+                                try:
+                                    success = book_slot(booking_page, org_cfg.booking_url, match,
+                                                        duration_minutes=duration, org=org_cfg)
+                                except NoAvailableCourtsError as e:
+                                    ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                    print(f"[{ts}] Race condition — courts taken before booking completed. Continuing poll...\n  ({e})")
+                                except BookingWindowError as e:
+                                    print(f"Booking window not open yet: {e}")
+                                    browser.close()
+                                    status = "failed"
+                                    done = True
+                                except AlreadyBookedError as e:
+                                    print(f"Already has a reservation — no booking needed: {e}")
+                                    browser.close()
+                                    status = "failed"
+                                    done = True
+                                except BookingError as e:
+                                    print(f"Booking rejected: {e}")
+                                    browser.close()
+                                    status = "failed"
+                                    done = True
+                                else:
+                                    if success:
+                                        slot = match
+                                        browser.close()
+                                        status = "success"
+                                        done = True
+                                    else:
+                                        ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                        print(f"[{ts}] Booking attempt did not complete (transient), continuing poll...")
 
-                    jitter = random.uniform(-0.2 * interval, 0.2 * interval)
-                    wait = interval + jitter
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{ts}] No slot yet (checked as {probe_label}). Next check in {wait:.0f}s...")
+                            if done:
+                                break
 
-                    # append partial log while waiting
-                    _finish_run(run_id, "running", buf.getvalue())
-                    time.sleep(wait)
+                            if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
+                                ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                print(f"[{ts}] Timeout after {timeout_minutes}m — no slot found.")
+                                browser.close()
+                                status = "failed"
+                                done = True
+                                break
+
+                            jitter = random.uniform(-0.2 * interval, 0.2 * interval)
+                            wait = interval + jitter
+                            ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                            print(f"[{ts}] No slot yet (checked as {probe_label}). Next check in {wait:.0f}s...")
+                            _finish_run(run_id, "running", buf.getvalue())
+                            time.sleep(wait)
+
+                except Exception as exc:
+                    if _is_network_error(exc) and not done:
+                        consecutive_errors += 1
+                        ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                        print(f"[{ts}] Transient error (streak={consecutive_errors}): {exc}")
+                        if consecutive_errors >= WARNING_THRESHOLD:
+                            _send_warning_email(
+                                f"Watch job warning — {consecutive_errors} consecutive errors",
+                                f"Watch job #{job_id} polling for {time_desc} on {target_date_iso} "
+                                f"has hit {consecutive_errors} consecutive transient errors.\n\n"
+                                f"Last error:\n{exc}\n\nThe job is still running.",
+                            )
+                            consecutive_errors = 0
+                        if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
+                            print(f"[{ts}] Deadline reached during error recovery — stopping.")
+                            done = True
+                        else:
+                            jitter = random.uniform(-0.2 * interval, 0.2 * interval)
+                            wait = interval + jitter
+                            print(f"[{ts}] Retrying in {wait:.0f}s...")
+                            _finish_run(run_id, "running", buf.getvalue())
+                            time.sleep(wait)
+                    else:
+                        raise
+                else:
+                    # sync_playwright exited without exception: inner poll loop broke due to a
+                    # per-poll network error (not a session-setup exception). Restart session.
+                    if not done:
+                        consecutive_errors += 1
+                        ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                        if consecutive_errors >= WARNING_THRESHOLD:
+                            _send_warning_email(
+                                f"Watch job warning — {consecutive_errors} consecutive errors",
+                                f"Watch job #{job_id} polling for {time_desc} on {target_date_iso} "
+                                f"has hit {consecutive_errors} consecutive transient errors. Still running.",
+                            )
+                            consecutive_errors = 0
+                        if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
+                            done = True
+                        else:
+                            jitter = random.uniform(-0.2 * interval, 0.2 * interval)
+                            wait = interval + jitter
+                            print(f"[{ts}] Session restarting in {wait:.0f}s...")
+                            _finish_run(run_id, "running", buf.getvalue())
+                            time.sleep(wait)
 
         if slot is not None:
             _record_booking(run_id, account_id, slot, duration)
