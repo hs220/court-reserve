@@ -70,27 +70,32 @@ def watch_and_book(page, probe_page, target_date: date, target_time: str, durati
     (may be a different account); page is used for the actual booking."""
     started = time.monotonic()
     while True:
-        slots = get_available_slots(probe_page, target_date, org) if org else get_available_slots(probe_page, target_date)
+        try:
+            slots = get_available_slots(probe_page, target_date, org) if org else get_available_slots(probe_page, target_date)
+        except Exception as exc:
+            if _is_network_error(exc):
+                print(f"[{_ts()}] Network error checking slots — will retry in {interval}s... ({exc})")
+                time.sleep(interval)
+                continue
+            raise
+
         match = next((s for s in slots if s.start_time == target_time and not s.is_wait_list), None)
         if match:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{ts}] Found slot — booking now...")
+            print(f"[{_ts()}] Found slot — booking now...")
             booking_url = org.booking_url if org else None
             success = book_slot(page, booking_url, match, duration_minutes=duration, org=org) if org else book_slot(page, booking_url, match, duration_minutes=duration)
             if success:
                 _notify("CourtReserve", f"Court booked for {target_time} on {target_date}")
                 return True
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{ts}] Booking attempt failed (slot may not be fully released yet) — will retry in {interval}s...")
+            print(f"[{_ts()}] Booking attempt failed (slot may not be fully released yet) — will retry in {interval}s...")
 
         if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
-            print(f"Timeout after {timeout_minutes}m — no slot found at {target_time} on {target_date}.")
+            print(f"[{_ts()}] Timeout after {timeout_minutes}m — no slot found at {target_time} on {target_date}.")
             return False
 
         jitter = random.uniform(-0.2 * interval, 0.2 * interval)
         wait = interval + jitter
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}] No slot at {target_time} on {target_date} yet. Next check in {wait:.0f}s...")
+        print(f"[{_ts()}] No slot at {target_time} on {target_date} yet. Next check in {wait:.0f}s...")
         time.sleep(wait)
 
 
