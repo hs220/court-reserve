@@ -22,11 +22,10 @@ from scheduler import wait_until
 
 PT = pytz.timezone("America/Los_Angeles")
 
-# "apirequestcontext" catches Playwright API request timeouts/failures (e.g. the
-# get_available_slots POST) — transient and retriable. Note: a page/selector timeout
-# ("page.wait_for_selector: Timeout ...") is deliberately NOT matched, since that's a
-# rendering/booking failure, not a network error.
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected", "apirequestcontext"]
+# Treat any Playwright timeout (Page.goto, wait_for_selector, APIRequestContext.post,
+# etc.) as a transient/retriable condition — the site is just slow or briefly
+# unreachable. We'd rather retry than fail a booking/watch job outright.
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected"]
 
 def _is_network_error(exc: Exception) -> bool:
     return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
