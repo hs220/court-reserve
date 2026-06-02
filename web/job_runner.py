@@ -1,6 +1,7 @@
 """Runs booking jobs in background threads; captures stdout and persists to DB."""
 
 import io
+import json
 import sys
 import threading
 import time
