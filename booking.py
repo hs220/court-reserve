@@ -151,13 +151,16 @@ def get_available_slots(page: Page, target_date: date, org: OrgConfig = DEFAULT_
     return slots
 
 
-def find_best_slot(slots: list[Slot], preferred_times: list[str]) -> Optional[Slot]:
+def find_best_slot(slots: list[Slot], preferred_times: list[str], allow_fallback: bool = True) -> Optional[Slot]:
     if not slots:
         return None
     for ptime in (preferred_times or []):
         for s in slots:
             if s.start_time == ptime and not s.is_wait_list:
                 return s
+    # No preferred match — only fall back if allowed
+    if not allow_fallback:
+        return None
     # return first non-waitlist slot
     for s in slots:
         if not s.is_wait_list:
@@ -342,7 +345,7 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
 
     # Broader page text check for inline error messages
     page_text = page.evaluate("(function(){ return document.body.innerText; })()")
-    if "Reservation Confirmed" in page_text:
+    if "reservation confirmed" in page_text.lower():
         print("Booking confirmed!")
         return True
     for marker in ["is only allowed", "not allowed", "cannot reserve", "restricted to", "no available courts"]:
@@ -361,8 +364,8 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
             print(f"Modal still open after Save — possible error: {visible_text[:200]}")
             return False
 
-    print("Booking confirmed!")
-    return True
+    print("Could not confirm booking (no confirmation message found) — treating as failed.")
+    return False
 
 
 def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:
@@ -377,12 +380,15 @@ def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:
                 pass
 
     page.on("response", _on_response)
-    page.goto(
-        f"https://app.courtreserve.com/Online/Bookings/List/{org.org_id}?type=1",
-        wait_until="networkidle",
-        timeout=30000,
-    )
-    page.wait_for_timeout(2000)
+    try:
+        page.goto(
+            f"https://app.courtreserve.com/Online/Bookings/List/{org.org_id}?type=1",
+            wait_until="networkidle",
+            timeout=30000,
+        )
+        page.wait_for_timeout(2000)
+    finally:
+        page.remove_listener("response", _on_response)
 
     raw_body = captured.get("body")
     if not raw_body:

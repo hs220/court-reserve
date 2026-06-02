@@ -63,7 +63,7 @@ from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
 from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict, get_days_out
 
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout"]
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected"]
 
 def _is_network_error(exc: Exception) -> bool:
     return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
@@ -223,7 +223,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                     if at_iso:
                         wait_until(datetime.fromisoformat(at_iso))
                     elif datetime.now(tz) < release_dt:
-                        wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
+                        wait_until(release_dt - timedelta(seconds=8))
 
                     slots = None
                     for attempt in range(12):
@@ -239,7 +239,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                         browser.close()
                         status = "failed"
                     else:
-                        slot = find_best_slot(slots, preferred_times)
+                        slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
                         if slot is None:
                             print("No matching slot found.")
                             browser.close()
@@ -291,7 +291,7 @@ def _deadline_timeout_minutes(deadline_mode: str, target_date, target_time: str,
     """Convert deadline_mode to minutes-from-now for the poll timeout. Returns 0 for infinite."""
     if deadline_mode == "infinite" or not target_time:
         return 0
-    offset_mins = {"5h10m": 310, "4h10m": 250, "30m": 30}.get(deadline_mode, 250)
+    offset_mins = {"5h10m": 310, "4h10m": 250, "4h": 240, "30m": 30}.get(deadline_mode, 250)
     tz = pytz.timezone(org_timezone)
     hour, minute = map(int, target_time.split(":"))
     court_naive = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
@@ -374,7 +374,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                         time_to_release = (release_dt - datetime.now(tz_obj)).total_seconds()
                         if 0 < time_to_release < 600:
                             print(f"Pre-warming: release at {release_dt.strftime('%H:%M:%S %Z')}, waiting {time_to_release:.0f}s...")
-                            wait_until((release_dt - timedelta(seconds=8)).replace(tzinfo=None))
+                            wait_until(release_dt - timedelta(seconds=8))
 
                         if probe_account:
                             probe_session_file = _session_file(probe_account, org)

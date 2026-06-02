@@ -34,6 +34,19 @@ def shutdown():
         scheduler.shutdown(wait=False)
 
 
+def _job_timezone(job_id: int) -> "pytz.BaseTzInfo":
+    """Return the pytz timezone for the organization owning the given job."""
+    from web.database import engine, jobs, organizations
+    with engine.connect() as conn:
+        job_row = conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone()
+        org_row = (
+            conn.execute(organizations.select().where(organizations.c.id == job_row.org_id)).fetchone()
+            if job_row else None
+        )
+    tzname = org_row.timezone if org_row and org_row.timezone else "America/Los_Angeles"
+    return pytz.timezone(tzname)
+
+
 # ── book_next ─────────────────────────────────────────────────────────────────
 
 def schedule_book_next(job_id: int, account_id: int, params: dict):
@@ -41,7 +54,11 @@ def schedule_book_next(job_id: int, account_id: int, params: dict):
     from web.job_runner import run_book_next
     apscheduler_id = f"book_next_{job_id}_{int(time.time())}"
     run_at = params.get("run_at")
-    trigger = DateTrigger(run_date=datetime.fromisoformat(run_at)) if run_at else DateTrigger(run_date=datetime.now())
+    if run_at:
+        tz = _job_timezone(job_id)
+        trigger = DateTrigger(run_date=datetime.fromisoformat(run_at), timezone=tz)
+    else:
+        trigger = DateTrigger(run_date=datetime.now())
 
     scheduler.add_job(
         run_book_next,
@@ -66,7 +83,11 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
     from web.job_runner import run_watch
     apscheduler_id = f"watch_{job_id}_{int(time.time())}"
     run_at = params.get("run_at")
-    trigger = DateTrigger(run_date=datetime.fromisoformat(run_at)) if run_at else DateTrigger(run_date=datetime.now())
+    if run_at:
+        tz = _job_timezone(job_id)
+        trigger = DateTrigger(run_date=datetime.fromisoformat(run_at), timezone=tz)
+    else:
+        trigger = DateTrigger(run_date=datetime.now())
 
     probe_id = params.get("probe_account_id")
     scheduler.add_job(
@@ -181,9 +202,23 @@ def reschedule_active_book_next_jobs():
             "SELECT id, account_id, params, apscheduler_id FROM jobs "
             "WHERE type='book_next' AND status='active'"
         )).fetchall()
+    from web.database import job_runs, bookings
     for row in rows:
         job_id, account_id, params_str, aps_id = row
         if not scheduler.get_job(aps_id or ""):
+            with engine.begin() as conn:
+                run_ids = [
+                    r[0] for r in conn.execute(
+                        job_runs.select().with_only_columns(job_runs.c.id).where(job_runs.c.job_id == job_id)
+                    ).fetchall()
+                ]
+                has_booking = bool(run_ids) and conn.execute(
+                    bookings.select().where(bookings.c.job_run_id.in_(run_ids)).limit(1)
+                ).fetchone()
+                if has_booking:
+                    conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="completed"))
+            if has_booking:
+                continue
             params = json.loads(params_str or "{}")
             schedule_book_next(job_id, account_id, params)
 

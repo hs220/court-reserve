@@ -16,12 +16,13 @@ from playwright.sync_api import sync_playwright
 
 from config import load_config, default_org_config, SESSION_FILE
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
-from booking import get_available_slots, find_best_slot, book_slot
+from booking import (get_available_slots, find_best_slot, book_slot,
+                     BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError)
 from scheduler import wait_until
 
 PT = pytz.timezone("America/Los_Angeles")
 
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout"]
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected"]
 
 def _is_network_error(exc: Exception) -> bool:
     return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
@@ -83,7 +84,20 @@ def watch_and_book(page, probe_page, target_date: date, target_time: str, durati
         if match:
             print(f"[{_ts()}] Found slot — booking now...")
             booking_url = org.booking_url if org else None
-            success = book_slot(page, booking_url, match, duration_minutes=duration, org=org) if org else book_slot(page, booking_url, match, duration_minutes=duration)
+            try:
+                success = book_slot(page, booking_url, match, duration_minutes=duration, org=org) if org else book_slot(page, booking_url, match, duration_minutes=duration)
+            except NoAvailableCourtsError as e:
+                print(f"[{_ts()}] Race condition — courts taken before booking completed, continuing to poll...\n  ({e})")
+                success = False
+            except BookingWindowError as e:
+                print(f"[{_ts()}] Booking window not open yet: {e}")
+                return False
+            except AlreadyBookedError as e:
+                print(f"[{_ts()}] Already has a reservation — no booking needed: {e}")
+                return False
+            except BookingError as e:
+                print(f"[{_ts()}] Booking rejected: {e}")
+                return False
             if success:
                 _notify("CourtReserve", f"Court booked for {target_time} on {target_date}")
                 return True
@@ -157,7 +171,7 @@ def cmd_book(args, cfg):
             browser.close()
             sys.exit(1)
 
-        slot = find_best_slot(slots, preferred_times)
+        slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
         if slot is None:
             print(f"[{_ts()}] No matching slot found.")
             browser.close()
@@ -212,7 +226,7 @@ def cmd_book_next(args, cfg):
     print(f"book-next: targeting {target_date} (today + {days_out} days), release at {release_dt.strftime('%Y-%m-%d %H:%M %Z')}")
 
     args.date = target_date.isoformat()
-    args.at = release_dt.strftime("%Y-%m-%d %H:%M:%S")
+    args.at = release_dt.isoformat()
 
     MAX_RETRIES = 5
     last_exc_tb = None

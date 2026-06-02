@@ -3,13 +3,14 @@ from datetime import datetime
 
 
 def wait_until(target: datetime) -> None:
-    now = datetime.now()
+    now = datetime.now(target.tzinfo) if target.tzinfo is not None else datetime.now()
     delta = (target - now).total_seconds()
     if delta <= 0:
         return
     print(f"Waiting until {target.strftime('%Y-%m-%d %H:%M:%S')} ({int(delta)}s from now)...")
     while True:
-        remaining = (target - datetime.now()).total_seconds()
+        _now = datetime.now(target.tzinfo) if target.tzinfo is not None else datetime.now()
+        remaining = (target - _now).total_seconds()
         if remaining <= 0:
             break
         if remaining > 60:
