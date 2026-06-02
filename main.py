@@ -152,37 +152,66 @@ def cmd_book(args, cfg):
         if args.at:
             wait_until(datetime.fromisoformat(args.at))
 
-        # Retry loop: slots may not appear the instant 12PM ticks
-        slots = None
-        for attempt in range(12):
+        duration = args.duration or cfg.get("default_duration", 60)
+        dry_run = getattr(args, 'dry_run', False)
+
+        # Retry loop: keep going until a slot is actually booked. Slots may not
+        # appear the instant 12PM ticks, the slot we pick may get snapped up
+        # before we click, or the booking click may not register — all of these
+        # return without a booking and should be retried with a fresh fetch.
+        # Permanent rejections (booking window closed, already booked, no
+        # courts) raise BookingError and propagate out immediately — retrying
+        # those is pointless.
+        ATTEMPTS = 12
+        success = False
+        for attempt in range(ATTEMPTS):
+            last = attempt == ATTEMPTS - 1
+
             try:
                 slots = get_available_slots(page, target_date, org)
             except Exception as exc:
-                if attempt < 11 and _is_network_error(exc):
-                    print(f"[{_ts()}] Network error fetching slots, retrying... ({attempt + 1}/12): {exc}")
+                if not last and _is_network_error(exc):
+                    print(f"[{_ts()}] Network error fetching slots, retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
                     time.sleep(1)
                     continue
                 raise
-            if slots:
+
+            if not slots:
+                if not last:
+                    print(f"[{_ts()}] No slots yet, retrying... ({attempt + 1}/{ATTEMPTS})")
+                    time.sleep(0.5)
+                continue
+
+            slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
+            if slot is None:
+                if not last:
+                    print(f"[{_ts()}] No matching slot yet, retrying... ({attempt + 1}/{ATTEMPTS})")
+                    time.sleep(0.5)
+                continue
+
+            print(f"[{_ts()}] Booking {slot.court_type} at {slot.start_time} on {target_date} for {duration} min...")
+            try:
+                success = book_slot(page, org.booking_url, slot, duration_minutes=duration, org=org, dry_run=dry_run)
+            except Exception as exc:
+                if not last and _is_network_error(exc):
+                    print(f"[{_ts()}] Network error during booking, retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
+                    continue
+                # The booking window may not have flipped open at the exact
+                # instant of the 12PM release — retry, it may open momentarily.
+                if not last and isinstance(exc, BookingWindowError):
+                    print(f"[{_ts()}] Booking window not open yet, retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
+                    time.sleep(0.5)
+                    continue
+                raise
+
+            if success or dry_run:
                 break
-            if attempt < 11:
-                print(f"[{_ts()}] No slots yet, retrying... ({attempt + 1}/12)")
+            if not last:
+                print(f"[{_ts()}] Booking attempt failed, retrying... ({attempt + 1}/{ATTEMPTS})")
                 time.sleep(0.5)
 
-        if not slots:
-            print(f"[{_ts()}] No available slots — nothing to book.")
-            browser.close()
-            sys.exit(1)
-
-        slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
-        if slot is None:
-            print(f"[{_ts()}] No matching slot found.")
-            browser.close()
-            sys.exit(1)
-
-        duration = args.duration or cfg.get("default_duration", 60)
-        print(f"[{_ts()}] Booking {slot.court_type} at {slot.start_time} on {target_date} for {duration} min...")
-        success = book_slot(page, org.booking_url, slot, duration_minutes=duration, org=org, dry_run=getattr(args, 'dry_run', False))
+        if not success and not dry_run:
+            print(f"[{_ts()}] Could not book after {ATTEMPTS} attempts.")
         browser.close()
         sys.exit(0 if success else 1)
 
@@ -256,8 +285,9 @@ def cmd_book_next(args, cfg):
             continue
         except Exception as exc:
             last_exc_tb = traceback.format_exc()
-            if attempt < MAX_RETRIES and _is_network_error(exc):
-                print(f"[{_ts()}] Network error on attempt {attempt + 1}: {exc}")
+            if attempt < MAX_RETRIES and (_is_network_error(exc) or isinstance(exc, BookingWindowError)):
+                reason = "Network error" if _is_network_error(exc) else "Booking window not open yet"
+                print(f"[{_ts()}] {reason} on attempt {attempt + 1}: {exc}")
                 continue
             _send_failure_email(
                 f"Booking error for {target_date}",

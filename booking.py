@@ -244,18 +244,36 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
             print(f"[{ts}] Could not find time slot for {slot_label} in the scheduler grid after {GRID_RETRIES} attempts.")
             return False
 
-    page.wait_for_timeout(300)  # let scroll settle
-    page.mouse.click(bbox['x'], bbox['y'])
-    page.wait_for_timeout(2000)
-    return _handle_booking_modal(page, slot, duration_minutes, dry_run=dry_run)
+    # Clicking the cell occasionally fails to open the modal (the AJAX call
+    # doesn't fire, or the click lands a hair off the cell). Retry the click a
+    # few times before giving up — re-finding the cell each time in case the
+    # grid re-rendered underneath us.
+    CLICK_RETRIES = 5
+    for click_attempt in range(CLICK_RETRIES):
+        page.wait_for_timeout(300)  # let scroll settle
+        page.mouse.click(bbox['x'], bbox['y'])
+        page.wait_for_timeout(2000)
+
+        if page.query_selector("#create-res-modal, .modal-content"):
+            return _handle_booking_modal(page, slot, duration_minutes, dry_run=dry_run)
+
+        ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        if click_attempt < CLICK_RETRIES - 1:
+            print(f"[{ts}] No booking modal appeared after clicking slot "
+                  f"(attempt {click_attempt + 1}/{CLICK_RETRIES}) — retrying...")
+            # Re-locate the cell; the grid may have shifted or re-rendered.
+            new_bbox = _find_slot_bbox(page, slot_label)
+            if new_bbox:
+                bbox = new_bbox
+        else:
+            print(f"[{ts}] No booking modal appeared after clicking slot "
+                  f"after {CLICK_RETRIES} attempts.")
+            return False
+
+    return False
 
 
 def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run: bool = False) -> bool:
-    modal = page.query_selector("#create-res-modal, .modal-content")
-    if not modal:
-        ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
-        print(f"[{ts}] No booking modal appeared after clicking slot.")
-        return False
     print("Booking modal opened — waiting for full AJAX load...")
 
     # The modal loads in two hops:
