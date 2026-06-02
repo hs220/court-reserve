@@ -96,6 +96,30 @@ async def create_bug(
     return RedirectResponse(f"/bugs?{qs}", status_code=303)
 
 
+def _redirect(warn: str = "", extra: str = ""):
+    params = [p for p in (extra, ("ghwarn=" + urllib.parse.quote(warn)) if warn else "") if p]
+    qs = ("?" + "&".join(params)) if params else ""
+    return RedirectResponse(f"/bugs{qs}", status_code=303)
+
+
+async def _push_issue_state(bug_id: int, state: str) -> str:
+    """Best-effort: mirror the local change onto the linked GitHub issue.
+
+    Returns a warning string ('' if nothing to do or it succeeded).
+    """
+    with engine.connect() as conn:
+        row = conn.execute(
+            bug_reports.select().where(bug_reports.c.id == bug_id)
+        ).fetchone()
+    if not row or not row.gh_issue_number or not github_issues.is_configured():
+        return ""
+    try:
+        await run_in_threadpool(github_issues.set_issue_state, row.gh_issue_number, state)
+        return ""
+    except Exception as e:
+        return f"issue #{row.gh_issue_number} not updated on GitHub: {e}"
+
+
 @router.post("/bugs/{bug_id}/resolve")
 async def resolve_bug(bug_id: int):
     with engine.begin() as conn:
@@ -104,7 +128,8 @@ async def resolve_bug(bug_id: int):
             .where(bug_reports.c.id == bug_id)
             .values(status="resolved", resolved_at=datetime.utcnow())
         )
-    return RedirectResponse("/bugs", status_code=303)
+    warn = await _push_issue_state(bug_id, "closed")
+    return _redirect(warn)
 
 
 @router.post("/bugs/{bug_id}/reopen")
@@ -115,11 +140,50 @@ async def reopen_bug(bug_id: int):
             .where(bug_reports.c.id == bug_id)
             .values(status="open", resolved_at=None)
         )
-    return RedirectResponse("/bugs", status_code=303)
+    warn = await _push_issue_state(bug_id, "open")
+    return _redirect(warn)
 
 
 @router.post("/bugs/{bug_id}/delete")
 async def delete_bug(bug_id: int):
+    # Close the linked issue first (we lose the number once the row is gone).
+    warn = await _push_issue_state(bug_id, "closed")
     with engine.begin() as conn:
         conn.execute(bug_reports.delete().where(bug_reports.c.id == bug_id))
-    return RedirectResponse("/bugs", status_code=303)
+    return _redirect(warn)
+
+
+@router.post("/bugs/sync")
+async def sync_bugs():
+    """Pull each tracked issue's state from GitHub and reconcile local status."""
+    if not github_issues.is_configured():
+        return _redirect("GitHub integration not configured.")
+
+    with engine.connect() as conn:
+        rows = [row_to_dict(r) for r in conn.execute(
+            bug_reports.select().where(bug_reports.c.gh_issue_number.isnot(None))
+        )]
+
+    updated = 0
+    errors = []
+    for r in rows:
+        try:
+            state = await run_in_threadpool(github_issues.get_issue_state, r["gh_issue_number"])
+        except Exception as e:
+            errors.append(f"#{r['gh_issue_number']}: {e}")
+            continue
+        new_status = "resolved" if state == "closed" else "open"
+        if new_status != r["status"]:
+            with engine.begin() as conn:
+                conn.execute(
+                    update(bug_reports)
+                    .where(bug_reports.c.id == r["id"])
+                    .values(
+                        status=new_status,
+                        resolved_at=datetime.utcnow() if new_status == "resolved" else None,
+                    )
+                )
+            updated += 1
+
+    warn = "; ".join(errors) if errors else ""
+    return _redirect(warn, extra=f"synced=1&updated={updated}")

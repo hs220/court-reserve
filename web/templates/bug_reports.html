@@ -4,6 +4,11 @@
 {% set severity_badge = {"high": "badge-failed", "medium": "badge-paused", "low": "badge-completed"} %}
 <div class="card-header">
   <h1>Bug Reports{% if open_count %} <span class="badge badge-failed">{{ open_count }} open</span>{% endif %}</h1>
+  {% if gh_configured %}
+  <form method="post" action="/bugs/sync">
+    <button class="btn btn-ghost" data-loading="⟳ Syncing…">⟳ Sync from GitHub</button>
+  </form>
+  {% endif %}
 </div>
 
 {% if request.query_params.get('submitted') %}
@@ -11,9 +16,12 @@
   Thanks! Your bug report has been submitted{% if gh_configured and not request.query_params.get('ghwarn') %} and a GitHub issue was filed{% endif %}.
 </div>
 {% endif %}
+{% if request.query_params.get('synced') %}
+<div class="alert-banner">Synced from GitHub — {{ request.query_params.get('updated', 0) }} report(s) updated.</div>
+{% endif %}
 {% if request.query_params.get('ghwarn') %}
 <div class="alert-banner alert-banner-warn">
-  Saved locally, but creating the GitHub issue failed: {{ request.query_params.get('ghwarn') }}
+  Saved locally, but a GitHub update failed: {{ request.query_params.get('ghwarn') }}
 </div>
 {% endif %}
 {% if not gh_configured %}
