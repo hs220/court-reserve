@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Bug Reports — CourtReserve Manager{% endblock %}
+{% block content %}
+{% set severity_badge = {"high": "badge-failed", "medium": "badge-paused", "low": "badge-completed"} %}
+<div class="card-header">
+  <h1>Bug Reports{% if open_count %} <span class="badge badge-failed">{{ open_count }} open</span>{% endif %}</h1>
+</div>
+
+{% if request.query_params.get('submitted') %}
+<div class="alert-banner">
+  Thanks! Your bug report has been submitted{% if gh_configured and not request.query_params.get('ghwarn') %} and a GitHub issue was filed{% endif %}.
+</div>
+{% endif %}
+{% if request.query_params.get('ghwarn') %}
+<div class="alert-banner alert-banner-warn">
+  Saved locally, but creating the GitHub issue failed: {{ request.query_params.get('ghwarn') }}
+</div>
+{% endif %}
+{% if not gh_configured %}
+<div class="alert-banner alert-banner-warn">
+  GitHub integration is off — reports are stored locally only. Set <code>GITHUB_TOKEN</code>
+  (and optionally <code>GITHUB_REPO</code>) to auto-file issues.
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0;font-size:15px">Report a bug</h2>
+  <form method="post" action="/bugs">
+    <div class="form-group" style="margin-bottom:14px">
+      <label>Title</label>
+      <input name="title" placeholder="Short summary of the problem" required>
+    </div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Severity</label>
+        <select name="severity">
+          <option value="low">Low</option>
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Your name / email (optional)</label>
+        <input name="reporter" placeholder="So we can follow up">
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:14px">
+      <label>Description</label>
+      <textarea name="description" rows="4" placeholder="What happened? What did you expect? Steps to reproduce."></textarea>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" data-loading="Submitting…">Submit Report</button>
+    </div>
+  </form>
+</div>
+
+{% if reports %}
+<div class="card" style="padding:0">
+  <div class="scroll-table-wrap">
+  <table>
+    <thead><tr>
+      <th>Status</th><th>Severity</th><th>Title</th><th>Issue</th><th>Reporter</th><th>Reported (PT)</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in reports %}
+    <tr{% if r.status == 'resolved' %} style="opacity:.55"{% endif %}>
+      <td><span class="badge {% if r.status == 'resolved' %}badge-active{% else %}badge-failed{% endif %}">{{ r.status }}</span></td>
+      <td><span class="badge {{ severity_badge.get(r.severity, 'badge-paused') }}">{{ r.severity }}</span></td>
+      <td>
+        <strong>{{ r.title }}</strong>
+        {% if r.description %}<div style="font-size:12px;color:var(--muted);white-space:pre-wrap;margin-top:4px">{{ r.description }}</div>{% endif %}
+      </td>
+      <td>
+        {% if r.gh_issue_url %}<a href="{{ r.gh_issue_url }}" target="_blank" rel="noopener">#{{ r.gh_issue_number }}</a>{% else %}—{% endif %}
+      </td>
+      <td>{{ r.reporter or "—" }}</td>
+      <td style="font-size:12px;color:var(--muted)">{{ r.created_at | localdt }}</td>
+      <td style="white-space:nowrap">
+        {% if r.status == 'open' %}
+        <form method="post" action="/bugs/{{ r.id }}/resolve" style="display:inline">
+          <button class="btn btn-success btn-sm">Resolve</button>
+        </form>
+        {% else %}
+        <form method="post" action="/bugs/{{ r.id }}/reopen" style="display:inline">
+          <button class="btn btn-ghost btn-sm">Reopen</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/bugs/{{ r.id }}/delete" style="display:inline"
+              onsubmit="return confirm('Delete this bug report permanently?')">
+          <button class="btn btn-danger btn-sm">✕</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <div class="empty-state">
+    <p>No bug reports yet.</p>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

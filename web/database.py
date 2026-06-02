@@ -90,6 +90,20 @@ bookings = Table("bookings", metadata,
 )
 
 
+bug_reports = Table("bug_reports", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("title", String, nullable=False),
+    Column("description", Text, default=""),
+    Column("severity", String, default="medium"),     # low | medium | high
+    Column("reporter", String, default=""),            # optional name/email
+    Column("status", String, default="open"),          # open | resolved
+    Column("created_at", DateTime, default=datetime.utcnow),
+    Column("resolved_at", DateTime, nullable=True),
+    Column("gh_issue_number", Integer, nullable=True),  # GitHub issue number, if filed
+    Column("gh_issue_url", String, default=""),
+)
+
+
 SEED_ORGS = [
     dict(name="Lifetime Sunnyvale",   org_id="13233", scheduler_id="16983",  cost_type_id="141205"),
     dict(name="Lifetime Santa Clara", org_id="13234", scheduler_id="16995",  cost_type_id="141206"),
@@ -101,6 +115,7 @@ def init_db():
     metadata.create_all(engine)
     _migrate_accounts_org_optional()
     _migrate_orgs_resident_days_out()
+    _migrate_bug_reports_gh_columns()
     _seed_orgs()
 
 
@@ -150,6 +165,22 @@ def _migrate_orgs_resident_days_out():
             conn.execute(text(
                 "UPDATE organizations SET resident_days_out = days_out, nonresident_days_out = days_out"
             ))
+
+
+def _migrate_bug_reports_gh_columns():
+    """Add GitHub-issue tracking columns to bug_reports if missing."""
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='bug_reports'"
+        )).fetchone()
+        if not row:
+            return
+        sql = row[0] or ""
+        if "gh_issue_number" in sql:
+            return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE bug_reports ADD COLUMN gh_issue_number INTEGER"))
+        conn.execute(text("ALTER TABLE bug_reports ADD COLUMN gh_issue_url VARCHAR DEFAULT ''"))
 
 
 def _seed_orgs():

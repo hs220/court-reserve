@@ -13,7 +13,7 @@ from sqlalchemy import update, func
 from web.database import init_db, engine, job_runs
 from web.database import jobs as jobs_table
 from web import apscheduler_setup
-from web.routes import orgs, jobs, logs, calendar as calendar_routes, reservations
+from web.routes import orgs, jobs, logs, calendar as calendar_routes, reservations, bug_reports
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -62,3 +62,4 @@ app.include_router(jobs.router)
 app.include_router(logs.router)
 app.include_router(calendar_routes.router)
 app.include_router(reservations.router)
+app.include_router(bug_reports.router)

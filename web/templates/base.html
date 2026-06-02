@@ -24,6 +24,7 @@
     <a href="/jobs" class="nav-link {% if request.url.path == '/jobs' or (request.url.path.startswith('/jobs/') and 'recurring' not in request.url.path) %}active{% endif %}">Jobs</a>
     <a href="/reservations" class="nav-link {% if '/reservations' in request.url.path %}active{% endif %}">Reservations</a>
     <a href="/recurring" class="nav-link {% if request.url.path == '/recurring' %}active{% endif %}">Recurring</a>
+    <a href="/bugs" class="nav-link {% if '/bugs' in request.url.path %}active{% endif %}">Bug Reports</a>
   </nav>
   <main class="content">
     {% block content %}{% endblock %}

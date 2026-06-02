@@ -166,6 +166,7 @@ span.flatpickr-weekday { background: transparent; color: var(--muted); font-size
 
 /* ── Alert banner ── */
 .alert-banner { background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.3); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; color: var(--green); font-size: 13px; }
+.alert-banner-warn { background: rgba(234,179,8,.12); border-color: rgba(234,179,8,.3); color: var(--yellow); }
 
 /* ── Misc ── */
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
