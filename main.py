@@ -162,7 +162,7 @@ def cmd_book(args, cfg):
         # Permanent rejections (booking window closed, already booked, no
         # courts) raise BookingError and propagate out immediately — retrying
         # those is pointless.
-        ATTEMPTS = 12
+        ATTEMPTS = 20
         success = False
         for attempt in range(ATTEMPTS):
             last = attempt == ATTEMPTS - 1

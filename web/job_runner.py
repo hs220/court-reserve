@@ -229,48 +229,69 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                     elif datetime.now(tz) < release_dt:
                         wait_until(release_dt - timedelta(seconds=8))
 
-                    slots = None
-                    for attempt in range(12):
-                        slots = get_available_slots(page, target_date, org_cfg)
-                        if slots:
-                            break
-                        if attempt < 11:
-                            print(f"No slots yet, retrying... ({attempt + 1}/12)")
-                            time.sleep(0.5)
+                    # Retry the whole fetch→find→book cycle. Slots may not appear
+                    # the instant the window opens, the slot we pick may get taken
+                    # before we click, or the click may not register a modal (the
+                    # failure in issue #2 / run #175) — all transient and worth
+                    # retrying with a fresh fetch and re-navigation.
+                    BOOK_ATTEMPTS = 20
+                    for book_attempt in range(BOOK_ATTEMPTS):
+                        last = book_attempt == BOOK_ATTEMPTS - 1
 
-                    if not slots:
-                        print("No available slots — nothing to book.")
-                        browser.close()
-                        status = "failed"
-                    else:
+                        slots = None
+                        for attempt in range(12):
+                            slots = get_available_slots(page, target_date, org_cfg)
+                            if slots:
+                                break
+                            if attempt < 11:
+                                print(f"No slots yet, retrying... ({attempt + 1}/12)")
+                                time.sleep(0.5)
+
+                        if not slots:
+                            if not last:
+                                print(f"No available slots yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
+                                time.sleep(1)
+                                continue
+                            print("No available slots — nothing to book.")
+                            break
+
                         slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
                         if slot is None:
+                            if not last:
+                                print(f"No matching slot yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
+                                time.sleep(1)
+                                continue
                             print("No matching slot found.")
-                            browser.close()
-                            status = "failed"
-                        else:
-                            for window_attempt in range(12):
-                                try:
-                                    success = book_slot(page, org_cfg.booking_url, slot,
-                                                        duration_minutes=default_duration, org=org_cfg)
-                                    break
-                                except BookingWindowError as e:
-                                    if window_attempt < 11:
-                                        print(f"Booking window not open yet (attempt {window_attempt + 1}/12), retrying in 5s...")
-                                        time.sleep(5)
-                                    else:
-                                        print(f"Booking window still not open after 12 attempts: {e}")
-                                except AlreadyBookedError as e:
-                                    print(f"Already has a reservation: {e}")
-                                    break
-                                except NoAvailableCourtsError as e:
-                                    print(f"No available courts: {e}")
-                                    break
-                                except BookingError as e:
-                                    print(f"Booking rejected: {e}")
-                                    break
-                            browser.close()
-                            status = "success" if success else "failed"
+                            break
+
+                        try:
+                            success = book_slot(page, org_cfg.booking_url, slot,
+                                                duration_minutes=default_duration, org=org_cfg)
+                        except BookingWindowError as e:
+                            if not last:
+                                print(f"Booking window not open yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS} in 5s: {e}")
+                                time.sleep(5)
+                                continue
+                            print(f"Booking window still not open after {BOOK_ATTEMPTS} attempts: {e}")
+                            break
+                        except AlreadyBookedError as e:
+                            print(f"Already has a reservation: {e}")
+                            break
+                        except NoAvailableCourtsError as e:
+                            print(f"No available courts: {e}")
+                            break
+                        except BookingError as e:
+                            print(f"Booking rejected: {e}")
+                            break
+
+                        if success:
+                            break
+                        if not last:
+                            print(f"Booking attempt failed (no modal / transient) — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
+                            time.sleep(1)
+
+                    browser.close()
+                    status = "success" if success else "failed"
             break  # completed (success or expected failure) — do not retry
 
         except Exception as exc:
