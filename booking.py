@@ -1,7 +1,7 @@
 import json
 import random
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
 import pytz
@@ -319,14 +319,47 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
         else:
             kendo_value = target_str
 
-        page.evaluate(f"""(function() {{
-            var w = $("#Duration").data("kendoDropDownList");
-            if (w) {{ w.value("{kendo_value}"); w.trigger("change"); }}
-        }})()""")
-        page.wait_for_timeout(500)
+        # CourtReserve's Duration widget re-binds its dataSource asynchronously
+        # after the modal loads. A value set too early can silently revert to the
+        # default (60 min) even while every option still appears in the list — so
+        # the form ends up submitting the wrong length (e.g. a 2-hour request
+        # books only 1 hour). Set the value, then verify the form's actual EndTime
+        # matches the requested duration, re-applying if the widget reverted.
+        expected_end = (slot.start_dt + timedelta(minutes=int(kendo_value))).strftime("%-I:%M %p")
 
-        end_time = page.evaluate("(function(){ return document.getElementById('EndTime')?.value; })()")
-        print(f"Duration={duration_minutes} min (kendo={kendo_value})  EndTime={end_time}  AvailableOptions={duration_options}")
+        def _norm_time(s: Optional[str]) -> str:
+            return (s or "").strip().upper().lstrip("0")
+
+        end_time = None
+        actual_value = None
+        duration_ok = False
+        for set_attempt in range(5):
+            page.evaluate(f"""(function() {{
+                var w = $("#Duration").data("kendoDropDownList");
+                if (w) {{ w.value("{kendo_value}"); w.trigger("change"); }}
+            }})()""")
+            page.wait_for_timeout(500)
+
+            end_time = page.evaluate("(function(){ return document.getElementById('EndTime')?.value; })()")
+            actual_value = page.evaluate("""(function() {
+                var w = $("#Duration").data("kendoDropDownList");
+                return w ? String(w.value()) : null;
+            })()""")
+            if actual_value == kendo_value and _norm_time(end_time) == _norm_time(expected_end):
+                duration_ok = True
+                break
+            ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            print(f"[{ts}] Duration not applied yet (widget={actual_value}, EndTime={end_time}, "
+                  f"expected {kendo_value} min / {expected_end}) — retrying ({set_attempt + 1}/5)...")
+            page.wait_for_timeout(500)
+
+        print(f"Duration={duration_minutes} min (kendo={kendo_value})  EndTime={end_time}  "
+              f"expected={expected_end}  AvailableOptions={duration_options}")
+
+        if not duration_ok:
+            print(f"Could not confirm duration {kendo_value} min (EndTime={end_time}, expected {expected_end}) — "
+                  f"aborting before Save to avoid booking the wrong length.")
+            return False
     else:
         print("Duration=any — using CourtReserve default")
 
