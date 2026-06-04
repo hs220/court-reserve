@@ -182,7 +182,8 @@ def cmd_book(args, cfg):
                     time.sleep(0.5)
                 continue
 
-            slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
+            slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times,
+                                  duration_minutes=duration)
             if slot is None:
                 if not last:
                     print(f"[{_ts()}] No matching slot yet, retrying... ({attempt + 1}/{ATTEMPTS})")

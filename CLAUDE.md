@@ -29,6 +29,11 @@ python main.py watch --date YYYY-MM-DD --time 10:00 --duration 120 --interval 30
 # Show browser window for debugging
 python main.py book-next --headed
 
+# Run unit tests (stdlib unittest, no extra deps)
+python -m unittest discover -p "test_*.py" -v
+# Or a single module:
+python -m unittest test_booking -v
+
 # Web UI (local dev)
 DATA_DIR=~/.court-reserve-data python web_main.py
 # → http://localhost:8080

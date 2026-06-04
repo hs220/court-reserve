@@ -151,21 +151,59 @@ def get_available_slots(page: Page, target_date: date, org: OrgConfig = DEFAULT_
     return slots
 
 
-def find_best_slot(slots: list[Slot], preferred_times: list[str], allow_fallback: bool = True) -> Optional[Slot]:
+_INTERVAL_MS = 30 * 60 * 1000  # CourtReserve scheduler granularity
+
+
+def slot_has_window(slots: list[Slot], start: Slot, duration_minutes: int) -> bool:
+    """True if a *single* court is free across enough consecutive intervals to cover
+    `duration_minutes` starting at `start`.
+
+    CourtReserve's ReadConsolidated feed reports availability per 30-min interval, and
+    a reservation must hold the same court for its whole length. The booking form does
+    NOT validate this client-side — it will happily let you select 120 min on a slot
+    with only 60 min free, set EndTime accordingly, and only reject at Save (or, on a
+    slow client, hang the modal). So we must confirm the window ourselves before
+    committing to a slot. Returns True when duration_minutes <= 0 (no constraint)."""
+    if duration_minutes <= 0:
+        return True
+    by_start = {s.start_ms: s for s in slots}
+    interval = (start.end_ms - start.start_ms) or _INTERVAL_MS
+    needed = (duration_minutes * 60_000 + interval - 1) // interval  # ceil
+    common: Optional[set] = None
+    for k in range(needed):
+        s = by_start.get(start.start_ms + k * interval)
+        if s is None or s.is_wait_list:
+            return False
+        ids = set(s.available_court_ids)
+        common = ids if common is None else (common & ids)
+        if not common:
+            return False
+    return True
+
+
+def find_best_slot(slots: list[Slot], preferred_times: list[str], allow_fallback: bool = True,
+                   duration_minutes: int = 0) -> Optional[Slot]:
     if not slots:
         return None
+
+    def ok(s: Slot) -> bool:
+        return not s.is_wait_list and slot_has_window(slots, s, duration_minutes)
+
     for ptime in (preferred_times or []):
         for s in slots:
-            if s.start_time == ptime and not s.is_wait_list:
+            if s.start_time == ptime and ok(s):
                 return s
     # No preferred match — only fall back if allowed
     if not allow_fallback:
         return None
-    # return first non-waitlist slot
+    # return first slot that can actually hold the full duration
     for s in slots:
-        if not s.is_wait_list:
+        if ok(s):
             return s
-    return slots[0]
+    # Last resort (any slot, incl. waitlist) only when not enforcing a duration window
+    if duration_minutes <= 0:
+        return slots[0]
+    return None
 
 
 def _classify_booking_error(msg: str) -> BookingError:

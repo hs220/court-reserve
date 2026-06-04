@@ -58,7 +58,7 @@ import pytz
 from playwright.sync_api import sync_playwright
 from sqlalchemy import update, insert
 
-from booking import (OrgConfig, get_available_slots, find_best_slot, book_slot,
+from booking import (OrgConfig, get_available_slots, find_best_slot, book_slot, slot_has_window,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError)
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
@@ -255,7 +255,8 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                             print("No available slots — nothing to book.")
                             break
 
-                        slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times)
+                        slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times,
+                                              duration_minutes=default_duration)
                         if slot is None:
                             if not last:
                                 print(f"No matching slot yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
@@ -425,12 +426,24 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                 raise
 
                             if target_time:
-                                match = next(
+                                open_at_time = next(
                                     (s for s in slots if s.start_time == target_time and not s.is_wait_list),
                                     None,
                                 )
+                                # A slot can be open for its 30-min interval yet lack a
+                                # contiguous same-court window for the full duration. Don't
+                                # try to book it — CourtReserve would only reject at Save (or
+                                # hang the modal). Keep watching; the window may open later.
+                                if open_at_time and not slot_has_window(slots, open_at_time, duration):
+                                    ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                    print(f"[{ts}] {target_time} is open but has no contiguous "
+                                          f"{duration}-min window (need a single court free the whole "
+                                          f"time) — continuing to watch...")
+                                    match = None
+                                else:
+                                    match = open_at_time
                             else:
-                                match = find_best_slot(slots, [])
+                                match = find_best_slot(slots, [], duration_minutes=duration)
 
                             if match:
                                 ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
