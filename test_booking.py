@@ -7,12 +7,18 @@ hold a single court for the full requested duration (the bug behind the 08:30/12
 Run:  python -m unittest test_booking -v
 """
 
+import json
 import unittest
 from datetime import date, datetime, timedelta
 
 import pytz
 
-from booking import Slot, slot_has_window, find_best_slot
+from booking import (
+    Slot, slot_has_window, find_best_slot,
+    _parse_ms, _build_json_data, _classify_booking_error,
+    OrgConfig, BookingError, BookingWindowError,
+    NoAvailableCourtsError, AlreadyBookedError,
+)
 
 TZ = "America/Los_Angeles"
 BASE = date(2026, 6, 11)
@@ -181,6 +187,72 @@ class FindBestSlotTests(unittest.TestCase):
         # No non-waitlist match and no duration constraint -> returns slots[0].
         chosen = find_best_slot(slots, ["99:99"], allow_fallback=True)
         self.assertIs(chosen, slots[0])
+
+
+class ParseMsTests(unittest.TestCase):
+    def test_parses_dotnet_date_format(self):
+        self.assertEqual(_parse_ms("/Date(1748000000000)/"), 1748000000000)
+
+    def test_parses_plain_value_unchanged(self):
+        # Robust to a value that's already stripped of the /Date(...)/ wrapper.
+        self.assertEqual(_parse_ms("1748000000000"), 1748000000000)
+
+
+class BuildJsonDataTests(unittest.TestCase):
+    def setUp(self):
+        self.org = OrgConfig("13234", "16995", "141206", "America/Los_Angeles")
+
+    def test_summer_date_uses_pdt_offset(self):
+        # Noon PDT (UTC-7) on 2026-06-11 -> 19:00 UTC.
+        d = json.loads(_build_json_data(date(2026, 6, 11), self.org))
+        self.assertEqual(d["startDate"], "2026-06-11T19:00:00.000Z")
+        self.assertEqual(d["Date"], "Thu, 11 Jun 2026 19:00:00 GMT")
+
+    def test_winter_date_uses_pst_offset(self):
+        # Noon PST (UTC-8) on 2026-01-15 -> 20:00 UTC.
+        d = json.loads(_build_json_data(date(2026, 1, 15), self.org))
+        self.assertEqual(d["startDate"], "2026-01-15T20:00:00.000Z")
+
+    def test_payload_carries_org_identifiers_and_local_date(self):
+        d = json.loads(_build_json_data(date(2026, 6, 11), self.org))
+        self.assertEqual(d["orgId"], "13234")
+        self.assertEqual(d["CustomSchedulerId"], "16995")
+        self.assertEqual(d["CostTypeId"], "141206")
+        self.assertEqual(d["TimeZone"], "America/Los_Angeles")
+        self.assertEqual(d["KendoDate"], {"Year": 2026, "Month": 6, "Day": 11})
+
+
+class ClassifyBookingErrorTests(unittest.TestCase):
+    def test_advance_window_message(self):
+        err = _classify_booking_error("You are only allowed to reserve up to 7 days out")
+        self.assertIsInstance(err, BookingWindowError)
+
+    def test_no_available_courts_message(self):
+        err = _classify_booking_error("No available courts for this time")
+        self.assertIsInstance(err, NoAvailableCourtsError)
+
+    def test_restricted_per_day_message(self):
+        err = _classify_booking_error("You are restricted to 1 reservation per day")
+        self.assertIsInstance(err, AlreadyBookedError)
+
+    def test_restricted_court_message(self):
+        err = _classify_booking_error("Restricted to one court at a time")
+        self.assertIsInstance(err, AlreadyBookedError)
+
+    def test_restricted_without_qualifier_is_generic(self):
+        # "restricted to" alone (no per-day/court qualifier) -> base BookingError.
+        err = _classify_booking_error("Access restricted to members")
+        self.assertIsInstance(err, BookingError)
+        self.assertNotIsInstance(err, AlreadyBookedError)
+
+    def test_case_insensitive(self):
+        err = _classify_booking_error("NO AVAILABLE COURTS")
+        self.assertIsInstance(err, NoAvailableCourtsError)
+
+    def test_unknown_message_is_generic(self):
+        err = _classify_booking_error("Something weird happened")
+        self.assertIsInstance(err, BookingError)
+        self.assertNotIsInstance(err, BookingWindowError)
 
 
 if __name__ == "__main__":
