@@ -59,7 +59,9 @@ from playwright.sync_api import sync_playwright
 from sqlalchemy import update, insert
 
 from booking import (OrgConfig, get_available_slots, find_best_slot, book_slot, slot_has_window,
-                     BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError)
+                     _org_uses_court_picker,
+                     BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
+                     CourtSelectionRequiredError)
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
 from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict, get_days_out
@@ -255,8 +257,12 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                             print("No available slots — nothing to book.")
                             break
 
+                        # Only picker orgs (Santa Clara) can trust the feed's window pre-filter;
+                        # non-picker orgs (Sunnyvale) must attempt the booking and rely on the
+                        # server's "no available courts" response.
+                        window_dur = default_duration if _org_uses_court_picker(org_cfg) else 0
                         slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times,
-                                              duration_minutes=default_duration)
+                                              duration_minutes=window_dur)
                         if slot is None:
                             if not last:
                                 print(f"No matching slot yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
@@ -279,7 +285,20 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                             print(f"Already has a reservation: {e}")
                             break
                         except NoAvailableCourtsError as e:
-                            print(f"No available courts: {e}")
+                            if not last:
+                                print(f"No available courts for the full window yet; "
+                                      f"retry {book_attempt + 1}/{BOOK_ATTEMPTS}: {e}")
+                                time.sleep(1)
+                                continue
+                            print(f"No available courts after {BOOK_ATTEMPTS} attempts: {e}")
+                            break
+                        except CourtSelectionRequiredError as e:
+                            if not last:
+                                print(f"No court available for the full window yet (court picker empty); "
+                                      f"retry {book_attempt + 1}/{BOOK_ATTEMPTS}: {e}")
+                                time.sleep(1)
+                                continue
+                            print(f"No court available for the full window after {BOOK_ATTEMPTS} attempts: {e}")
                             break
                         except BookingError as e:
                             print(f"Booking rejected: {e}")
@@ -430,11 +449,14 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                     (s for s in slots if s.start_time == target_time and not s.is_wait_list),
                                     None,
                                 )
-                                # A slot can be open for its 30-min interval yet lack a
-                                # contiguous same-court window for the full duration. Don't
-                                # try to book it — CourtReserve would only reject at Save (or
-                                # hang the modal). Keep watching; the window may open later.
-                                if open_at_time and not slot_has_window(slots, open_at_time, duration):
+                                # For picker orgs (Santa Clara), the feed is a useful cheap
+                                # pre-filter: a slot can be open for its 30-min interval yet lack a
+                                # contiguous same-court window, and we'd rather not open the modal.
+                                # For non-picker orgs (Sunnyvale) the feed is NOT trustworthy enough
+                                # to skip on — the only reliable signal is clicking Book and reading
+                                # the "no available courts" notice — so always attempt there.
+                                if (open_at_time and _org_uses_court_picker(org_cfg)
+                                        and not slot_has_window(slots, open_at_time, duration)):
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
                                     print(f"[{ts}] {target_time} is open but has no contiguous "
                                           f"{duration}-min window (need a single court free the whole "
@@ -443,7 +465,8 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                 else:
                                     match = open_at_time
                             else:
-                                match = find_best_slot(slots, [], duration_minutes=duration)
+                                window_dur = duration if _org_uses_court_picker(org_cfg) else 0
+                                match = find_best_slot(slots, [], duration_minutes=window_dur)
 
                             if match:
                                 ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -453,7 +476,13 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                                         duration_minutes=duration, org=org_cfg)
                                 except NoAvailableCourtsError as e:
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
-                                    print(f"[{ts}] Race condition — courts taken before booking completed. Continuing poll...\n  ({e})")
+                                    print(f"[{ts}] No court available for the full window (server reported "
+                                          f"no available courts on Save) — or courts were just taken. "
+                                          f"Not a failure; continuing to watch...\n  ({e})")
+                                except CourtSelectionRequiredError as e:
+                                    ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                    print(f"[{ts}] No court available for the full window yet (court picker empty). "
+                                          f"Not a failure; continuing to watch until a court frees up for the whole time.\n  ({e})")
                                 except BookingWindowError as e:
                                     print(f"Booking window not open yet: {e}")
                                     browser.close()

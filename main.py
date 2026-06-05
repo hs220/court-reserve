@@ -16,8 +16,9 @@ from playwright.sync_api import sync_playwright
 
 from config import load_config, default_org_config, SESSION_FILE
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
-from booking import (get_available_slots, find_best_slot, book_slot,
-                     BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError)
+from booking import (get_available_slots, find_best_slot, book_slot, _org_uses_court_picker,
+                     BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
+                     CourtSelectionRequiredError)
 from scheduler import wait_until
 
 PT = pytz.timezone("America/Los_Angeles")
@@ -91,6 +92,9 @@ def watch_and_book(page, probe_page, target_date: date, target_time: str, durati
                 success = book_slot(page, booking_url, match, duration_minutes=duration, org=org) if org else book_slot(page, booking_url, match, duration_minutes=duration)
             except NoAvailableCourtsError as e:
                 print(f"[{_ts()}] Race condition — courts taken before booking completed, continuing to poll...\n  ({e})")
+                success = False
+            except CourtSelectionRequiredError as e:
+                print(f"[{_ts()}] No court available for the full window (court picker empty); continuing to poll...\n  ({e})")
                 success = False
             except BookingWindowError as e:
                 print(f"[{_ts()}] Booking window not open yet: {e}")
@@ -182,8 +186,11 @@ def cmd_book(args, cfg):
                     time.sleep(0.5)
                 continue
 
+            # Picker orgs (Santa Clara) can trust the feed's window pre-filter; non-picker
+            # orgs (Sunnyvale) must attempt the booking and rely on the server's response.
+            window_dur = duration if _org_uses_court_picker(org) else 0
             slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times,
-                                  duration_minutes=duration)
+                                  duration_minutes=window_dur)
             if slot is None:
                 if not last:
                     print(f"[{_ts()}] No matching slot yet, retrying... ({attempt + 1}/{ATTEMPTS})")
@@ -201,6 +208,14 @@ def cmd_book(args, cfg):
                 # instant of the 12PM release — retry, it may open momentarily.
                 if not last and isinstance(exc, BookingWindowError):
                     print(f"[{_ts()}] Booking window not open yet, retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
+                    time.sleep(0.5)
+                    continue
+                if not last and isinstance(exc, CourtSelectionRequiredError):
+                    print(f"[{_ts()}] No court available for the full window (court picker empty), retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
+                    time.sleep(0.5)
+                    continue
+                if not last and isinstance(exc, NoAvailableCourtsError):
+                    print(f"[{_ts()}] No available courts for the full window, retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
                     time.sleep(0.5)
                     continue
                 raise

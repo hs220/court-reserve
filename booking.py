@@ -21,6 +21,12 @@ class NoAvailableCourtsError(BookingError):
 class AlreadyBookedError(BookingError):
     """Account already has a reservation and is restricted from booking more."""
 
+class CourtSelectionRequiredError(BookingError):
+    """No single court is free for the entire requested window, so CourtReserve leaves
+    the court picker empty and rejects Save with "Please select a court". This is NOT a
+    terminal failure — it just means a contiguous court isn't available *right now*, so
+    the caller should keep watching until one frees up for the whole window."""
+
 CANCEL_REASONS = [
     "Schedule conflict came up",
     "Plans changed unexpectedly",
@@ -66,6 +72,20 @@ DEFAULT_ORG_CONFIG = OrgConfig(
     cost_type_id=_DEFAULT_COST_TYPE_ID,
     timezone=_DEFAULT_TZ,
 )
+
+
+# Org-specific booking-modal behavior (home project — hard-coded per org).
+# Some clubs (e.g. Lifetime Santa Clara) expose a court picker (#CourtId) in the
+# reservation modal: it auto-fills with a court free for the WHOLE window, or is
+# left empty when none spans it — a reliable "not bookable" signal. Others (e.g.
+# Lifetime Sunnyvale) auto-assign the court server-side and leave #CourtId blank
+# even for bookable slots, so the picker must NOT be used as a signal there; those
+# orgs rely on the slot_has_window pre-filter and the post-Save error backstop.
+_COURT_PICKER_ORG_IDS = {"13234"}  # Lifetime Santa Clara
+
+
+def _org_uses_court_picker(org: "OrgConfig") -> bool:
+    return org.org_id in _COURT_PICKER_ORG_IDS
 
 
 @dataclass
@@ -155,15 +175,18 @@ _INTERVAL_MS = 30 * 60 * 1000  # CourtReserve scheduler granularity
 
 
 def slot_has_window(slots: list[Slot], start: Slot, duration_minutes: int) -> bool:
-    """True if a *single* court is free across enough consecutive intervals to cover
-    `duration_minutes` starting at `start`.
+    """Heuristic pre-filter: True if a *single* court appears free across enough
+    consecutive intervals to cover `duration_minutes` starting at `start`.
 
     CourtReserve's ReadConsolidated feed reports availability per 30-min interval, and
-    a reservation must hold the same court for its whole length. The booking form does
-    NOT validate this client-side — it will happily let you select 120 min on a slot
-    with only 60 min free, set EndTime accordingly, and only reject at Save (or, on a
-    slow client, hang the modal). So we must confirm the window ourselves before
-    committing to a slot. Returns True when duration_minutes <= 0 (no constraint)."""
+    a reservation must hold the same court for its whole length. This intersects each
+    interval's AvailableCourtIds to cheaply reject slots that obviously can't fit (e.g.
+    an interval is missing entirely), avoiding a wasted modal open. It is NOT
+    authoritative, though — a court can appear in every interval's list yet still not be
+    bookable as one contiguous block, so the feed can yield false positives. The real
+    test is the modal's #CourtId picker (see _handle_booking_modal), which raises
+    CourtSelectionRequiredError when no court spans the window. Returns True when
+    duration_minutes <= 0 (no constraint)."""
     if duration_minutes <= 0:
         return True
     by_start = {s.start_ms: s for s in slots}
@@ -210,6 +233,8 @@ def _classify_booking_error(msg: str) -> BookingError:
     lower = msg.lower()
     if "only allowed to reserve up to" in lower:
         return BookingWindowError(msg)
+    if "select a court" in lower:
+        return CourtSelectionRequiredError(msg)
     if "no available courts" in lower:
         return NoAvailableCourtsError(msg)
     if "restricted to" in lower and ("per day" in lower or "court" in lower):
@@ -293,7 +318,7 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
         page.wait_for_timeout(2000)
 
         if page.query_selector("#create-res-modal, .modal-content"):
-            return _handle_booking_modal(page, slot, duration_minutes, dry_run=dry_run)
+            return _handle_booking_modal(page, slot, duration_minutes, org=org, dry_run=dry_run)
 
         ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
         if click_attempt < CLICK_RETRIES - 1:
@@ -311,7 +336,7 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
     return False
 
 
-def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run: bool = False) -> bool:
+def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
     print("Booking modal opened — waiting for full AJAX load...")
 
     # The modal loads in two hops:
@@ -406,6 +431,30 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
         page.wait_for_timeout(8000)
         return False
 
+    # Authoritative court-availability check — ONLY for orgs with a court picker
+    # (e.g. Santa Clara). Such orgs auto-populate #CourtId with a court free for the
+    # ENTIRE reservation; if no single court spans the requested duration the field
+    # is left blank and Save fails with "Please select a court". The ReadConsolidated
+    # feed's per-interval AvailableCourtIds cannot be trusted for this — a court can
+    # appear in every 30-min interval yet still not be bookable as one contiguous
+    # block — so the picker is the real test. Orgs WITHOUT a picker (e.g. Sunnyvale)
+    # leave #CourtId blank even for bookable slots, so this check is skipped for them
+    # (they rely on slot_has_window + the post-Save backstop instead).
+    if duration_minutes > 0 and _org_uses_court_picker(org):
+        court_available = page.evaluate("""(function() {
+            var el = document.getElementById("CourtId");
+            if (el && el.value && String(el.value).trim()) return true;
+            var w = (window.$ && $("#CourtId").data) ? $("#CourtId").data("kendoDropDownList") : null;
+            if (w && w.dataSource && w.dataSource.data().length > 0) return true;
+            return false;
+        })()""")
+        if not court_available:
+            ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            msg = (f"No court is available for the full {duration_minutes}-min window at "
+                   f"{slot.start_time} (court picker empty) — keep watching.")
+            print(f"[{ts}] {msg}")
+            raise CourtSelectionRequiredError(msg)
+
     # Accept the disclosure checkbox
     page.evaluate("""(function() {
         var cb = document.getElementById("DisclosureAgree");
@@ -437,7 +486,7 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, dry_run
     if "reservation confirmed" in page_text.lower():
         print("Booking confirmed!")
         return True
-    for marker in ["is only allowed", "not allowed", "cannot reserve", "restricted to", "no available courts"]:
+    for marker in ["is only allowed", "not allowed", "cannot reserve", "restricted to", "no available courts", "select a court"]:
         if marker in page_text:
             idx = page_text.find(marker)
             snippet = page_text[max(0, idx-30):idx+120].strip()

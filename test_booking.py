@@ -15,9 +15,9 @@ import pytz
 
 from booking import (
     Slot, slot_has_window, find_best_slot,
-    _parse_ms, _build_json_data, _classify_booking_error,
+    _parse_ms, _build_json_data, _classify_booking_error, _org_uses_court_picker,
     OrgConfig, BookingError, BookingWindowError,
-    NoAvailableCourtsError, AlreadyBookedError,
+    NoAvailableCourtsError, AlreadyBookedError, CourtSelectionRequiredError,
 )
 
 TZ = "America/Los_Angeles"
@@ -253,6 +253,41 @@ class ClassifyBookingErrorTests(unittest.TestCase):
         err = _classify_booking_error("Something weird happened")
         self.assertIsInstance(err, BookingError)
         self.assertNotIsInstance(err, BookingWindowError)
+
+    def test_please_select_a_court_is_not_terminal(self):
+        err = _classify_booking_error("Please select a court")
+        self.assertIsInstance(err, CourtSelectionRequiredError)
+        # Still a BookingError so generic handlers don't break, but distinguishable
+        # so the watch/book loops can keep trying instead of failing the job.
+        self.assertIsInstance(err, BookingError)
+        self.assertNotIsInstance(err, NoAvailableCourtsError)
+
+    def test_court_selection_matches_real_bom_prefixed_notice(self):
+        # The exact popup text from run 189 (leading BOM chars + multi-line).
+        msg = "﻿﻿Reservation Notice\nPlease select a court\nOK"
+        self.assertIsInstance(_classify_booking_error(msg), CourtSelectionRequiredError)
+
+    def test_sunnyvale_no_available_courts_notice(self):
+        # Exact Save-rejection popup captured from Lifetime Sunnyvale for a window
+        # with no court free the whole time — the signal to keep watching there.
+        msg = "﻿﻿Reservation Notice\nSorry, no available courts for the time requested.\nOK"
+        self.assertIsInstance(_classify_booking_error(msg), NoAvailableCourtsError)
+
+
+class OrgCourtPickerTests(unittest.TestCase):
+    def test_santa_clara_uses_court_picker(self):
+        org = OrgConfig("13234", "16995", "141206")
+        self.assertTrue(_org_uses_court_picker(org))
+
+    def test_sunnyvale_does_not_use_court_picker(self):
+        # Sunnyvale leaves #CourtId blank even for bookable slots, so the picker
+        # check must be skipped or it would never book.
+        org = OrgConfig("13233", "16983", "141205")
+        self.assertFalse(_org_uses_court_picker(org))
+
+    def test_unknown_org_defaults_to_no_picker(self):
+        org = OrgConfig("99999", "0", "0")
+        self.assertFalse(_org_uses_court_picker(org))
 
 
 if __name__ == "__main__":
