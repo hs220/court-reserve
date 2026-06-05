@@ -27,6 +27,13 @@ class CourtSelectionRequiredError(BookingError):
     terminal failure — it just means a contiguous court isn't available *right now*, so
     the caller should keep watching until one frees up for the whole window."""
 
+class SlotNotBookableError(BookingError):
+    """Clicking the slot cell never opened the create-reservation modal, even after
+    several retries. The cell exists in the grid but isn't bookable — typically the
+    ReadConsolidated feed advertised availability that's already gone (stale during the
+    release rush). The caller should DEMOTE this slot (stop re-picking it) and try
+    another candidate rather than re-clicking the same dead cell."""
+
 CANCEL_REASONS = [
     "Schedule conflict came up",
     "Plans changed unexpectedly",
@@ -205,12 +212,16 @@ def slot_has_window(slots: list[Slot], start: Slot, duration_minutes: int) -> bo
 
 
 def find_best_slot(slots: list[Slot], preferred_times: list[str], allow_fallback: bool = True,
-                   duration_minutes: int = 0) -> Optional[Slot]:
+                   duration_minutes: int = 0, exclude_starts: Optional[set] = None) -> Optional[Slot]:
     if not slots:
         return None
 
+    excluded = exclude_starts or set()
+
     def ok(s: Slot) -> bool:
-        return not s.is_wait_list and slot_has_window(slots, s, duration_minutes)
+        return (s.start_ms not in excluded
+                and not s.is_wait_list
+                and slot_has_window(slots, s, duration_minutes))
 
     for ptime in (preferred_times or []):
         for s in slots:
@@ -223,9 +234,12 @@ def find_best_slot(slots: list[Slot], preferred_times: list[str], allow_fallback
     for s in slots:
         if ok(s):
             return s
-    # Last resort (any slot, incl. waitlist) only when not enforcing a duration window
+    # Last resort (any non-excluded slot, incl. waitlist) only when not enforcing
+    # a duration window
     if duration_minutes <= 0:
-        return slots[0]
+        for s in slots:
+            if s.start_ms not in excluded:
+                return s
     return None
 
 
@@ -331,9 +345,69 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
         else:
             print(f"[{ts}] No booking modal appeared after clicking slot "
                   f"after {CLICK_RETRIES} attempts.")
-            return False
+            _dump_no_modal_diagnostics(page, slot_label, bbox)
+            raise SlotNotBookableError(
+                f"Slot at {slot.start_time} on {slot.start_date} clicked but never "
+                f"opened a booking modal — cell not bookable (likely stale feed).")
 
-    return False
+    raise SlotNotBookableError(
+        f"Slot at {slot.start_time} on {slot.start_date} not bookable.")
+
+
+def _dump_no_modal_diagnostics(page: Page, slot_label: str, bbox) -> None:
+    """On a persistent no-modal failure, capture page state so we can tell whether
+    the click missed the cell (cause: off-screen/wrong element) or a modal opened
+    that our selector didn't match (cause: CourtReserve markup changed)."""
+    import os, time as _time
+    stamp = _time.strftime("%Y%m%d-%H%M%S")
+    # Write to DATA_DIR (the mounted volume on NAS) so the screenshot survives the
+    # container and is retrievable; fall back to /tmp for local/CLI runs.
+    out_dir = os.environ.get("DATA_DIR", "/tmp")
+    base = os.path.join(out_dir, f"court-debug-{stamp}")
+    try:
+        page.screenshot(path=f"{base}.png", full_page=True)
+        print(f"  [debug] screenshot -> {base}.png")
+    except Exception as e:
+        print(f"  [debug] screenshot failed: {e}")
+    try:
+        bx = (bbox or {}).get("x", -1)
+        by = (bbox or {}).get("y", -1)
+        info = page.evaluate("""(function(pt) {
+            var bx = pt[0], by = pt[1];
+            var vp = {w: window.innerWidth, h: window.innerHeight,
+                      scrollY: window.scrollY};
+            // Any dialog-like containers currently in the DOM
+            var sels = ["#create-res-modal", ".modal-content", ".modal", ".k-window",
+                        ".k-dialog", "[role=dialog]", "#main-reservation-container",
+                        ".pnotify", ".swal2-container"];
+            var found = {};
+            sels.forEach(function(s) {
+                var els = document.querySelectorAll(s);
+                if (els.length) {
+                    found[s] = [];
+                    els.forEach(function(el) {
+                        var r = el.getBoundingClientRect();
+                        found[s].push({visible: !!(el.offsetParent) ,
+                                       w: Math.round(r.width), h: Math.round(r.height),
+                                       cls: el.className});
+                    });
+                }
+            });
+            // What element is actually at the click point?
+            var atPoint = null;
+            if (bx >= 0) {
+                var e = document.elementFromPoint(bx, by);
+                if (e) atPoint = {tag: e.tagName, cls: e.className,
+                                  txt: (e.innerText||"").slice(0,60)};
+            }
+            return {viewport: vp, dialogs: found, atClickPoint: atPoint, url: location.href};
+        })""", [bx, by])
+        print(f"  [debug] url={info.get('url')}")
+        print(f"  [debug] viewport={info.get('viewport')}  clickPoint={bbox}")
+        print(f"  [debug] elementAtClickPoint={info.get('atClickPoint')}")
+        print(f"  [debug] dialog-like containers found: {json.dumps(info.get('dialogs'), indent=2)}")
+    except Exception as e:
+        print(f"  [debug] dom probe failed: {e}")
 
 
 def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:

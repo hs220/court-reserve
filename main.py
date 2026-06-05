@@ -18,7 +18,7 @@ from config import load_config, default_org_config, SESSION_FILE
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from booking import (get_available_slots, find_best_slot, book_slot, _org_uses_court_picker,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
-                     CourtSelectionRequiredError)
+                     CourtSelectionRequiredError, SlotNotBookableError)
 from scheduler import wait_until
 
 PT = pytz.timezone("America/Los_Angeles")
@@ -96,6 +96,9 @@ def watch_and_book(page, probe_page, target_date: date, target_time: str, durati
             except CourtSelectionRequiredError as e:
                 print(f"[{_ts()}] No court available for the full window (court picker empty); continuing to poll...\n  ({e})")
                 success = False
+            except SlotNotBookableError as e:
+                print(f"[{_ts()}] Slot clicked but no modal (taken in the race) — continuing to poll...\n  ({e})")
+                success = False
             except BookingWindowError as e:
                 print(f"[{_ts()}] Booking window not open yet: {e}")
                 return False
@@ -168,6 +171,9 @@ def cmd_book(args, cfg):
         # those is pointless.
         ATTEMPTS = 20
         success = False
+        # Slots whose cell clicked but never opened a modal (stale feed) — demote
+        # so we re-pick a live slot instead of re-clicking the same dead cell.
+        dead_starts: set = set()
         for attempt in range(ATTEMPTS):
             last = attempt == ATTEMPTS - 1
 
@@ -189,8 +195,13 @@ def cmd_book(args, cfg):
             # Picker orgs (Santa Clara) can trust the feed's window pre-filter; non-picker
             # orgs (Sunnyvale) must attempt the booking and rely on the server's response.
             window_dur = duration if _org_uses_court_picker(org) else 0
-            slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times,
-                                  duration_minutes=window_dur)
+            # Book ONLY from the preferred-times list, in descending preference order;
+            # never book a time that isn't on it. A dead preferred slot (no modal) is in
+            # dead_starts, so we fall through to the next preferred time. Fallback to
+            # arbitrary times is allowed only when no preferred list was given.
+            slot = find_best_slot(slots, preferred_times,
+                                  allow_fallback=not preferred_times,
+                                  duration_minutes=window_dur, exclude_starts=dead_starts)
             if slot is None:
                 if not last:
                     print(f"[{_ts()}] No matching slot yet, retrying... ({attempt + 1}/{ATTEMPTS})")
@@ -218,6 +229,14 @@ def cmd_book(args, cfg):
                     print(f"[{_ts()}] No available courts for the full window, retrying... ({attempt + 1}/{ATTEMPTS}): {exc}")
                     time.sleep(0.5)
                     continue
+                if isinstance(exc, SlotNotBookableError):
+                    dead_starts.add(slot.start_ms)
+                    if not last:
+                        print(f"[{_ts()}] Slot {slot.start_time} not bookable (no modal) — "
+                              f"demoting and trying another slot... ({attempt + 1}/{ATTEMPTS}): {exc}")
+                        continue
+                    print(f"[{_ts()}] No bookable slot after {ATTEMPTS} attempts: {exc}")
+                    break
                 raise
 
             if success or dry_run:
@@ -273,8 +292,12 @@ def cmd_book_next(args, cfg):
 
     print(f"book-next: targeting {target_date} (today + {days_out} days), release at {release_dt.strftime('%Y-%m-%d %H:%M %Z')}")
 
+    # Start the fetch→click cycle a bit before the official release so we're already
+    # mid-attempt the instant slots flip open. Pre-release clicks just raise
+    # BookingWindowError and get retried until the window opens.
+    RELEASE_LEAD_SECONDS = 30
     args.date = target_date.isoformat()
-    args.at = release_dt.isoformat()
+    args.at = (release_dt - timedelta(seconds=RELEASE_LEAD_SECONDS)).isoformat()
 
     MAX_RETRIES = 5
     last_exc_tb = None

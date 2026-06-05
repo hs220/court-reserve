@@ -61,7 +61,12 @@ from sqlalchemy import update, insert
 from booking import (OrgConfig, Slot, get_available_slots, find_best_slot, book_slot, slot_has_window,
                      _org_uses_court_picker, get_my_reservations, cancel_reservation, match_reservation_id,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
-                     CourtSelectionRequiredError)
+                     CourtSelectionRequiredError, SlotNotBookableError)
+
+# Start polling/clicking this many seconds BEFORE the official release time. The
+# scheduler grid and ReadConsolidated feed can flip open a hair before noon, and
+# the extra lead lets us be mid-cycle the instant slots appear.
+RELEASE_LEAD_SECONDS = 30
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
 from web.database import (engine, job_runs, jobs, bookings, accounts, organizations,
@@ -426,7 +431,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                     if at_iso:
                         wait_until(datetime.fromisoformat(at_iso))
                     elif datetime.now(tz) < release_dt:
-                        wait_until(release_dt - timedelta(seconds=8))
+                        wait_until(release_dt - timedelta(seconds=RELEASE_LEAD_SECONDS))
 
                     # Retry the whole fetch→find→book cycle. Slots may not appear
                     # the instant the window opens, the slot we pick may get taken
@@ -434,6 +439,11 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                     # failure in issue #2 / run #175) — all transient and worth
                     # retrying with a fresh fetch and re-navigation.
                     BOOK_ATTEMPTS = 20
+                    # Slots whose cell clicked but never opened a modal — the feed
+                    # advertised them as open but they're actually gone (stale during
+                    # the release rush). Demote them so we re-pick a live slot instead
+                    # of hammering the same dead cell.
+                    dead_starts: set = set()
                     for book_attempt in range(BOOK_ATTEMPTS):
                         last = book_attempt == BOOK_ATTEMPTS - 1
 
@@ -458,8 +468,14 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                         # non-picker orgs (Sunnyvale) must attempt the booking and rely on the
                         # server's "no available courts" response.
                         window_dur = default_duration if _org_uses_court_picker(org_cfg) else 0
-                        slot = find_best_slot(slots, preferred_times, allow_fallback=not preferred_times,
-                                              duration_minutes=window_dur)
+                        # Book ONLY from the user's preferred-times list, in descending
+                        # preference order; never book a time that isn't on it. If a
+                        # preferred slot is dead (no modal), it's in dead_starts and we
+                        # fall through to the next preferred time. Fallback to arbitrary
+                        # times is allowed only when no preferred list was given.
+                        slot = find_best_slot(slots, preferred_times,
+                                              allow_fallback=not preferred_times,
+                                              duration_minutes=window_dur, exclude_starts=dead_starts)
                         if slot is None:
                             if not last:
                                 print(f"No matching slot yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
@@ -497,6 +513,15 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                                 continue
                             print(f"No court available for the full window after {BOOK_ATTEMPTS} attempts: {e}")
                             break
+                        except SlotNotBookableError as e:
+                            dead_starts.add(slot.start_ms)
+                            if not last:
+                                print(f"Slot {slot.start_time} not bookable (no modal) — "
+                                      f"demoting and trying another slot; "
+                                      f"retry {book_attempt + 1}/{BOOK_ATTEMPTS}: {e}")
+                                continue
+                            print(f"No bookable slot after {BOOK_ATTEMPTS} attempts: {e}")
+                            break
                         except BookingError as e:
                             print(f"Booking rejected: {e}")
                             break
@@ -504,7 +529,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                         if success:
                             break
                         if not last:
-                            print(f"Booking attempt failed (no modal / transient) — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
+                            print(f"Booking attempt failed (transient) — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
                             time.sleep(1)
 
                     browser.close()
@@ -690,6 +715,10 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
                                     print(f"[{ts}] No court available for the full window yet (court picker empty). "
                                           f"Not a failure; continuing to watch until a court frees up for the whole time.\n  ({e})")
+                                except SlotNotBookableError as e:
+                                    ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                    print(f"[{ts}] Slot clicked but no modal (taken in the race). "
+                                          f"Not a failure; continuing to watch...\n  ({e})")
                                 except BookingWindowError as e:
                                     print(f"Booking window not open yet: {e}")
                                     browser.close()

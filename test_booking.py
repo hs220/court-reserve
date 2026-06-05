@@ -189,6 +189,40 @@ class FindBestSlotTests(unittest.TestCase):
         chosen = find_best_slot(slots, ["99:99"], allow_fallback=True)
         self.assertIs(chosen, slots[0])
 
+    # --- exclude_starts: demote dead slots (no-modal) and re-pick within the list ---
+
+    def test_dead_preferred_falls_through_to_next_preferred(self):
+        # Top preference 20:00 is dead (no modal); fall through to the next preferred
+        # time, 19:00 — in descending-preference order.
+        slots = [mk("20:00", [1, 2]), mk("19:00", [3, 4]), mk("18:00", [5, 6])]
+        dead = {at(slots, "20:00").start_ms}
+        chosen = find_best_slot(slots, ["20:00", "19:00", "18:00"],
+                                allow_fallback=False, exclude_starts=dead)
+        self.assertEqual(chosen.start_time, "19:00")
+
+    def test_never_books_outside_preferred_list(self):
+        # 20:00 is the only preferred time and it's dead — we must NOT grab 18:00,
+        # which isn't on the list. Preferred-only means return None here.
+        slots = [mk("20:00", [1, 2]), mk("18:00", [3, 4])]
+        dead = {at(slots, "20:00").start_ms}
+        self.assertIsNone(
+            find_best_slot(slots, ["20:00"], allow_fallback=False, exclude_starts=dead)
+        )
+
+    def test_all_preferred_excluded_returns_none(self):
+        slots = [mk("08:00", [1, 2]), mk("08:30", [3, 4])]
+        dead = {s.start_ms for s in slots}
+        self.assertIsNone(
+            find_best_slot(slots, ["08:00", "08:30"], allow_fallback=False, exclude_starts=dead)
+        )
+
+    def test_exclude_starts_skips_dead_in_last_resort(self):
+        # No preferred list -> fallback path; excluded slot is skipped in last resort.
+        slots = [mk("08:00", [1], is_wait_list=True), mk("08:30", [2], is_wait_list=True)]
+        dead = {at(slots, "08:00").start_ms}
+        chosen = find_best_slot(slots, [], allow_fallback=True, exclude_starts=dead)
+        self.assertIs(chosen, slots[1])
+
 
 class ParseMsTests(unittest.TestCase):
     def test_parses_dotnet_date_format(self):
