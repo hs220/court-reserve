@@ -64,6 +64,38 @@
 {% endfor %}
 {% endmacro %}
 
+{% if pending_transfers %}
+<div class="card" style="padding:0;overflow-x:auto;border:1px solid var(--accent)">
+  <div class="card-header" style="padding:12px 16px"><h2>Pending transfers</h2></div>
+  <table class="jobs-table">
+    <thead><tr><th>Court</th><th>Held by (probe)</th><th>→ Move to</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for t in pending_transfers %}
+      <tr>
+        <td data-label="Court">{{ t.date }} {{ t.start_time }} ({{ t.duration_min }}min){% if t.court_type %} · {{ t.court_type }}{% endif %}</td>
+        <td data-label="Held by">{{ t.probe_label }}</td>
+        <td data-label="Move to">{{ t.main_label }}</td>
+        <td data-label="Status">
+          <span class="badge badge-{{ 'active' if t.status == 'pending' else t.status }}">{{ t.status }}</span>
+          {% if t.note %}<div style="font-size:11px;color:var(--muted)">{{ t.note }}</div>{% endif %}
+        </td>
+        <td data-label="" style="white-space:nowrap">
+          {% if t.status in ('pending', 'held_by_probe') %}
+          <form method="post" action="/transfers/{{ t.id }}/execute" style="display:inline"
+                onsubmit="return confirm('Cancel from {{ t.probe_label }} and re-book on {{ t.main_label }}? The court is briefly exposed during the swap.')">
+            <button class="btn btn-primary btn-sm" data-loading="Transferring…">Transfer →</button>
+          </form>
+          {% elif t.status == 'transferring' %}
+          <span style="color:var(--muted);font-size:12px">in progress…</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 {% if active_jobs %}
 <div class="card" style="padding:0;overflow-x:auto">
   <div class="card-header" style="padding:12px 16px"><h2>Active</h2></div>
@@ -187,11 +219,18 @@
           </select>
         </div>
         <div class="form-group" style="grid-column:1/-1">
-          <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — used only for slot detection)</span></label>
+          <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — detects AND books, then transfers to your booking account)</span></label>
           <select name="probe_account_id">
             <option value="">— same as booking account —</option>
             {% for a in accounts %}<option value="{{ a.id }}">{{ a.label or a.email }}</option>{% endfor %}
           </select>
+        </div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label style="font-weight:400;text-transform:none;cursor:pointer">
+            <input type="checkbox" name="auto_transfer" value="1" style="width:auto;margin-right:6px">
+            Automatically transfer to the booking account once the probe secures it
+            <span style="color:var(--muted)">(otherwise it waits for the Transfer button; only applies with a probe account)</span>
+          </label>
         </div>
       </div>
       <div class="form-actions">

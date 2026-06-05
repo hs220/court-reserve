@@ -563,6 +563,16 @@ def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:
     return results
 
 
+def match_reservation_id(reservations: list[dict], slot_date: str, slot_time: str) -> Optional[str]:
+    """From get_my_reservations() output, return the reservation_id whose date and
+    start_time match the given slot (YYYY-MM-DD / HH:MM), or None. Used to locate the
+    reservation a probe account just made so it can be cancelled for transfer."""
+    for r in reservations:
+        if r.get("date") == slot_date and r.get("start_time") == slot_time:
+            return r.get("reservation_id") or None
+    return None
+
+
 def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT_ORG_CONFIG) -> bool:
     reason = random.choice(CANCEL_REASONS)
     detail_url = f"https://app.courtreserve.com/Online/MyProfile/Reservation/{org.org_id}/{reservation_id}"

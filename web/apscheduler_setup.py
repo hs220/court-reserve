@@ -103,6 +103,7 @@ def schedule_watch(job_id: int, account_id: int, params: dict):
             "interval": int(params.get("interval", 60)),
             "deadline_mode": params.get("deadline_mode", "4h"),
             "probe_account_id": int(probe_id) if probe_id else None,
+            "auto_transfer": bool(params.get("auto_transfer", False)),
         },
     )
     _persist_scheduler_id(job_id, apscheduler_id)

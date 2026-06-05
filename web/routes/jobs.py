@@ -6,7 +6,8 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select, update
 
-from web.database import engine, jobs, accounts, organizations, job_runs, bookings, row_to_dict, json_field, get_days_out
+from web.database import (engine, jobs, accounts, organizations, job_runs, bookings,
+                          pending_transfers, row_to_dict, json_field, get_days_out)
 from web import apscheduler_setup
 from web.templates_shared import templates
 
@@ -67,11 +68,21 @@ async def list_jobs(request: Request):
                     )]
         all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
+        acct_label = {a["id"]: (a.get("label") or a["email"]) for a in all_accounts}
+        transfers = [row_to_dict(r) for r in conn.execute(
+            pending_transfers.select()
+            .where(pending_transfers.c.status.in_(["pending", "transferring", "held_by_probe"]))
+            .order_by(pending_transfers.c.created_at.desc())
+        )]
+    for t in transfers:
+        t["probe_label"] = acct_label.get(t["probe_account_id"], "?")
+        t["main_label"] = acct_label.get(t["main_account_id"], "?")
     active_jobs = [j for j in all_jobs if j["status"] in ("active", "paused")]
     completed_jobs = [j for j in all_jobs if j["status"] not in ("active", "paused")]
     return templates.TemplateResponse(request, "jobs.html", context={
         "active_jobs": active_jobs,
         "completed_jobs": completed_jobs,
+        "pending_transfers": transfers,
         "orgs": all_orgs,
         "accounts": all_accounts,
     })
@@ -145,8 +156,11 @@ async def create_watch(
     interval: int = Form(60),
     deadline_mode: str = Form("4h"),
     probe_account_id: str = Form(""),
+    auto_transfer: str = Form(""),
 ):
     probe_id = int(probe_account_id) if probe_account_id.strip() else None
+    # Auto-transfer only makes sense with a distinct probe account.
+    auto_xfer = bool(auto_transfer.strip()) and probe_id is not None and probe_id != account_id
 
     with engine.connect() as conn:
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
@@ -155,7 +169,7 @@ async def create_watch(
 
     params = json.dumps({"date": date, "time": time, "duration": duration,
                          "interval": interval, "deadline_mode": deadline_mode,
-                         "probe_account_id": probe_id, "run_at": run_at})
+                         "probe_account_id": probe_id, "auto_transfer": auto_xfer, "run_at": run_at})
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
             account_id=account_id,
@@ -170,7 +184,8 @@ async def create_watch(
     apscheduler_setup.schedule_watch(job_id, account_id,
                                      {"date": date, "time": time, "duration": duration,
                                       "interval": interval, "deadline_mode": deadline_mode,
-                                      "probe_account_id": probe_id, "run_at": run_at})
+                                      "probe_account_id": probe_id, "auto_transfer": auto_xfer,
+                                      "run_at": run_at})
     return RedirectResponse("/jobs", status_code=303)
 
 
@@ -213,14 +228,17 @@ async def create_recurrent_watch(
     interval: int = Form(60),
     deadline_mode: str = Form("4h"),
     probe_account_id: str = Form(""),
+    auto_transfer: str = Form(""),
 ):
     probe_id = int(probe_account_id) if probe_account_id.strip() else None
+    auto_xfer = bool(auto_transfer.strip()) and probe_id is not None and probe_id != account_id
 
     with engine.connect() as conn:
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
 
     params_dict = {"target_day_of_week": target_day_of_week, "time": time, "duration": duration,
-                   "interval": interval, "deadline_mode": deadline_mode, "probe_account_id": probe_id}
+                   "interval": interval, "deadline_mode": deadline_mode, "probe_account_id": probe_id,
+                   "auto_transfer": auto_xfer}
     cron_expr = _recurrent_cron_expr(account_id, org, target_day_of_week, "recurrent_watch")
 
     with engine.begin() as conn:
@@ -322,6 +340,20 @@ async def run_now(job_id: int):
     return RedirectResponse(f"/jobs/{job_id}/runs", status_code=303)
 
 
+@router.post("/transfers/{transfer_id}/execute")
+async def execute_transfer(transfer_id: int):
+    """Run a pending probe→main transfer in the background (cancel from probe, re-book on main)."""
+    import threading
+    from web.job_runner import run_transfer
+    with engine.begin() as conn:
+        row = conn.execute(pending_transfers.select().where(pending_transfers.c.id == transfer_id)).fetchone()
+        if row and row.status in ("pending", "held_by_probe"):
+            conn.execute(update(pending_transfers).where(pending_transfers.c.id == transfer_id)
+                         .values(status="transferring", note="Transfer queued..."))
+    threading.Thread(target=run_transfer, kwargs={"transfer_id": transfer_id}, daemon=True).start()
+    return RedirectResponse("/jobs", status_code=303)
+
+
 @router.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
 async def edit_job_form(request: Request, job_id: int):
     with engine.connect() as conn:
@@ -341,6 +373,7 @@ async def update_job(
     interval: int = Form(60),
     deadline_mode: str = Form("4h"),
     probe_account_id: str = Form(""),
+    auto_transfer: str = Form(""),
 ):
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
@@ -366,10 +399,11 @@ async def update_job(
 
     elif j["type"] == "watch":
         probe_id = int(probe_account_id) if probe_account_id.strip() else None
+        auto_xfer = bool(auto_transfer.strip()) and probe_id is not None and probe_id != j["account_id"]
         run_at = _watch_window_run_at(j["account_id"], org, date)
         new_params = json.dumps({"date": date, "time": time, "duration": duration,
                                   "interval": interval, "deadline_mode": deadline_mode,
-                                  "probe_account_id": probe_id, "run_at": run_at})
+                                  "probe_account_id": probe_id, "auto_transfer": auto_xfer, "run_at": run_at})
         with engine.begin() as conn:
             conn.execute(update(jobs).where(jobs.c.id == job_id).values(params=new_params, status="active"))
         apscheduler_setup.schedule_watch(job_id, j["account_id"], json.loads(new_params))

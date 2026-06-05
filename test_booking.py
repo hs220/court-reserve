@@ -16,6 +16,7 @@ import pytz
 from booking import (
     Slot, slot_has_window, find_best_slot,
     _parse_ms, _build_json_data, _classify_booking_error, _org_uses_court_picker,
+    match_reservation_id,
     OrgConfig, BookingError, BookingWindowError,
     NoAvailableCourtsError, AlreadyBookedError, CourtSelectionRequiredError,
 )
@@ -272,6 +273,28 @@ class ClassifyBookingErrorTests(unittest.TestCase):
         # with no court free the whole time — the signal to keep watching there.
         msg = "﻿﻿Reservation Notice\nSorry, no available courts for the time requested.\nOK"
         self.assertIsInstance(_classify_booking_error(msg), NoAvailableCourtsError)
+
+
+class MatchReservationIdTests(unittest.TestCase):
+    RES = [
+        {"reservation_id": "111", "date": "2026-06-07", "start_time": "13:00", "duration_min": 120},
+        {"reservation_id": "222", "date": "2026-06-07", "start_time": "08:30", "duration_min": 60},
+    ]
+
+    def test_matches_date_and_time(self):
+        self.assertEqual(match_reservation_id(self.RES, "2026-06-07", "13:00"), "111")
+        self.assertEqual(match_reservation_id(self.RES, "2026-06-07", "08:30"), "222")
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(match_reservation_id(self.RES, "2026-06-07", "09:00"))
+        self.assertIsNone(match_reservation_id(self.RES, "2026-06-08", "13:00"))
+
+    def test_empty_list(self):
+        self.assertIsNone(match_reservation_id([], "2026-06-07", "13:00"))
+
+    def test_blank_reservation_id_is_none(self):
+        res = [{"reservation_id": "", "date": "2026-06-07", "start_time": "13:00"}]
+        self.assertIsNone(match_reservation_id(res, "2026-06-07", "13:00"))
 
 
 class OrgCourtPickerTests(unittest.TestCase):

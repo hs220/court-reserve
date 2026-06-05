@@ -71,11 +71,18 @@
         </select>
       </div>
       <div class="form-group" style="grid-column:1/-1">
-        <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — used only for slot detection)</span></label>
+        <label>Probe Account <span style="color:var(--muted);font-weight:400;text-transform:none">(optional — detects AND books, then transfers to your booking account)</span></label>
         <select name="probe_account_id">
           <option value="">— same as booking account —</option>
           {% for a in accounts %}<option value="{{ a.id }}" {% if job.params.probe_account_id == a.id %}selected{% endif %}>{{ a.label or a.email }}</option>{% endfor %}
         </select>
+      </div>
+      <div class="form-group" style="grid-column:1/-1">
+        <label style="font-weight:400;text-transform:none;cursor:pointer">
+          <input type="checkbox" name="auto_transfer" value="1" style="width:auto;margin-right:6px" {% if job.params.auto_transfer %}checked{% endif %}>
+          Automatically transfer to the booking account once the probe secures it
+          <span style="color:var(--muted)">(only applies with a probe account)</span>
+        </label>
       </div>
       {% endif %}
       {% endif %}

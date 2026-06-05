@@ -58,13 +58,14 @@ import pytz
 from playwright.sync_api import sync_playwright
 from sqlalchemy import update, insert
 
-from booking import (OrgConfig, get_available_slots, find_best_slot, book_slot, slot_has_window,
-                     _org_uses_court_picker,
+from booking import (OrgConfig, Slot, get_available_slots, find_best_slot, book_slot, slot_has_window,
+                     _org_uses_court_picker, get_my_reservations, cancel_reservation, match_reservation_id,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
                      CourtSelectionRequiredError)
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from scheduler import wait_until
-from web.database import engine, job_runs, jobs, bookings, accounts, organizations, row_to_dict, get_days_out
+from web.database import (engine, job_runs, jobs, bookings, accounts, organizations,
+                          pending_transfers, row_to_dict, get_days_out)
 
 # Treat any Playwright timeout (Page.goto, wait_for_selector, APIRequestContext.post,
 # etc.) as a transient/retriable condition — the site is just slow or briefly
@@ -168,6 +169,202 @@ def _record_booking(run_id: int, account_id: int, slot, duration_min: int):
             duration_min=duration_min,
             confirmed_at=datetime.utcnow(),
         ))
+
+
+# ── probe → main transfer ───────────────────────────────────────────────────────
+
+def _slot_from_fields(date_str: str, start_time: str, duration_min: int, court_type: str, tz: str) -> Slot:
+    """Rebuild a Slot from stored fields so book_slot can re-create the reservation.
+    book_slot only needs start/end and court_type (not the per-interval court ids)."""
+    dt = pytz.timezone(tz).localize(datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M"))
+    return Slot(
+        court_type=court_type or "Hard",
+        start_ms=int(dt.timestamp() * 1000),
+        end_ms=int((dt + timedelta(minutes=duration_min)).timestamp() * 1000),
+        available_courts=1,
+        available_court_ids=[],
+        is_wait_list=False,
+        timezone=tz,
+    )
+
+
+def _create_pending_transfer(job_id, run_id, org, probe_account, main_account,
+                             reservation_id, slot, duration, auto, status="pending", note=""):
+    with engine.begin() as conn:
+        result = conn.execute(insert(pending_transfers).values(
+            job_id=job_id, run_id=run_id, org_id=org["id"],
+            probe_account_id=probe_account["id"], main_account_id=main_account["id"],
+            reservation_id=reservation_id or "",
+            date=slot.start_date, start_time=slot.start_time,
+            duration_min=duration, court_type=slot.court_type,
+            status=status, auto=bool(auto), note=note,
+            created_at=datetime.utcnow(),
+        ))
+        return result.inserted_primary_key[0]
+
+
+def _update_pending_transfer(transfer_id, status, note=""):
+    resolved = datetime.utcnow() if status in ("transferred", "failed") else None
+    with engine.begin() as conn:
+        conn.execute(update(pending_transfers).where(pending_transfers.c.id == transfer_id)
+                     .values(status=status, note=note, resolved_at=resolved))
+
+
+def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_id, slot, duration, log):
+    """Cancel the probe's reservation and re-book on the main account, using two
+    already-logged-in pages. Returns (status, note):
+      transferred    – main holds it
+      held_by_probe  – probe still holds it (cancel failed, or main re-book failed but
+                       probe re-booked to retain)
+      failed         – court lost (cancel ok, main and probe both failed to re-book)"""
+    if not reservation_id:
+        return "held_by_probe", "No reservation id captured — probe still holds the court; cancel manually."
+    try:
+        cancelled = cancel_reservation(probe_page, reservation_id, org_cfg)
+    except Exception as e:
+        log(f"Cancel raised: {e}")
+        cancelled = False
+    if not cancelled:
+        return "held_by_probe", "Cancel failed — probe still holds the court."
+
+    # Re-book on main as fast as possible (the court is exposed during this window).
+    main_ok = False
+    for attempt in range(3):
+        try:
+            main_ok = book_slot(booking_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg)
+        except NoAvailableCourtsError:
+            main_ok = False
+        except Exception as e:
+            log(f"Main re-book error (attempt {attempt + 1}): {e}")
+            main_ok = False
+        if main_ok:
+            return "transferred", "Re-booked on the main account."
+        time.sleep(0.5)
+
+    # Safety fallback: probe re-books to retain the court rather than lose it.
+    log("Main re-book failed — probe re-booking to retain the court...")
+    try:
+        if book_slot(probe_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg):
+            return "held_by_probe", "Main re-book failed; probe re-booked to retain the court."
+    except Exception as e:
+        log(f"Probe re-book error: {e}")
+    return "failed", "Court lost: main re-book failed and probe could not re-book."
+
+
+def run_transfer(transfer_id: int):
+    """Execute a pending transfer (manual Transfer button): cancel the probe's
+    reservation and re-book on the main account. Launches its own browser."""
+    with engine.connect() as conn:
+        row = conn.execute(pending_transfers.select()
+                           .where(pending_transfers.c.id == transfer_id)).fetchone()
+    if not row:
+        return
+    t = row_to_dict(row)
+    if t["status"] not in ("pending", "held_by_probe"):
+        print(f"Transfer #{transfer_id} is '{t['status']}' — nothing to do.")
+        return
+
+    with engine.connect() as conn:
+        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == t["org_id"])).fetchone())
+        probe = row_to_dict(conn.execute(accounts.select().where(accounts.c.id == t["probe_account_id"])).fetchone())
+        main = row_to_dict(conn.execute(accounts.select().where(accounts.c.id == t["main_account_id"])).fetchone())
+    org_cfg = _org_config(org)
+    slot = _slot_from_fields(t["date"], t["start_time"], t["duration_min"], t.get("court_type", ""), org_cfg.timezone)
+
+    _update_pending_transfer(transfer_id, "transferring", "Transfer started.")
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
+            probe_ctx = browser.new_context(user_agent=USER_AGENT)
+            probe_page = probe_ctx.new_page()
+            ensure_logged_in(probe_ctx, probe_page, probe["email"], probe["password"],
+                             org_cfg.booking_url, _session_file(probe, org))
+            main_ctx = browser.new_context(user_agent=USER_AGENT)
+            main_page = main_ctx.new_page()
+            ensure_logged_in(main_ctx, main_page, main["email"], main["password"],
+                             org_cfg.booking_url, _session_file(main, org))
+            status, note = _perform_transfer_with_pages(
+                probe_page, main_page, org_cfg, t["reservation_id"], slot, t["duration_min"], print)
+            browser.close()
+    except Exception as exc:
+        _update_pending_transfer(transfer_id, "held_by_probe",
+                                 f"Transfer errored ({exc}); probe likely still holds the court.")
+        _send_warning_email("Court transfer errored",
+                            f"Transfer #{transfer_id} for {t['date']} {t['start_time']} errored: {exc}\n"
+                            f"The probe account likely still holds the court — check and retry.")
+        return
+
+    _update_pending_transfer(transfer_id, status, note)
+    if status == "transferred":
+        _record_booking(t["run_id"], main["id"], slot, t["duration_min"])
+    elif status == "held_by_probe":
+        _record_booking(t["run_id"], probe["id"], slot, t["duration_min"])
+    _send_warning_email(
+        f"Court transfer {status}: {t['date']} {t['start_time']}",
+        f"Transfer #{transfer_id} for {t['date']} {t['start_time']} ({t['duration_min']}min): {status}.\n{note}",
+    )
+    print(f"Transfer #{transfer_id} result: {status} — {note}")
+
+
+def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_account,
+                          probe_page, booking_page, slot, duration, auto_transfer, tz_obj) -> str:
+    """The probe just secured `slot`. Create a pending transfer, notify, and (if
+    auto_transfer) immediately move the court to the main account using the already-open
+    probe/main pages. Returns the run status: 'success' | 'pending_transfer' | 'failed'."""
+    ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{ts}] Probe secured {slot.start_date} {slot.start_time} — preparing transfer to main...")
+
+    reservation_id = ""
+    try:
+        reservations = get_my_reservations(probe_page, org_cfg)
+        reservation_id = match_reservation_id(reservations, slot.start_date, slot.start_time) or ""
+    except Exception as e:
+        print(f"[{ts}] Could not look up the probe's reservation id: {e}")
+    if not reservation_id:
+        print(f"[{ts}] Warning: no reservation id captured — transfer will need a manual cancel.")
+
+    transfer_id = _create_pending_transfer(
+        job_id, run_id, org, probe_account, main_account, reservation_id, slot, duration, auto_transfer)
+
+    probe_label = probe_account.get("label") or probe_account["email"]
+    _send_warning_email(
+        f"Court secured (pending transfer): {slot.start_date} {slot.start_time}",
+        f"The probe account '{probe_label}' booked {slot.start_date} {slot.start_time} "
+        f"({duration} min) and is holding it.\n\n"
+        + ("Auto-transfer is running now; you'll get a follow-up with the result.\n"
+           if auto_transfer else
+           "Use the Transfer button on the Jobs page to move it to your main account.\n"))
+
+    if not auto_transfer:
+        print(f"[{ts}] Pending transfer #{transfer_id} created — awaiting manual Transfer.")
+        return "pending_transfer"
+
+    # Auto-transfer now, reusing the already-warm probe/main pages.
+    _update_pending_transfer(transfer_id, "transferring", "Auto-transfer started.")
+    try:
+        t_status, t_note = _perform_transfer_with_pages(
+            probe_page, booking_page, org_cfg, reservation_id, slot, duration,
+            log=lambda m: print(f"[{datetime.now(tz_obj).strftime('%Y-%m-%d %H:%M:%S %Z')}] {m}"))
+    except Exception as e:
+        # Probe already holds the court; leave it recoverable via the Transfer button.
+        t_status, t_note = "held_by_probe", f"Auto-transfer errored ({e}); probe still holds the court."
+    _update_pending_transfer(transfer_id, t_status, t_note)
+    print(f"[{ts}] Auto-transfer #{transfer_id} result: {t_status} — {t_note}")
+
+    if t_status == "transferred":
+        _record_booking(run_id, main_account["id"], slot, duration)
+        run_status = "success"
+    elif t_status == "held_by_probe":
+        _record_booking(run_id, probe_account["id"], slot, duration)
+        run_status = "pending_transfer"
+    else:
+        run_status = "failed"
+
+    _send_warning_email(
+        f"Court transfer {t_status}: {slot.start_date} {slot.start_time}",
+        f"Auto-transfer #{transfer_id} for {slot.start_date} {slot.start_time} ({duration} min): "
+        f"{t_status}.\n{t_note}")
+    return run_status
 
 
 def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
@@ -347,11 +544,14 @@ def _deadline_timeout_minutes(deadline_mode: str, target_date, target_time: str,
 
 def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_time: str,
               duration: int, interval: int = 60, deadline_mode: str = "4h",
-              probe_account_id: int | None = None):
+              probe_account_id: int | None = None, auto_transfer: bool = False):
     """
     Poll until a specific slot opens on target_date at target_time, then book it.
-    If probe_account_id is set, that account is used only for slot-availability checks
-    while account_id is used for the actual booking.
+    If probe_account_id is set (and differs from account_id), that PROBE account does
+    the polling AND the booking attempts — keeping repeated/risky Book attempts off the
+    main account. When the probe secures the court, a pending_transfers row is created
+    and (if auto_transfer) the court is immediately cancelled from the probe and re-booked
+    on the main account; otherwise it waits for the manual Transfer button.
     Transient network/timeout errors restart the browser session automatically.
     After 20 consecutive errors a warning email is sent, but the job keeps running.
     """
@@ -378,6 +578,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
             probe_account = row_to_dict(probe_row) if probe_row else None
         else:
             probe_account = None
+
+        # When a distinct probe account is configured it does the booking too, and the
+        # court is transferred to the main account afterwards (immediately if auto_transfer,
+        # else via the Transfer button). Without a probe, the main account books directly.
+        using_probe = probe_account is not None
 
         time_desc = target_time if target_time else "any time"
         timeout_minutes = _deadline_timeout_minutes(deadline_mode, target_date, target_time, org_cfg.timezone)
@@ -470,9 +675,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
 
                             if match:
                                 ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
-                                print(f"[{ts}] Found slot — booking now...")
+                                booker = "probe" if using_probe else "main"
+                                print(f"[{ts}] Found slot — booking now (as {booker})...")
+                                booker_page = probe_page if using_probe else booking_page
                                 try:
-                                    success = book_slot(booking_page, org_cfg.booking_url, match,
+                                    success = book_slot(booker_page, org_cfg.booking_url, match,
                                                         duration_minutes=duration, org=org_cfg)
                                 except NoAvailableCourtsError as e:
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -499,10 +706,19 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                     status = "failed"
                                     done = True
                                 else:
-                                    if success:
+                                    if success and not using_probe:
+                                        # Main account booked directly — done.
                                         slot = match
                                         browser.close()
                                         status = "success"
+                                        done = True
+                                    elif success and using_probe:
+                                        # Probe secured the court; create a pending transfer and
+                                        # (optionally) move it to the main account immediately.
+                                        status = _handle_probe_secured(
+                                            job_id, run_id, org, org_cfg, account, probe_account,
+                                            probe_page, booking_page, match, duration, auto_transfer, tz_obj)
+                                        browser.close()
                                         done = True
                                     else:
                                         ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -581,7 +797,9 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
 
     _finish_run(run_id, status, buf.getvalue())
 
-    job_final = "completed" if status == "success" else "failed"
+    # pending_transfer counts as a completed watch — we secured the court (the probe
+    # holds it / it's being moved to main); the watch itself shouldn't reschedule.
+    job_final = "completed" if status in ("success", "pending_transfer") else "failed"
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
 
@@ -666,6 +884,7 @@ def run_recurrent_watch(job_id: int, account_id: int):
             "interval": params.get("interval", 60),
             "deadline_mode": params.get("deadline_mode", "4h"),
             "probe_account_id": probe_id,
+            "auto_transfer": bool(params.get("auto_transfer", False)),
             "run_at": "",  # start immediately — window is already open
         }
         with engine.begin() as conn:

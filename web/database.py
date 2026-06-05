@@ -90,6 +90,29 @@ bookings = Table("bookings", metadata,
 )
 
 
+pending_transfers = Table("pending_transfers", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("job_id", Integer, ForeignKey("jobs.id"), nullable=False),
+    Column("run_id", Integer, ForeignKey("job_runs.id"), nullable=True),
+    Column("org_id", Integer, ForeignKey("organizations.id"), nullable=False),
+    Column("probe_account_id", Integer, ForeignKey("accounts.id"), nullable=False),
+    Column("main_account_id", Integer, ForeignKey("accounts.id"), nullable=False),
+    Column("reservation_id", String, default=""),     # probe's reservation, to cancel
+    Column("date", String, nullable=False),            # YYYY-MM-DD
+    Column("start_time", String, nullable=False),      # HH:MM
+    Column("duration_min", Integer, default=120),
+    Column("court_type", String, default=""),
+    # pending: held by probe, awaiting transfer; transferring: in progress;
+    # transferred: now on main; held_by_probe: transfer failed, probe still holds it;
+    # failed: court lost
+    Column("status", String, default="pending"),
+    Column("auto", Boolean, default=False),            # auto-transfer requested
+    Column("note", Text, default=""),                  # last status detail
+    Column("created_at", DateTime, default=datetime.utcnow),
+    Column("resolved_at", DateTime, nullable=True),
+)
+
+
 bug_reports = Table("bug_reports", metadata,
     Column("id", Integer, primary_key=True),
     Column("title", String, nullable=False),
