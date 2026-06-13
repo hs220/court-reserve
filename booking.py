@@ -583,29 +583,55 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: Or
         page.wait_for_timeout(8000)
         return False
 
-    # Authoritative court-availability check — ONLY for orgs with a court picker
-    # (e.g. Santa Clara). Such orgs auto-populate #CourtId with a court free for the
-    # ENTIRE reservation; if no single court spans the requested duration the field
-    # is left blank and Save fails with "Please select a court". The ReadConsolidated
-    # feed's per-interval AvailableCourtIds cannot be trusted for this — a court can
-    # appear in every 30-min interval yet still not be bookable as one contiguous
-    # block — so the picker is the real test. Orgs WITHOUT a picker (e.g. Sunnyvale)
-    # leave #CourtId blank even for bookable slots, so this check is skipped for them
-    # (they rely on slot_has_window + the post-Save backstop instead).
+    # Court picker handling — ONLY for orgs with one (e.g. Santa Clara). After the
+    # duration is set, CourtReserve repopulates #CourtId *asynchronously* with only the
+    # courts free for the ENTIRE window, but it does NOT auto-select one — so Save fails
+    # with "Please select a court" unless we pick it ourselves. So: wait for the options
+    # to load, then select the first available court. An empty dropdown is the real
+    # "no court spans the window" signal — keep watching. (The ReadConsolidated feed's
+    # per-interval AvailableCourtIds can't be trusted for this; the picker is the truth.)
+    # Orgs WITHOUT a picker (e.g. Sunnyvale) leave #CourtId blank even for bookable slots,
+    # so this is skipped for them (they rely on slot_has_window + the post-Save backstop).
     if duration_minutes > 0 and _org_uses_court_picker(org):
-        court_available = page.evaluate("""(function() {
-            var el = document.getElementById("CourtId");
-            if (el && el.value && String(el.value).trim()) return true;
-            var w = (window.$ && $("#CourtId").data) ? $("#CourtId").data("kendoDropDownList") : null;
-            if (w && w.dataSource && w.dataSource.data().length > 0) return true;
-            return false;
-        })()""")
-        if not court_available:
+        selected_court = None
+        for _ in range(10):  # up to ~5s for the async court list to populate
+            selected_court = page.evaluate("""(function() {
+                var el = document.getElementById("CourtId");
+                var w = (window.$ && $("#CourtId").data) ? $("#CourtId").data("kendoDropDownList") : null;
+                function ne(v) { return v !== undefined && v !== null && String(v).trim() !== ""; }
+                // Already selected (auto-fill or a prior pass)? keep it.
+                if (el && ne(el.value)) return String(el.value);
+                if (w && ne(w.value())) return String(w.value());
+                // Otherwise select the first real option from the widget's dataSource...
+                if (w && w.dataSource) {
+                    var vf = w.options.dataValueField, d = w.dataSource.data();
+                    for (var i = 0; i < d.length; i++) {
+                        if (ne(d[i][vf])) { w.value(String(d[i][vf])); w.trigger("change"); return String(d[i][vf]); }
+                    }
+                }
+                // ...or from a plain <select> as a fallback.
+                if (el && el.options) {
+                    for (var j = 0; j < el.options.length; j++) {
+                        if (ne(el.options[j].value)) {
+                            el.value = el.options[j].value;
+                            el.dispatchEvent(new Event("change", {bubbles: true}));
+                            return el.value;
+                        }
+                    }
+                }
+                return null;
+            })()""")
+            if selected_court:
+                break
+            page.wait_for_timeout(500)
+        if not selected_court:
             ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
             msg = (f"No court is available for the full {duration_minutes}-min window at "
                    f"{slot.start_time} (court picker empty) — keep watching.")
             print(f"[{ts}] {msg}")
             raise CourtSelectionRequiredError(msg)
+        print(f"Selected court {selected_court} for the full {duration_minutes}-min window.")
+        page.wait_for_timeout(300)
 
     # Accept the disclosure checkbox
     page.evaluate("""(function() {
