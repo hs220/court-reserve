@@ -117,15 +117,23 @@
 </div>
 {% endif %}
 
-{% if completed_jobs %}
+{% if completed_jobs or has_newer %}
 <div class="card" style="padding:0;overflow-x:auto">
-  <div class="card-header" style="padding:12px 16px"><h2>Completed / Failed</h2></div>
+  <div class="card-header" style="padding:12px 16px">
+    <h2>Completed / Failed{% if page > 1 %} <span style="color:var(--muted);font-weight:400">· page {{ page }}</span>{% endif %}</h2>
+  </div>
   <table class="jobs-table">
     <thead><tr>
       <th>ID</th><th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Transfer</th><th></th>
     </tr></thead>
     <tbody>{{ job_rows(completed_jobs, show_transfer=True) }}</tbody>
   </table>
+  {% if has_older or has_newer %}
+  <div class="row-actions" style="padding:12px 16px;justify-content:space-between">
+    {% if has_newer %}<a href="/jobs?page={{ page - 1 }}" class="btn btn-ghost btn-sm">← Newer</a>{% else %}<span></span>{% endif %}
+    {% if has_older %}<a href="/jobs?page={{ page + 1 }}" class="btn btn-ghost btn-sm">Older →</a>{% else %}<span></span>{% endif %}
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 

@@ -57,15 +57,37 @@ def _enrich_job(j: dict, conn) -> dict:
     return j
 
 
+COMPLETED_PAGE_SIZE = 25
+
+
 @router.get("/jobs", response_class=HTMLResponse)
-async def list_jobs(request: Request):
+async def list_jobs(request: Request, page: int = 1):
+    page = max(1, page)
+    offset = (page - 1) * COMPLETED_PAGE_SIZE
+    active_states = ["active", "paused"]
     with engine.connect() as conn:
-        all_jobs = [_enrich_job(row_to_dict(r), conn)
-                    for r in conn.execute(
-                        jobs.select()
-                        .where(jobs.c.type.in_(["book_next", "watch"]))
-                        .order_by(jobs.c.created_at.desc())
-                    )]
+        # Active/paused jobs — always shown in full (they're current and few).
+        active_jobs = [_enrich_job(row_to_dict(r), conn)
+                       for r in conn.execute(
+                           jobs.select()
+                           .where(jobs.c.type.in_(["book_next", "watch"]) &
+                                  jobs.c.status.in_(active_states))
+                           .order_by(jobs.c.created_at.desc())
+                       )]
+        # Completed/failed history — paginated, newest first. Fetch one extra row to
+        # know whether there's an older page.
+        completed_rows = list(conn.execute(
+            jobs.select()
+            .where(jobs.c.type.in_(["book_next", "watch"]) &
+                   jobs.c.status.notin_(active_states))
+            .order_by(jobs.c.created_at.desc())
+            .limit(COMPLETED_PAGE_SIZE + 1)
+            .offset(offset)
+        ))
+        has_older = len(completed_rows) > COMPLETED_PAGE_SIZE
+        completed_jobs = [_enrich_job(row_to_dict(r), conn)
+                          for r in completed_rows[:COMPLETED_PAGE_SIZE]]
+
         all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
         acct_label = {a["id"]: (a.get("label") or a["email"]) for a in all_accounts}
@@ -82,19 +104,20 @@ async def list_jobs(request: Request):
             pending_transfers.select().order_by(pending_transfers.c.created_at.asc())
         ):
             job_transfer[r.job_id] = {"id": r.id, "status": r.status}
-    for j in all_jobs:
+    for j in active_jobs + completed_jobs:
         j["transfer"] = job_transfer.get(j["id"])
     for t in transfers:
         t["probe_label"] = acct_label.get(t["probe_account_id"], "?")
         t["main_label"] = acct_label.get(t["main_account_id"], "?")
-    active_jobs = [j for j in all_jobs if j["status"] in ("active", "paused")]
-    completed_jobs = [j for j in all_jobs if j["status"] not in ("active", "paused")]
     return templates.TemplateResponse(request, "jobs.html", context={
         "active_jobs": active_jobs,
         "completed_jobs": completed_jobs,
         "pending_transfers": transfers,
         "orgs": all_orgs,
         "accounts": all_accounts,
+        "page": page,
+        "has_older": has_older,
+        "has_newer": page > 1,
     })
 
 
