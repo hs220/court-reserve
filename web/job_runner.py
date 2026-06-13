@@ -312,19 +312,31 @@ def run_transfer(transfer_id: int):
 
 
 def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_account,
-                          probe_page, booking_page, slot, duration, auto_transfer, tz_obj) -> str:
+                          probe_page, booking_page, slot, duration, auto_transfer, tz_obj,
+                          captured_reservation_id="") -> str:
     """The probe just secured `slot`. Create a pending transfer, notify, and (if
     auto_transfer) immediately move the court to the main account using the already-open
     probe/main pages. Returns the run status: 'success' | 'pending_transfer' | 'failed'."""
     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{ts}] Probe secured {slot.start_date} {slot.start_time} — preparing transfer to main...")
 
-    reservation_id = ""
-    try:
-        reservations = get_my_reservations(probe_page, org_cfg)
-        reservation_id = match_reservation_id(reservations, slot.start_date, slot.start_time) or ""
-    except Exception as e:
-        print(f"[{ts}] Could not look up the probe's reservation id: {e}")
+    # Prefer the id captured from the save response (most reliable). Otherwise fall back
+    # to the bookings list, retrying a few times since a just-created reservation can take
+    # a moment to appear there.
+    reservation_id = captured_reservation_id or ""
+    if reservation_id:
+        print(f"[{ts}] Using reservation id from save response: {reservation_id}")
+    else:
+        for lookup_attempt in range(4):
+            try:
+                reservations = get_my_reservations(probe_page, org_cfg)
+                reservation_id = match_reservation_id(reservations, slot.start_date, slot.start_time) or ""
+            except Exception as e:
+                print(f"[{ts}] Could not look up the probe's reservation id (attempt {lookup_attempt + 1}/4): {e}")
+            if reservation_id:
+                print(f"[{ts}] Found reservation id via bookings list: {reservation_id}")
+                break
+            time.sleep(2)
     if not reservation_id:
         print(f"[{ts}] Warning: no reservation id captured — transfer will need a manual cancel.")
 
@@ -439,11 +451,13 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                     # failure in issue #2 / run #175) — all transient and worth
                     # retrying with a fresh fetch and re-navigation.
                     BOOK_ATTEMPTS = 20
-                    # Slots whose cell clicked but never opened a modal — the feed
-                    # advertised them as open but they're actually gone (stale during
-                    # the release rush). Demote them so we re-pick a live slot instead
-                    # of hammering the same dead cell.
-                    dead_starts: set = set()
+                    # Slots that weren't bookable THIS pass (no modal / "NONE AVAILABLE").
+                    # This is a soft skip, not a permanent ban: a slot can be momentarily
+                    # un-bookable (not released yet, or briefly held by another member mid-
+                    # booking) and then free up. Once every preferred slot has been skipped
+                    # we clear the set and try them all again on fresh grid data, so we keep
+                    # racing for the slot until it actually opens.
+                    tried: set = set()
                     for book_attempt in range(BOOK_ATTEMPTS):
                         last = book_attempt == BOOK_ATTEMPTS - 1
 
@@ -475,7 +489,14 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                         # times is allowed only when no preferred list was given.
                         slot = find_best_slot(slots, preferred_times,
                                               allow_fallback=not preferred_times,
-                                              duration_minutes=window_dur, exclude_starts=dead_starts)
+                                              duration_minutes=window_dur, exclude_starts=tried)
+                        if slot is None and tried:
+                            # Every preferred slot was skipped this pass — clear and retry
+                            # them all on fresh data; one may have opened up since.
+                            tried = set()
+                            slot = find_best_slot(slots, preferred_times,
+                                                  allow_fallback=not preferred_times,
+                                                  duration_minutes=window_dur, exclude_starts=tried)
                         if slot is None:
                             if not last:
                                 print(f"No matching slot yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS}...")
@@ -514,10 +535,10 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                             print(f"No court available for the full window after {BOOK_ATTEMPTS} attempts: {e}")
                             break
                         except SlotNotBookableError as e:
-                            dead_starts.add(slot.start_ms)
+                            tried.add(slot.start_ms)
                             if not last:
-                                print(f"Slot {slot.start_time} not bookable (no modal) — "
-                                      f"demoting and trying another slot; "
+                                print(f"Slot {slot.start_time} not bookable right now — "
+                                      f"skipping this pass, will retry on fresh data; "
                                       f"retry {book_attempt + 1}/{BOOK_ATTEMPTS}: {e}")
                                 continue
                             print(f"No bookable slot after {BOOK_ATTEMPTS} attempts: {e}")
@@ -703,9 +724,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                 booker = "probe" if using_probe else "main"
                                 print(f"[{ts}] Found slot — booking now (as {booker})...")
                                 booker_page = probe_page if using_probe else booking_page
+                                book_result: dict = {}
                                 try:
                                     success = book_slot(booker_page, org_cfg.booking_url, match,
-                                                        duration_minutes=duration, org=org_cfg)
+                                                        duration_minutes=duration, org=org_cfg,
+                                                        result=book_result)
                                 except NoAvailableCourtsError as e:
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
                                     print(f"[{ts}] No court available for the full window (server reported "
@@ -746,7 +769,8 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                         # (optionally) move it to the main account immediately.
                                         status = _handle_probe_secured(
                                             job_id, run_id, org, org_cfg, account, probe_account,
-                                            probe_page, booking_page, match, duration, auto_transfer, tz_obj)
+                                            probe_page, booking_page, match, duration, auto_transfer, tz_obj,
+                                            captured_reservation_id=book_result.get("reservation_id", ""))
                                         browser.close()
                                         done = True
                                     else:

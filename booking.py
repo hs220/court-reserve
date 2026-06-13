@@ -1,5 +1,6 @@
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -257,16 +258,40 @@ def _classify_booking_error(msg: str) -> BookingError:
 
 
 def _navigate_to_date(page: Page, target_date: date) -> None:
+    """Point the Kendo scheduler at target_date AND force a fresh server fetch.
+
+    The grid is loaded once during pre-warm (before the noon release) and Kendo
+    won't re-read when we navigate to the same date across retries — so without an
+    explicit dataSource.read() the grid keeps showing whatever it loaded earlier
+    (e.g. the pre-release "NONE AVAILABLE" state), and we end up clicking a stale,
+    un-bookable cell even though the live feed shows the slot open. This forces the
+    grid to re-fetch each time, mirroring a manual browser refresh."""
     js_date = f"new Date({target_date.year}, {target_date.month - 1}, {target_date.day})"
     page.evaluate(f"""
-        var scheduler = $("#ConsolidatedScheduler").data("kendoScheduler");
-        if (scheduler) {{ scheduler.date({js_date}); }}
+        (function() {{
+            var scheduler = $("#ConsolidatedScheduler").data("kendoScheduler");
+            if (!scheduler) return;
+            window.__crDataBound = false;
+            scheduler.one("dataBound", function() {{ window.__crDataBound = true; }});
+            scheduler.date({js_date});
+            scheduler.dataSource.read();   // force fresh fetch even if date unchanged
+        }})()
     """)
-    page.wait_for_timeout(3000)
+    # Wait for the refreshed data to bind, then a short settle for re-render.
+    for _ in range(24):  # up to ~6s
+        if page.evaluate("window.__crDataBound === true"):
+            break
+        page.wait_for_timeout(250)
+    page.wait_for_timeout(600)
 
 
 def _find_slot_bbox(page: Page, slot_label: str):
-    """Return viewport {x, y} for the Kendo scheduler cell matching slot_label, or None."""
+    """Return {x, y, marker} for the Kendo scheduler cell matching slot_label, or None
+    if the row/cell isn't in the grid yet. `marker` is None when the cell looks bookable,
+    or a short reason string when the (fresh) grid shows it's NOT bookable — i.e. its
+    slot container is "not-available-courts-container" / renders "NONE AVAILABLE". The
+    caller uses that to demote the slot immediately instead of burning ~10s of click
+    retries."""
     return page.evaluate(f"""
         (function() {{
             var timeRows = document.querySelectorAll(".k-scheduler-times tr");
@@ -284,12 +309,49 @@ def _find_slot_bbox(page: Page, slot_label: str):
             if (!cell) return null;
             cell.scrollIntoView({{behavior: "instant", block: "center"}});
             var r = cell.getBoundingClientRect();
-            return {{x: r.x + r.width / 2, y: r.y + r.height / 2}};
+            var cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+
+            // Kendo renders the slot items in an overlay layer, NOT inside this <td>,
+            // so inspect whatever is actually rendered at the click point and walk up
+            // to its .consolidate-item-container to read the real bookability state.
+            // A bookable slot's container carries "available-courts-container" (and a
+            // "Reserve" button); a gone one carries "not-available-courts-container" /
+            // "NONE AVAILABLE". NOTE: the Reserve <a> has class "fn-disable" in BOTH
+            // cases, so fn-disable is NOT a usable signal — only the container class is.
+            var marker = null;
+            var el = document.elementFromPoint(cx, cy);
+            var node = el, container = null;
+            for (var d = 0; d < 6 && node; d++) {{
+                if ((" " + (node.className || "") + " ").indexOf("consolidate-item-container") >= 0) {{
+                    container = node; break;
+                }}
+                node = node.parentElement;
+            }}
+            // Three rendered states (read off the container class, which is reliable;
+            // text is a fallback):
+            //   available-courts-container  -> "Reserve"        -> BOOKABLE (marker null)
+            //   not-available-courts-container -> "NONE AVAILABLE" -> taken
+            //   inPast-courts-container     -> "UNAVAILABLE"    -> not open yet / past
+            // (NOTE: "not-available-courts-container" contains the substring
+            // "available-courts-container", so check the negative classes first.)
+            var target = container || el;
+            if (target) {{
+                var tcls = " " + (target.className || "") + " ";
+                var ttxt = (target.innerText || "").toUpperCase();
+                if (tcls.indexOf("not-available-courts-container") >= 0 ||
+                    ttxt.indexOf("NONE AVAILABLE") >= 0) {{
+                    marker = "NONE AVAILABLE (taken)";
+                }} else if (tcls.indexOf("inPast-courts-container") >= 0 ||
+                           ttxt.indexOf("UNAVAILABLE") >= 0) {{
+                    marker = "UNAVAILABLE (not open yet / past)";
+                }}
+            }}
+            return {{x: cx, y: cy, marker: marker}};
         }})()
     """)
 
 
-def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
+def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False, result: Optional[dict] = None) -> bool:
     ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
 
@@ -321,6 +383,17 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
             print(f"[{ts}] Could not find time slot for {slot_label} in the scheduler grid after {GRID_RETRIES} attempts.")
             return False
 
+    # The freshly-read grid already tells us if the cell isn't bookable (renders
+    # "NONE AVAILABLE" or a disabled Reserve button). Demote immediately rather than
+    # wasting ~10s clicking a cell that will never open a modal — so the caller can
+    # cycle through the other preferred times (or re-try this one on fresh data) fast.
+    if bbox.get("marker"):
+        ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        print(f"[{ts}] Slot {slot_label} shows '{bbox['marker']}' on fresh grid — not bookable right now.")
+        raise SlotNotBookableError(
+            f"Slot at {slot.start_time} on {slot.start_date} not bookable "
+            f"({bbox['marker']}).")
+
     # Clicking the cell occasionally fails to open the modal (the AJAX call
     # doesn't fire, or the click lands a hair off the cell). Retry the click a
     # few times before giving up — re-finding the cell each time in case the
@@ -332,14 +405,19 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
         page.wait_for_timeout(2000)
 
         if page.query_selector("#create-res-modal, .modal-content"):
-            return _handle_booking_modal(page, slot, duration_minutes, org=org, dry_run=dry_run)
+            return _handle_booking_modal(page, slot, duration_minutes, org=org, dry_run=dry_run, result=result)
 
         ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
         if click_attempt < CLICK_RETRIES - 1:
             print(f"[{ts}] No booking modal appeared after clicking slot "
                   f"(attempt {click_attempt + 1}/{CLICK_RETRIES}) — retrying...")
-            # Re-locate the cell; the grid may have shifted or re-rendered.
+            # Re-locate the cell; the grid may have shifted or re-rendered. If it now
+            # shows unbookable, demote fast instead of finishing the retries.
             new_bbox = _find_slot_bbox(page, slot_label)
+            if new_bbox and new_bbox.get("marker"):
+                raise SlotNotBookableError(
+                    f"Slot at {slot.start_time} on {slot.start_date} became not "
+                    f"bookable ({new_bbox['marker']}).")
             if new_bbox:
                 bbox = new_bbox
         else:
@@ -410,7 +488,7 @@ def _dump_no_modal_diagnostics(page: Page, slot_label: str, bbox) -> None:
         print(f"  [debug] dom probe failed: {e}")
 
 
-def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False) -> bool:
+def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False, result: Optional[dict] = None) -> bool:
     print("Booking modal opened — waiting for full AJAX load...")
 
     # The modal loads in two hops:
@@ -536,8 +614,38 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: Or
     })()""")
     page.wait_for_timeout(300)
 
-    save_btn.click()
-    page.wait_for_timeout(4000)
+    # Capture the new ReservationId straight from the save response — it's the most
+    # reliable source (the after-the-fact bookings list can lag or filter it out, which
+    # left transfers stuck with no id to cancel). Best-effort: scan any reservation-ish
+    # response body for an id field.
+    _save_capture: dict = {}
+
+    def _on_save_response(resp):
+        if _save_capture.get("id"):
+            return
+        u = resp.url.lower()
+        if "reservation" not in u and "booking" not in u:
+            return
+        try:
+            body = resp.text()
+        except Exception:
+            return
+        # Only trust the specific ReservationId field — a generic "Id" could belong to
+        # something else and we must not cancel the wrong reservation during a transfer.
+        m = re.search(r'"[Rr]eservationId"\s*:\s*"?(\d{3,})', body or "")
+        if m:
+            _save_capture["id"] = m.group(1)
+
+    page.on("response", _on_save_response)
+    try:
+        save_btn.click()
+        page.wait_for_timeout(4000)
+    finally:
+        page.remove_listener("response", _on_save_response)
+
+    if result is not None and _save_capture.get("id"):
+        result["reservation_id"] = _save_capture["id"]
+        print(f"Captured reservation id from save response: {_save_capture['id']}")
 
     # Check for error notice/popup (CourtReserve shows a pnotify/swal dialog on failure).
     # Do NOT include generic modal selectors here — they match the booking form itself.

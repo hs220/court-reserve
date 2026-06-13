@@ -171,9 +171,10 @@ def cmd_book(args, cfg):
         # those is pointless.
         ATTEMPTS = 20
         success = False
-        # Slots whose cell clicked but never opened a modal (stale feed) — demote
-        # so we re-pick a live slot instead of re-clicking the same dead cell.
-        dead_starts: set = set()
+        # Slots not bookable THIS pass (no modal / "NONE AVAILABLE"). Soft skip, not a
+        # permanent ban: a slot can be momentarily un-bookable then free up, so once all
+        # preferred slots are skipped we clear and retry them on fresh grid data.
+        tried: set = set()
         for attempt in range(ATTEMPTS):
             last = attempt == ATTEMPTS - 1
 
@@ -201,7 +202,14 @@ def cmd_book(args, cfg):
             # arbitrary times is allowed only when no preferred list was given.
             slot = find_best_slot(slots, preferred_times,
                                   allow_fallback=not preferred_times,
-                                  duration_minutes=window_dur, exclude_starts=dead_starts)
+                                  duration_minutes=window_dur, exclude_starts=tried)
+            if slot is None and tried:
+                # Every preferred slot was skipped this pass — clear and retry them all
+                # on fresh data; one may have opened up since.
+                tried = set()
+                slot = find_best_slot(slots, preferred_times,
+                                      allow_fallback=not preferred_times,
+                                      duration_minutes=window_dur, exclude_starts=tried)
             if slot is None:
                 if not last:
                     print(f"[{_ts()}] No matching slot yet, retrying... ({attempt + 1}/{ATTEMPTS})")
@@ -230,10 +238,10 @@ def cmd_book(args, cfg):
                     time.sleep(0.5)
                     continue
                 if isinstance(exc, SlotNotBookableError):
-                    dead_starts.add(slot.start_ms)
+                    tried.add(slot.start_ms)
                     if not last:
-                        print(f"[{_ts()}] Slot {slot.start_time} not bookable (no modal) — "
-                              f"demoting and trying another slot... ({attempt + 1}/{ATTEMPTS}): {exc}")
+                        print(f"[{_ts()}] Slot {slot.start_time} not bookable right now — "
+                              f"skipping this pass, will retry on fresh data... ({attempt + 1}/{ATTEMPTS}): {exc}")
                         continue
                     print(f"[{_ts()}] No bookable slot after {ATTEMPTS} attempts: {exc}")
                     break
