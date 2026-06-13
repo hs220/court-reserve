@@ -3,7 +3,7 @@ from datetime import date as date_cls, datetime, timedelta
 
 import pytz
 from fastapi import APIRouter, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from sqlalchemy import select, update
 
 from web.database import (engine, jobs, accounts, organizations, job_runs, bookings,
@@ -69,9 +69,15 @@ async def list_jobs(request: Request):
         all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
         acct_label = {a["id"]: (a.get("label") or a["email"]) for a in all_accounts}
+        # Show active transfers plus any resolved (transferred/failed) in the last 24h, so
+        # their logs stay reachable via the View Log button right after a run.
+        recent_cutoff = datetime.utcnow() - timedelta(hours=24)
         transfers = [row_to_dict(r) for r in conn.execute(
             pending_transfers.select()
-            .where(pending_transfers.c.status.in_(["pending", "transferring", "held_by_probe"]))
+            .where(
+                pending_transfers.c.status.in_(["pending", "transferring", "held_by_probe"]) |
+                (pending_transfers.c.resolved_at >= recent_cutoff)
+            )
             .order_by(pending_transfers.c.created_at.desc())
         )]
     for t in transfers:
@@ -345,13 +351,29 @@ async def execute_transfer(transfer_id: int):
     """Run a pending probe→main transfer in the background (cancel from probe, re-book on main)."""
     import threading
     from web.job_runner import run_transfer
+    # Do NOT pre-set status here: run_transfer atomically claims a runnable transfer
+    # (pending/held_by_probe -> transferring). Setting 'transferring' here would make that
+    # claim never match, so the worker would no-op ("nothing to do") — the original bug.
     with engine.begin() as conn:
         row = conn.execute(pending_transfers.select().where(pending_transfers.c.id == transfer_id)).fetchone()
         if row and row.status in ("pending", "held_by_probe"):
             conn.execute(update(pending_transfers).where(pending_transfers.c.id == transfer_id)
-                         .values(status="transferring", note="Transfer queued..."))
+                         .values(note="Transfer queued..."))
     threading.Thread(target=run_transfer, kwargs={"transfer_id": transfer_id}, daemon=True).start()
     return RedirectResponse("/jobs", status_code=303)
+
+
+@router.get("/transfers/{transfer_id}/log", response_class=PlainTextResponse)
+async def get_transfer_log(transfer_id: int):
+    with engine.connect() as conn:
+        t = conn.execute(pending_transfers.select()
+                         .where(pending_transfers.c.id == transfer_id)).fetchone()
+    if not t:
+        return PlainTextResponse("Transfer not found.", status_code=404)
+    header = (f"Transfer #{t.id} — {t.date} {t.start_time} ({t.duration_min} min)\n"
+              f"status: {t.status}\nnote: {t.note or ''}\n"
+              f"{'-' * 60}\n")
+    return PlainTextResponse(header + (t.log_text or "(no transfer output yet)"))
 
 
 @router.get("/jobs/{job_id}/edit", response_class=HTMLResponse)

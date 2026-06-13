@@ -108,6 +108,7 @@ pending_transfers = Table("pending_transfers", metadata,
     Column("status", String, default="pending"),
     Column("auto", Boolean, default=False),            # auto-transfer requested
     Column("note", Text, default=""),                  # last status detail
+    Column("log_text", Text, default=""),              # full transfer run output
     Column("created_at", DateTime, default=datetime.utcnow),
     Column("resolved_at", DateTime, nullable=True),
 )
@@ -139,7 +140,20 @@ def init_db():
     _migrate_accounts_org_optional()
     _migrate_orgs_resident_days_out()
     _migrate_bug_reports_gh_columns()
+    _migrate_pending_transfers_log_text()
     _seed_orgs()
+
+
+def _migrate_pending_transfers_log_text():
+    """Add pending_transfers.log_text if missing (stores the transfer run output)."""
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_transfers'"
+        )).fetchone()
+        if not row or "log_text" in (row[0] or ""):
+            return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pending_transfers ADD COLUMN log_text TEXT DEFAULT ''"))
 
 
 def _migrate_accounts_org_optional():

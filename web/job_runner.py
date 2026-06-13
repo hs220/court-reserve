@@ -256,18 +256,54 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     return "failed", "Court lost: main re-book failed and probe could not re-book."
 
 
+def _persist_transfer_log(transfer_id: int, buf: io.StringIO):
+    """Write the captured transfer output to pending_transfers.log_text (leaves
+    status/note untouched) so it's viewable in the UI."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(update(pending_transfers)
+                         .where(pending_transfers.c.id == transfer_id)
+                         .values(log_text=buf.getvalue()))
+    except Exception:
+        pass
+
+
 def run_transfer(transfer_id: int):
     """Execute a pending transfer (manual Transfer button): cancel the probe's
-    reservation and re-book on the main account. Launches its own browser."""
-    with engine.connect() as conn:
+    reservation and re-book on the main account. Launches its own browser. All output is
+    captured to pending_transfers.log_text so it can be viewed from the UI."""
+    buf = io.StringIO()
+    with _capture(buf):
+        try:
+            _run_transfer_inner(transfer_id, buf)
+        finally:
+            _persist_transfer_log(transfer_id, buf)
+
+
+def _run_transfer_inner(transfer_id: int, buf: io.StringIO):
+    ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{ts}] Transfer #{transfer_id} starting...")
+    # Atomically claim the transfer: flip a runnable transfer (pending/held_by_probe) to
+    # 'transferring' in one UPDATE. If nothing was claimed, it's already resolved or being
+    # run by another click — bail. (The caller must NOT pre-set 'transferring' itself, or
+    # this claim would never match and the worker would no-op — that was the original bug.)
+    with engine.begin() as conn:
+        claimed = conn.execute(
+            update(pending_transfers)
+            .where((pending_transfers.c.id == transfer_id) &
+                   (pending_transfers.c.status.in_(["pending", "held_by_probe"])))
+            .values(status="transferring", note="Transfer started.")
+        )
+        if claimed.rowcount == 0:
+            row = conn.execute(pending_transfers.select()
+                               .where(pending_transfers.c.id == transfer_id)).fetchone()
+            print(f"Transfer #{transfer_id} is "
+                  f"'{row.status if row else 'missing'}' — nothing to do.")
+            return
         row = conn.execute(pending_transfers.select()
                            .where(pending_transfers.c.id == transfer_id)).fetchone()
-    if not row:
-        return
     t = row_to_dict(row)
-    if t["status"] not in ("pending", "held_by_probe"):
-        print(f"Transfer #{transfer_id} is '{t['status']}' — nothing to do.")
-        return
+    _persist_transfer_log(transfer_id, buf)
 
     with engine.connect() as conn:
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == t["org_id"])).fetchone())
@@ -276,7 +312,7 @@ def run_transfer(transfer_id: int):
     org_cfg = _org_config(org)
     slot = _slot_from_fields(t["date"], t["start_time"], t["duration_min"], t.get("court_type", ""), org_cfg.timezone)
 
-    _update_pending_transfer(transfer_id, "transferring", "Transfer started.")
+    # (status already set to 'transferring' by the atomic claim above)
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
