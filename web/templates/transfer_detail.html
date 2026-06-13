@@ -6,6 +6,7 @@
 </div>
 <h1>Transfer #{{ t.id }}</h1>
 <p style="color:var(--muted);margin-bottom:6px">
+  Job: <strong><a href="/jobs/{{ t.job_id }}/runs" style="color:inherit">#{{ t.job_id }}</a></strong> &nbsp;·&nbsp;
   Court: <strong>{{ t.date }} {{ t.start_time }} ({{ t.duration_min }} min){% if t.court_type %} · {{ t.court_type }}{% endif %}</strong> &nbsp;·&nbsp;
   Org: <strong>{{ t.org_name }}</strong>
 </p>

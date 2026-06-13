@@ -69,17 +69,21 @@ async def list_jobs(request: Request):
         all_orgs = [row_to_dict(r) for r in conn.execute(organizations.select())]
         all_accounts = [row_to_dict(r) for r in conn.execute(accounts.select())]
         acct_label = {a["id"]: (a.get("label") or a["email"]) for a in all_accounts}
-        # Show active transfers plus any resolved (transferred/failed) in the last 24h, so
-        # their logs stay reachable via the View Log button right after a run.
-        recent_cutoff = datetime.utcnow() - timedelta(hours=24)
+        # Pending-transfers tab: only the non-terminal (still-actionable) transfers —
+        # not the failed/expired/transferred ones.
         transfers = [row_to_dict(r) for r in conn.execute(
             pending_transfers.select()
-            .where(
-                pending_transfers.c.status.in_(["pending", "transferring", "held_by_probe"]) |
-                (pending_transfers.c.resolved_at >= recent_cutoff)
-            )
+            .where(pending_transfers.c.status.in_(["pending", "transferring", "held_by_probe"]))
             .order_by(pending_transfers.c.created_at.desc())
         )]
+        # Map each job to its latest transfer (any status) so jobs can link to it.
+        job_transfer = {}
+        for r in conn.execute(
+            pending_transfers.select().order_by(pending_transfers.c.created_at.asc())
+        ):
+            job_transfer[r.job_id] = {"id": r.id, "status": r.status}
+    for j in all_jobs:
+        j["transfer"] = job_transfer.get(j["id"])
     for t in transfers:
         t["probe_label"] = acct_label.get(t["probe_account_id"], "?")
         t["main_label"] = acct_label.get(t["main_account_id"], "?")

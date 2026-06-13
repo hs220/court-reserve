@@ -9,9 +9,10 @@
   </div>
 </div>
 
-{% macro job_rows(job_list) %}
+{% macro job_rows(job_list, show_transfer=False) %}
 {% for j in job_list %}
 <tr>
+  <td data-label="ID" style="color:var(--muted)">#{{ j.id }}</td>
   <td data-label="Type"><strong>{{ j.type }}</strong></td>
   <td data-label="Org">{{ j.org.name if j.org else "—" }}</td>
   <td data-label="Account">{{ j.account.label or j.account.email if j.account else "—" }}</td>
@@ -30,9 +31,17 @@
       {% if j.params.run_at %}<span style="color:var(--muted)"> — opens {{ j.params.run_at.replace("T", " ") }}</span>{% endif %}
     {% endif %}
   </td>
+  {% if show_transfer %}
+  <td data-label="Transfer">
+    {% if j.transfer %}
+      <a href="/transfers/{{ j.transfer.id }}" class="btn btn-ghost btn-sm">Transfer #{{ j.transfer.id }}</a>
+    {% else %}—{% endif %}
+  </td>
+  {% else %}
   <td data-label="Next Run" style="font-size:12px;color:var(--muted)">
     {% if j.next_run_at %}{{ j.next_run_at | localdt }}{% else %}—{% endif %}
   </td>
+  {% endif %}
   <td data-label="" style="white-space:nowrap">
     <div class="row-actions" style="flex-wrap:nowrap;gap:4px">
       <a href="/jobs/{{ j.id }}/runs" class="btn btn-ghost btn-sm">Runs</a>
@@ -80,7 +89,6 @@
           {% if t.note %}<div style="font-size:11px;color:var(--muted)">{{ t.note }}</div>{% endif %}
         </td>
         <td data-label="" style="white-space:nowrap">
-          <a href="/transfers/{{ t.id }}" class="btn btn-ghost btn-sm">View Log</a>
           {% if t.status in ('pending', 'held_by_probe') %}
           <form method="post" action="/transfers/{{ t.id }}/execute" style="display:inline"
                 onsubmit="return confirm('Cancel from {{ t.probe_label }} and re-book on {{ t.main_label }}? The court is briefly exposed during the swap.')">
@@ -102,7 +110,7 @@
   <div class="card-header" style="padding:12px 16px"><h2>Active</h2></div>
   <table class="jobs-table">
     <thead><tr>
-      <th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Next Run</th><th></th>
+      <th>ID</th><th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Next Run</th><th></th>
     </tr></thead>
     <tbody>{{ job_rows(active_jobs) }}</tbody>
   </table>
@@ -114,9 +122,9 @@
   <div class="card-header" style="padding:12px 16px"><h2>Completed / Failed</h2></div>
   <table class="jobs-table">
     <thead><tr>
-      <th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Next Run</th><th></th>
+      <th>ID</th><th>Type</th><th>Org</th><th>Account</th><th>Status</th><th>Target / Params</th><th>Transfer</th><th></th>
     </tr></thead>
-    <tbody>{{ job_rows(completed_jobs) }}</tbody>
+    <tbody>{{ job_rows(completed_jobs, show_transfer=True) }}</tbody>
   </table>
 </div>
 {% endif %}
