@@ -80,7 +80,7 @@
           {% if t.note %}<div style="font-size:11px;color:var(--muted)">{{ t.note }}</div>{% endif %}
         </td>
         <td data-label="" style="white-space:nowrap">
-          <a href="/transfers/{{ t.id }}/log" target="_blank" class="btn btn-ghost btn-sm">View Log</a>
+          <a href="/transfers/{{ t.id }}" class="btn btn-ghost btn-sm">View Log</a>
           {% if t.status in ('pending', 'held_by_probe') %}
           <form method="post" action="/transfers/{{ t.id }}/execute" style="display:inline"
                 onsubmit="return confirm('Cancel from {{ t.probe_label }} and re-book on {{ t.main_label }}? The court is briefly exposed during the swap.')">

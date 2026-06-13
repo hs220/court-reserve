@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Transfer #{{ t.id }} — CourtReserve Manager{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px">
+  <a href="/jobs" style="color:var(--muted);text-decoration:none">← Back to jobs</a>
+</div>
+<h1>Transfer #{{ t.id }}</h1>
+<p style="color:var(--muted);margin-bottom:6px">
+  Court: <strong>{{ t.date }} {{ t.start_time }} ({{ t.duration_min }} min){% if t.court_type %} · {{ t.court_type }}{% endif %}</strong> &nbsp;·&nbsp;
+  Org: <strong>{{ t.org_name }}</strong>
+</p>
+<p style="color:var(--muted);margin-bottom:6px">
+  Held by: <strong>{{ t.probe_label }}</strong> &nbsp;→&nbsp;
+  Move to: <strong>{{ t.main_label }}</strong>
+</p>
+<p style="color:var(--muted);margin-bottom:24px">
+  Status: <span class="badge badge-{{ 'active' if t.status == 'pending' else t.status }}">{{ t.status }}</span>
+  {% if t.note %}&nbsp;·&nbsp; {{ t.note }}{% endif %}
+</p>
+
+<div class="card">
+  <div class="card-header">
+    <h2>Log Output</h2>
+    {% if t.status == "transferring" %}
+    <span style="color:var(--yellow);font-size:12px">● live</span>
+    {% endif %}
+  </div>
+  <div class="log-box"
+    {% if t.status == "transferring" %}
+      id="log-content"
+      hx-get="/transfers/{{ t.id }}/log"
+      hx-trigger="every 2s"
+      hx-target="#log-content"
+      hx-swap="innerHTML"
+    {% endif %}>
+    {{ t.log_text or "(no transfer output yet)" }}
+  </div>
+</div>
+{% endblock %}

@@ -370,10 +370,25 @@ async def get_transfer_log(transfer_id: int):
                          .where(pending_transfers.c.id == transfer_id)).fetchone()
     if not t:
         return PlainTextResponse("Transfer not found.", status_code=404)
-    header = (f"Transfer #{t.id} — {t.date} {t.start_time} ({t.duration_min} min)\n"
-              f"status: {t.status}\nnote: {t.note or ''}\n"
-              f"{'-' * 60}\n")
-    return PlainTextResponse(header + (t.log_text or "(no transfer output yet)"))
+    return PlainTextResponse(t.log_text or "(no transfer output yet)")
+
+
+@router.get("/transfers/{transfer_id}", response_class=HTMLResponse)
+async def transfer_detail(request: Request, transfer_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(pending_transfers.select()
+                           .where(pending_transfers.c.id == transfer_id)).fetchone()
+        if not row:
+            return HTMLResponse("Transfer not found.", status_code=404)
+        t = row_to_dict(row)
+        acct_label = {a.id: (a.label or a.email)
+                      for a in conn.execute(accounts.select())}
+        org = conn.execute(organizations.select()
+                           .where(organizations.c.id == t["org_id"])).fetchone()
+    t["probe_label"] = acct_label.get(t["probe_account_id"], "?")
+    t["main_label"] = acct_label.get(t["main_account_id"], "?")
+    t["org_name"] = org.name if org else "?"
+    return templates.TemplateResponse(request, "transfer_detail.html", context={"t": t})
 
 
 @router.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
