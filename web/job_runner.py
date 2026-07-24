@@ -75,9 +75,18 @@ from web.database import (engine, job_runs, jobs, bookings, accounts, organizati
 # Treat any Playwright timeout (Page.goto, wait_for_selector, APIRequestContext.post,
 # etc.) as a transient/retriable condition — the site is just slow or briefly
 # unreachable. We'd rather retry than fail a booking/watch job outright.
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected"]
+_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected",
+    # abrupt connection drops mid-request (seen from ReadConsolidated / Cloudflare)
+    "socket hang up", "connection reset", "econnreset", "reset by peer", "err_connection_reset",
+    # upstream/proxy hiccups that return an error page instead of data
+    "502", "503", "504", "bad gateway", "service unavailable", "gateway time"]
 
 def _is_network_error(exc: Exception) -> bool:
+    # A JSON decode failure from an API call means the site handed back an HTML error
+    # or Cloudflare challenge page instead of the expected JSON — a transient blip, not
+    # a real bug. Playwright's APIResponse.json() raises json.JSONDecodeError here.
+    if isinstance(exc, json.JSONDecodeError):
+        return True
     return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
 
 
@@ -161,6 +170,38 @@ def _finish_run(run_id: int, status: str, log: str):
             .where(job_runs.c.id == run_id)
             .values(finished_at=datetime.utcnow(), status=status, log_text=log)
         )
+    if status == "failed":
+        _notify_run_failed(run_id, log)
+
+
+def _notify_run_failed(run_id: int, log: str) -> None:
+    """Email a heads-up when a run ends in the failed state. Best-effort: never let a
+    notification problem propagate into the job runner. No-op unless NOTIFY_EMAIL /
+    SMTP_PASSWORD are configured (see _send_warning_email)."""
+    import os
+    try:
+        with engine.connect() as conn:
+            run = conn.execute(job_runs.select().where(job_runs.c.id == run_id)).fetchone()
+            if not run:
+                return
+            job = conn.execute(jobs.select().where(jobs.c.id == run.job_id)).fetchone()
+        job_type = job.type if job else "?"
+        job_id = job.id if job else run.job_id
+        params = (job.params if job else "") or ""
+        tail = "\n".join((log or "").strip().splitlines()[-30:]) or "(no log output)"
+        base = os.environ.get("WEB_BASE_URL", "").rstrip("/")
+        link = f"{base}/runs/{run_id}" if base else f"(open the web UI → run #{run_id})"
+        _send_warning_email(
+            f"Job failed: {job_type} (job #{job_id}, run #{run_id})",
+            f"A {job_type} job failed.\n\n"
+            f"Job:    #{job_id} ({job_type})\n"
+            f"Run:    #{run_id}\n"
+            f"Params: {params}\n"
+            f"Log:    {link}\n\n"
+            f"Last log lines:\n{tail}\n",
+        )
+    except Exception as e:
+        print(f"Failure notification error: {e}")
 
 
 def _record_booking(run_id: int, account_id: int, slot, duration_min: int):
