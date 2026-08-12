@@ -17,7 +17,10 @@ DOCKER="sudo /usr/local/bin/docker"
 echo "==> Pulling latest code on NAS..."
 ssh "$NAS_HOST" "cd $NAS_DIR && git pull"
 
-echo "==> Building and starting web service..."
-ssh "$NAS_HOST" "cd $NAS_DIR && $DOCKER compose up web --build -d"
+# `web autoheal` rather than bare `up`: the default would also fire the one-shot
+# court-reserve CLI runner. autoheal is the watchdog that restarts web when its
+# healthcheck fails -- Docker won't do that on its own.
+echo "==> Building and starting web + autoheal services..."
+ssh "$NAS_HOST" "cd $NAS_DIR && $DOCKER compose up web autoheal --build -d"
 
 echo "==> Done. UI available at http://192.168.68.70:7000"

@@ -52,6 +52,37 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+    # Opts this container in to the autoheal watchdog below.
+    labels:
+      autoheal: "true"
+
+  # Watchdog: restarts any container labelled autoheal=true when its healthcheck
+  # reports unhealthy. Needed because Docker itself does NOT act on health status --
+  # `restart: unless-stopped` reacts to process *exit*, and the failure this guards
+  # against (blocked event loop, port still open) never exits.
+  #
+  # It lives outside the web container on purpose: an in-process watchdog would be
+  # taken down by the very fault it's meant to catch.
+  #
+  # SECURITY: mounting docker.sock grants this container full control of the Docker
+  # daemon, which is root-equivalent on the NAS. Pinned by digest rather than a
+  # floating tag so the image can't change under us; re-pin deliberately to upgrade.
+  autoheal:
+    image: willfarrell/autoheal:1.2.0@sha256:31f580ef0279eaced5b38d631b08c474d70d8403c1c2fdd6ddcf2e879d5f3f7c
+    restart: unless-stopped
+    environment:
+      TZ: America/Los_Angeles
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 30           # seconds between health polls
+      AUTOHEAL_START_PERIOD: 300      # grace after autoheal itself starts (NAS reboot)
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   court_data:

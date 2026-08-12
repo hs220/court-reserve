@@ -101,15 +101,21 @@ Guards now in `docker-compose.yml`:
 - `logging:` — json-file capped at 5 × 10MB, so the log store can't grow unbounded
 - `healthcheck:` — a real HTTP GET, since TCP-accept alone can't tell healthy from wedged
 - `init: true` — tini reaps Playwright's chromium zombies
+- `autoheal` service — restarts `web` when it goes unhealthy. Docker does **not** do
+  this itself: `restart: unless-stopped` reacts to process *exit*, and a wedged event
+  loop never exits. Deliberately a separate container, since an in-process watchdog
+  would be taken down by the fault it's watching for. Opt in with `labels:
+  autoheal: "true"`. It mounts `docker.sock` (root-equivalent on the NAS), so the
+  image is pinned by digest — re-pin deliberately to upgrade.
+
+`deploy.sh` starts `web autoheal` explicitly; a bare `compose up` would also fire the
+one-shot CLI runner.
 
 **Gaps that remain:**
-- Docker does **not** restart a container for going unhealthy; `restart:
-  unless-stopped` reacts to process *exit*, not health status. The healthcheck makes
-  the state visible (`docker ps`, DSM) but nothing acts on it. Self-healing needs a
-  watchdog (e.g. an autoheal sidecar watching `health_status` events).
 - All failure alerting goes through the app itself, so an app-down event is exactly
   what it cannot report. An out-of-band check (NAS cron curling the endpoint) is the
-  smallest thing that closes this.
+  smallest thing that closes this. autoheal narrows the window but doesn't tell you
+  anything happened.
 
 When the daemon is wedged on a container, `docker kill`/`rm -f` hang and hold its
 lock — retrying makes it worse. Restart Container Manager instead:
