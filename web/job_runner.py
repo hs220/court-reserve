@@ -679,16 +679,48 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status=job_final))
 
 
-def _deadline_timeout_minutes(deadline_mode: str, target_date, target_time: str, org_timezone: str) -> int:
-    """Convert deadline_mode to minutes-from-now for the poll timeout. Returns 0 for infinite."""
-    if deadline_mode == "infinite" or not target_time:
-        return 0
-    offset_mins = {"5h10m": 310, "4h10m": 250, "4h": 240, "30m": 30}.get(deadline_mode, 250)
+_DEADLINE_OFFSETS = {"5h10m": 310, "4h10m": 250, "4h": 240, "30m": 30}
+
+
+def _time_deadline(deadline_mode: str, target_date, one_time: str, org_timezone: str):
+    """Absolute datetime after which `one_time` is no longer worth booking, or None
+    for no deadline. `one_time` is a single "HH:MM"."""
+    if deadline_mode == "infinite" or not one_time:
+        return None
+    offset_mins = _DEADLINE_OFFSETS.get(deadline_mode, 250)
     tz = pytz.timezone(org_timezone)
-    hour, minute = map(int, target_time.split(":"))
+    hour, minute = map(int, one_time.split(":"))
     court_naive = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
-    deadline_dt = tz.localize(court_naive) - timedelta(minutes=offset_mins)
-    remaining = (deadline_dt - datetime.now(tz)).total_seconds() / 60
+    return tz.localize(court_naive) - timedelta(minutes=offset_mins)
+
+
+def _live_times(deadline_mode: str, target_date, times: list[str], org_timezone: str) -> list[str]:
+    """Subset of `times` whose deadline hasn't passed, order preserved.
+
+    With several preferred times each has its own deadline, so they expire one by
+    one: watching for 19:00/19:30/20:00 at 4h10m, 19:00 stops being worth booking at
+    14:50 while 20:00 is still live until 15:50. Dropping them individually keeps the
+    single-time semantics ("never book something already inside the deadline") that
+    callers relied on when this only handled one time."""
+    if deadline_mode == "infinite" or not times:
+        return list(times)
+    now = datetime.now(pytz.timezone(org_timezone))
+    return [t for t in times
+            if (d := _time_deadline(deadline_mode, target_date, t, org_timezone)) is None or d > now]
+
+
+def _deadline_timeout_minutes(deadline_mode: str, target_date, target_time: str, org_timezone: str) -> int:
+    """Convert deadline_mode to minutes-from-now for the poll timeout. Returns 0 for
+    infinite. target_time may be a comma-separated list; the job runs until the LAST
+    of them expires, with earlier ones pruned as they go (see _live_times)."""
+    times = _parse_preferred_times(target_time)
+    if deadline_mode == "infinite" or not times:
+        return 0
+    deadlines = [d for t in times
+                 if (d := _time_deadline(deadline_mode, target_date, t, org_timezone)) is not None]
+    if not deadlines:
+        return 0
+    remaining = (max(deadlines) - datetime.now(pytz.timezone(org_timezone))).total_seconds() / 60
     return max(0, int(remaining))
 
 
@@ -696,7 +728,9 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
               duration: int, interval: int = 60, deadline_mode: str = "4h",
               probe_account_id: int | None = None, auto_transfer: bool = False):
     """
-    Poll until a specific slot opens on target_date at target_time, then book it.
+    Poll until a watched slot opens on target_date, then book it. target_time is one
+    "HH:MM" or a comma-separated list in priority order; the first listed time that is
+    actually bookable wins, and each time drops out once its own deadline passes.
     If probe_account_id is set (and differs from account_id), that PROBE account does
     the polling AND the booking attempts — keeping repeated/risky Book attempts off the
     main account. When the probe secures the court, a pending_transfers row is created
@@ -734,7 +768,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
         # else via the Transfer button). Without a probe, the main account books directly.
         using_probe = probe_account is not None
 
-        time_desc = target_time if target_time else "any time"
+        # target_time may be a single "HH:MM" or a comma-separated list in priority
+        # order — one job can watch several candidate start times, which costs nothing
+        # extra since each poll already fetches the whole day in one request.
+        preferred_times = _parse_preferred_times(target_time)
+        time_desc = " / ".join(preferred_times) if preferred_times else "any time"
         timeout_minutes = _deadline_timeout_minutes(deadline_mode, target_date, target_time, org_cfg.timezone)
         deadline_desc = f"stop {deadline_mode} before court" if deadline_mode != "infinite" else "no timeout"
 
@@ -799,28 +837,42 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                     break
                                 raise
 
-                            if target_time:
-                                open_at_time = next(
-                                    (s for s in slots if s.start_time == target_time and not s.is_wait_list),
-                                    None,
-                                )
-                                # For picker orgs (Santa Clara), the feed is a useful cheap
-                                # pre-filter: a slot can be open for its 30-min interval yet lack a
-                                # contiguous same-court window, and we'd rather not open the modal.
-                                # For non-picker orgs (Sunnyvale) the feed is NOT trustworthy enough
-                                # to skip on — the only reliable signal is clicking Book and reading
-                                # the "no available courts" notice — so always attempt there.
-                                if (open_at_time and _org_uses_court_picker(org_cfg)
-                                        and not slot_has_window(slots, open_at_time, duration)):
+                            # For picker orgs (Santa Clara), the feed is a useful cheap
+                            # pre-filter: a slot can be open for its 30-min interval yet lack a
+                            # contiguous same-court window, and we'd rather not open the modal.
+                            # For non-picker orgs (Sunnyvale) the feed is NOT trustworthy enough
+                            # to skip on — the only reliable signal is clicking Book and reading
+                            # the "no available courts" notice — so always attempt there.
+                            window_dur = duration if _org_uses_court_picker(org_cfg) else 0
+
+                            if preferred_times:
+                                # Prune times whose own deadline has passed, then take the
+                                # earliest-listed one that's actually bookable. allow_fallback
+                                # is off: a targeted watch must never grab some other time.
+                                active_times = _live_times(deadline_mode, target_date,
+                                                           preferred_times, org_cfg.timezone)
+                                if not active_times:
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
-                                    print(f"[{ts}] {target_time} is open but has no contiguous "
-                                          f"{duration}-min window (need a single court free the whole "
-                                          f"time) — continuing to watch...")
-                                    match = None
-                                else:
-                                    match = open_at_time
+                                    print(f"[{ts}] All watched times are now inside the "
+                                          f"{deadline_mode} deadline — nothing left to wait for.")
+                                    browser.close()
+                                    status = "failed"
+                                    done = True
+                                    break
+                                match = find_best_slot(slots, active_times, allow_fallback=False,
+                                                       duration_minutes=window_dur)
+                                if not match and window_dur:
+                                    # Distinguish "not open" from "open but unusable" — the
+                                    # latter is the confusing one when reading a log later.
+                                    blocked = [t for t in active_times
+                                               if any(s.start_time == t and not s.is_wait_list
+                                                      for s in slots)]
+                                    if blocked:
+                                        ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                        print(f"[{ts}] {', '.join(blocked)} open but no contiguous "
+                                              f"{duration}-min window (need a single court free the "
+                                              f"whole time) — continuing to watch...")
                             else:
-                                window_dur = duration if _org_uses_court_picker(org_cfg) else 0
                                 match = find_best_slot(slots, [], duration_minutes=window_dur)
 
                             if match:

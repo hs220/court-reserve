@@ -199,7 +199,7 @@
     <button class="modal-close" onclick="document.getElementById('add-watch-modal').classList.remove('open')">✕</button>
     <h2>New Watch Job</h2>
     <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Polls until a slot opens, then books it immediately. If the date is beyond the booking window, polling starts automatically when the window opens.</p>
-    <form method="post" action="/jobs/watch">
+    <form method="post" action="/jobs/watch" id="wt-form">
       <div class="form-grid">
         <div class="form-group"><label>Organization</label>
           <select name="org_db_id">
@@ -214,9 +214,11 @@
           </select>
         </div>
         <div class="form-group"><label>Date</label><input id="wt-date" name="date" placeholder="YYYY-MM-DD" autocomplete="off" required></div>
-        <div class="form-group">
-          <label>Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
-          <input id="wt-time" name="time" placeholder="any available" autocomplete="off">
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Preferred Times <span style="color:var(--muted);font-weight:400;text-transform:none">(priority order — leave empty for any)</span></label>
+          <div id="wt-times-list"></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="wt-add-time" style="margin-top:4px;align-self:flex-start">+ Add Time</button>
+          <input type="hidden" name="time" id="wt-times-value">
         </div>
         <div class="form-group"><label>Duration</label>
           <select name="duration">
@@ -309,13 +311,23 @@ document.getElementById('bn-form').addEventListener('submit', function() {
 var watchPickersInit = false;
 function openWatchModal() {
   document.getElementById('add-watch-modal').classList.add('open');
-  if (watchPickersInit) return;
-  watchPickersInit = true;
-  flatpickr('#wt-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
-  flatpickr('#wt-time', {
-    enableTime: true, noCalendar: true, dateFormat: 'H:i',
-    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
-  });
+  if (!watchPickersInit) {
+    watchPickersInit = true;
+    flatpickr('#wt-date', { dateFormat: 'Y-m-d', minDate: 'today', disableMobile: true });
+  }
+  const list = document.getElementById('wt-times-list');
+  list.innerHTML = '';
+  createTimeRow(list, '');
 }
+
+document.getElementById('wt-add-time').addEventListener('click', function() {
+  createTimeRow(document.getElementById('wt-times-list'), '');
+});
+
+document.getElementById('wt-form').addEventListener('submit', function() {
+  const vals = Array.from(document.querySelectorAll('#wt-times-list .time-entry-row input'))
+    .map(function(i) { return i.value.trim(); }).filter(Boolean);
+  document.getElementById('wt-times-value').value = vals.join(',');
+});
 </script>
 {% endblock %}

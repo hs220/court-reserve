@@ -127,7 +127,7 @@
     <button class="modal-close" onclick="document.getElementById('add-rwatch-modal').classList.remove('open')">✕</button>
     <h2>New Recurring Watch</h2>
     <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Creates a watch job each week — fires 5 min after the booking window opens.</p>
-    <form method="post" action="/jobs/recurrent_watch">
+    <form method="post" action="/jobs/recurrent_watch" id="rw-form">
       <div class="form-grid">
         <div class="form-group"><label>Organization</label>
           <select name="org_db_id">
@@ -152,9 +152,11 @@
             <option value="6">Sunday</option>
           </select>
         </div>
-        <div class="form-group">
-          <label>Time <span style="color:var(--muted);font-weight:400;text-transform:none">(leave blank for any)</span></label>
-          <input id="rw-time" name="time" placeholder="any available" autocomplete="off">
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Preferred Times <span style="color:var(--muted);font-weight:400;text-transform:none">(priority order — leave empty for any)</span></label>
+          <div id="rw-times-list"></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="rw-add-time" style="margin-top:4px;align-self:flex-start">+ Add Time</button>
+          <input type="hidden" name="time" id="rw-times-value">
         </div>
         <div class="form-group"><label>Duration</label>
           <select name="duration">
@@ -241,12 +243,20 @@ document.getElementById('rbn-form').addEventListener('submit', function() {
 var rwInit = false;
 function openRwatchModal() {
   document.getElementById('add-rwatch-modal').classList.add('open');
-  if (rwInit) return;
   rwInit = true;
-  flatpickr('#rw-time', {
-    enableTime: true, noCalendar: true, dateFormat: 'H:i',
-    time_24hr: true, minuteIncrement: 30, disableMobile: true, allowInput: true,
-  });
+  const list = document.getElementById('rw-times-list');
+  list.innerHTML = '';
+  createTimeRow(list, '');
 }
+
+document.getElementById('rw-add-time').addEventListener('click', function() {
+  createTimeRow(document.getElementById('rw-times-list'), '');
+});
+
+document.getElementById('rw-form').addEventListener('submit', function() {
+  const vals = Array.from(document.querySelectorAll('#rw-times-list .time-entry-row input'))
+    .map(function(i) { return i.value.trim(); }).filter(Boolean);
+  document.getElementById('rw-times-value').value = vals.join(',');
+});
 </script>
 {% endblock %}

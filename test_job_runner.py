@@ -11,7 +11,10 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date, datetime
 from unittest import mock
+
+import pytz
 
 # Must be set before importing web.job_runner -> web.database (reads DATA_DIR at import).
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="cr-test-data-"))
@@ -19,7 +22,9 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="cr-test-data-"))
 from sqlalchemy import insert
 
 from web.database import accounts, engine, init_db, job_runs, jobs, organizations
-from web.job_runner import (_append_run_log, _finish_run, _is_network_error, _notify_run_failed,
+from booking import Slot, find_best_slot
+from web.job_runner import (_append_run_log, _deadline_timeout_minutes, _finish_run,
+                            _is_network_error, _live_times, _notify_run_failed,
                             _parse_preferred_times, _send_warning_email, _start_run,
                             SMTP_ATTEMPTS, SMTP_TIMEOUT_SECONDS)
 
@@ -97,6 +102,108 @@ class ParsePreferredTimesTests(unittest.TestCase):
 
     def test_none(self):
         self.assertEqual(_parse_preferred_times(None), [])
+
+
+class MultiTimeWatchTests(unittest.TestCase):
+    """A watch job may name several candidate start times in priority order. Each poll
+    already fetches the whole day in one request, so extra times cost nothing -- but
+    each carries its own deadline and they expire independently."""
+
+    TZ = "America/Los_Angeles"
+
+    def setUp(self):
+        # Freeze "now" at 15:00 local on the target date so deadlines are deterministic.
+        self.target = date(2026, 8, 17)
+        self.now = pytz.timezone(self.TZ).localize(datetime(2026, 8, 17, 15, 0))
+        patcher = mock.patch("web.job_runner.datetime", wraps=datetime)
+        self.mock_dt = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mock_dt.now.return_value = self.now
+        self.mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+    def test_single_time_still_works(self):
+        # 19:00 court, 4h10m deadline -> cutoff 14:50, already past at 15:00.
+        self.assertEqual(
+            _deadline_timeout_minutes("4h10m", self.target, "19:00", self.TZ), 0)
+        # 20:00 court -> cutoff 15:50, 50 minutes left.
+        self.assertEqual(
+            _deadline_timeout_minutes("4h10m", self.target, "20:00", self.TZ), 50)
+
+    def test_multi_time_does_not_crash(self):
+        # Regression: this raised ValueError("invalid literal for int()") because the
+        # whole string was fed to int() via split(":").
+        self.assertEqual(
+            _deadline_timeout_minutes("4h10m", self.target, "19:00,19:30,20:00", self.TZ), 50)
+
+    def test_multi_time_runs_until_the_last_deadline(self):
+        # Job must not stop when the *earliest* time expires -- later ones are live.
+        self.assertEqual(
+            _deadline_timeout_minutes("4h10m", self.target, "19:00,20:00", self.TZ),
+            _deadline_timeout_minutes("4h10m", self.target, "20:00", self.TZ))
+
+    def test_expired_times_are_pruned_but_order_is_kept(self):
+        live = _live_times("4h10m", self.target, ["19:00", "19:30", "20:00"], self.TZ)
+        self.assertEqual(live, ["19:30", "20:00"])  # 19:00 cutoff 14:50 has passed
+
+    def test_all_expired_yields_nothing_to_watch(self):
+        self.assertEqual(_live_times("4h10m", self.target, ["19:00"], self.TZ), [])
+
+    def test_infinite_never_prunes_or_times_out(self):
+        times = ["19:00", "20:00"]
+        self.assertEqual(_live_times("infinite", self.target, times, self.TZ), times)
+        self.assertEqual(
+            _deadline_timeout_minutes("infinite", self.target, "19:00,20:00", self.TZ), 0)
+
+    def test_no_time_means_watch_anything(self):
+        self.assertEqual(_deadline_timeout_minutes("4h10m", self.target, "", self.TZ), 0)
+        self.assertEqual(_live_times("4h10m", self.target, [], self.TZ), [])
+
+    def test_whitespace_in_the_list_is_tolerated(self):
+        # The UI joins picker rows with "," but hand-edited params may have spaces.
+        self.assertEqual(
+            _deadline_timeout_minutes("4h10m", self.target, " 19:00 , 20:00 ", self.TZ), 50)
+
+
+class MultiTimeSlotSelectionTests(unittest.TestCase):
+    """find_best_slot already drives the choice; pin the behaviour run_watch relies on."""
+
+    TZ = "America/Los_Angeles"
+
+    def _slot(self, start_time, court_ids=(1,), waitlist=False):
+        base = pytz.timezone(self.TZ).localize(
+            datetime.strptime(f"2026-08-17 {start_time}", "%Y-%m-%d %H:%M"))
+        return Slot(
+            court_type="Hard",
+            start_ms=int(base.timestamp() * 1000),
+            end_ms=int(base.timestamp() * 1000) + 30 * 60 * 1000,
+            available_courts=len(court_ids),
+            available_court_ids=list(court_ids),
+            is_wait_list=waitlist,
+            timezone=self.TZ,
+        )
+
+    def test_earliest_listed_preference_wins(self):
+        slots = [self._slot("19:30"), self._slot("20:00")]
+        self.assertEqual(find_best_slot(slots, ["20:00", "19:30"], allow_fallback=False).start_time,
+                         "20:00")
+        self.assertEqual(find_best_slot(slots, ["19:30", "20:00"], allow_fallback=False).start_time,
+                         "19:30")
+
+    def test_falls_through_to_the_next_listed_time(self):
+        slots = [self._slot("20:00")]
+        self.assertEqual(
+            find_best_slot(slots, ["19:00", "19:30", "20:00"], allow_fallback=False).start_time,
+            "20:00")
+
+    def test_never_books_an_unlisted_time(self):
+        # allow_fallback=False is what stops a targeted watch grabbing a random slot.
+        slots = [self._slot("18:00"), self._slot("21:00")]
+        self.assertIsNone(find_best_slot(slots, ["19:00", "19:30"], allow_fallback=False))
+
+    def test_waitlist_slots_are_not_matches(self):
+        slots = [self._slot("19:00", waitlist=True), self._slot("19:30")]
+        self.assertEqual(find_best_slot(slots, ["19:00", "19:30"], allow_fallback=False).start_time,
+                         "19:30")
 
 
 class SendWarningEmailTests(unittest.TestCase):
