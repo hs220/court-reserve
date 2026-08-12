@@ -10,6 +10,8 @@ Run:  python -m unittest test_job_runner -v
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from datetime import date, datetime
 from unittest import mock
@@ -23,10 +25,11 @@ from sqlalchemy import insert
 
 from web.database import accounts, engine, init_db, job_runs, jobs, organizations
 from booking import Slot, find_best_slot
+import web.job_runner as jr
 from web.job_runner import (_append_run_log, _deadline_timeout_minutes, _finish_run,
                             _is_network_error, _live_times, _notify_run_failed,
                             _parse_preferred_times, _send_warning_email, _start_run,
-                            SMTP_ATTEMPTS, SMTP_TIMEOUT_SECONDS)
+                            request_cancel, run_watch, SMTP_ATTEMPTS, SMTP_TIMEOUT_SECONDS)
 
 
 class IsNetworkErrorTests(unittest.TestCase):
@@ -204,6 +207,154 @@ class MultiTimeSlotSelectionTests(unittest.TestCase):
         slots = [self._slot("19:00", waitlist=True), self._slot("19:30")]
         self.assertEqual(find_best_slot(slots, ["19:00", "19:30"], allow_fallback=False).start_time,
                          "19:30")
+
+
+class CancellationRegistryTests(unittest.TestCase):
+    """APScheduler's remove_job only drops the trigger, so a watch already mid-poll
+    outlived edit/pause/delete: still holding a browser, still able to book for a job
+    that no longer existed. Runs now publish an Event that callers can set."""
+
+    def tearDown(self):
+        with jr._cancel_lock:
+            jr._cancel_events.clear()
+
+    def test_cancel_sets_the_running_events_flag(self):
+        event = jr._register_cancel(42)
+        self.assertFalse(event.is_set())
+        self.assertTrue(request_cancel(42))
+        self.assertTrue(event.is_set())
+
+    def test_cancelling_an_idle_job_is_a_no_op(self):
+        # Edit/delete call this unconditionally; jobs that aren't running are common.
+        self.assertFalse(request_cancel(999))
+
+    def test_unregister_removes_the_event(self):
+        event = jr._register_cancel(42)
+        jr._unregister_cancel(42, event)
+        self.assertFalse(request_cancel(42))
+
+    def test_a_finishing_run_cannot_retract_its_replacements_event(self):
+        # The edit path cancels the old run and immediately schedules a new one. If the
+        # old thread's cleanup deleted whatever was registered, the *new* run would be
+        # silently uncancellable -- reintroducing the bug for every subsequent edit.
+        old = jr._register_cancel(42)
+        request_cancel(42)
+        new = jr._register_cancel(42)          # replacement run starts
+        jr._unregister_cancel(42, old)         # old thread finally-block lands late
+        self.assertFalse(new.is_set())
+        self.assertTrue(request_cancel(42))
+        self.assertTrue(new.is_set())
+
+    def test_each_job_is_isolated(self):
+        a, b = jr._register_cancel(1), jr._register_cancel(2)
+        request_cancel(1)
+        self.assertTrue(a.is_set())
+        self.assertFalse(b.is_set())
+
+    def test_cancel_wakes_a_waiting_thread_promptly(self):
+        # The poll loop waits on the Event rather than sleeping, so a cancel lands at
+        # once instead of after a full interval (60s in production).
+        event = jr._register_cancel(42)
+        result = {}
+
+        def worker():
+            t0 = time.monotonic()
+            result["cancelled"] = event.wait(30)
+            result["elapsed"] = time.monotonic() - t0
+
+        t = threading.Thread(target=worker)
+        t.start()
+        time.sleep(0.05)
+        request_cancel(42)
+        t.join(timeout=5)
+        self.assertTrue(result["cancelled"])
+        self.assertLess(result["elapsed"], 2.0, "cancel should not wait out the interval")
+
+    def test_cancelled_runs_do_not_send_failure_email(self):
+        # "cancelled" must not be spelled "failed": editing a job would then fire a
+        # spurious "Job failed" alert every time.
+        run_id = _start_run(_cancel_job_id())
+        with mock.patch("smtplib.SMTP") as smtp:
+            _finish_run(run_id, "cancelled", "watch: cancelled\n")
+            smtp.assert_not_called()
+        with engine.connect() as conn:
+            row = conn.execute(job_runs.select().where(job_runs.c.id == run_id)).fetchone()
+        self.assertEqual(row.status, "cancelled")
+        self.assertNotIn("failure notification", row.log_text)
+
+
+class RunWatchCancelPathTests(unittest.TestCase):
+    """Drive the real run_watch cancel path. Asserting on _finish_run alone is not
+    enough: it leaves run_watch free to report a cancellation as "failed", which would
+    fire a spurious "Job failed" email on every edit."""
+
+    def setUp(self):
+        self.job_id = _cancel_job_id()
+        with engine.begin() as conn:
+            conn.execute(jobs.update().where(jobs.c.id == self.job_id).values(status="active"))
+        # Enter the poll loop already cancelled, as if an edit landed a moment earlier.
+        preset = threading.Event()
+        preset.set()
+        for target, new in [("web.job_runner._register_cancel", lambda _job_id: preset),
+                            ("web.job_runner.ensure_logged_in", mock.DEFAULT),
+                            ("web.job_runner.wait_until", mock.DEFAULT)]:
+            p = mock.patch(target, new) if new is not mock.DEFAULT else mock.patch(target)
+            p.start()
+            self.addCleanup(p.stop)
+        pw = mock.patch("web.job_runner.sync_playwright")
+        self.pw = pw.start()
+        self.addCleanup(pw.stop)
+        self.browser = self.pw.return_value.__enter__.return_value.chromium.launch.return_value
+
+    def _run(self):
+        with mock.patch("smtplib.SMTP") as smtp:
+            run_watch(self.job_id, _cancel_account_id(), "2026-08-17", "19:00",
+                      duration=120, interval=60, deadline_mode="infinite")
+        return smtp
+
+    def test_cancelled_before_first_poll_ends_as_cancelled(self):
+        smtp = self._run()
+        with engine.connect() as conn:
+            run = conn.execute(job_runs.select().where(job_runs.c.job_id == self.job_id)
+                               .order_by(job_runs.c.id.desc())).fetchone()
+        self.assertEqual(run.status, "cancelled")
+        self.assertIn("Cancelled", run.log_text)
+        smtp.assert_not_called()          # never alert on a deliberate cancellation
+
+    def test_browser_is_closed_on_cancel(self):
+        # Otherwise cancelling leaks the chromium processes it was holding.
+        self._run()
+        self.browser.close.assert_called()
+
+    def test_cancel_does_not_clobber_the_jobs_row(self):
+        # An edit sets status=active and schedules a replacement; the retiring thread
+        # must not then stamp "failed" over it.
+        self._run()
+        with engine.connect() as conn:
+            job = conn.execute(jobs.select().where(jobs.c.id == self.job_id)).fetchone()
+        self.assertEqual(job.status, "active")
+
+    def test_the_event_is_retracted_afterwards(self):
+        self._run()
+        self.assertFalse(request_cancel(self.job_id))
+
+
+def _cancel_account_id():
+    with engine.connect() as conn:
+        return conn.execute(accounts.select().order_by(accounts.c.id.desc())).fetchone().id
+
+
+def _cancel_job_id():
+    """A throwaway job row for run-lifecycle assertions."""
+    init_db()
+    with engine.begin() as conn:
+        org_id = conn.execute(insert(organizations).values(
+            name="Cancel Org", org_id="1", scheduler_id="1", cost_type_id="1",
+            timezone="America/Los_Angeles")).inserted_primary_key[0]
+        acct_id = conn.execute(insert(accounts).values(
+            label="c", email="c@example.com", password="p")).inserted_primary_key[0]
+        return conn.execute(insert(jobs).values(
+            account_id=acct_id, org_id=org_id, type="watch", params="{}")).inserted_primary_key[0]
 
 
 class SendWarningEmailTests(unittest.TestCase):

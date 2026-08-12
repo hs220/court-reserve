@@ -291,8 +291,12 @@ async def create_recurrent_watch(
 
 @router.post("/jobs/{job_id}/pause")
 async def pause_job(job_id: int):
+    from web.job_runner import request_cancel
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
+    # pause_job only stops future firings; a watch already mid-poll would keep running
+    # (and could still book) unless we ask its thread to stop.
+    request_cancel(job_id)
     apscheduler_setup.pause_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="paused"))
@@ -311,11 +315,15 @@ async def resume_job(job_id: int):
 
 @router.post("/jobs/{job_id}/delete")
 async def delete_job(job_id: int):
+    from web.job_runner import request_cancel
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
         run_ids = [r[0] for r in conn.execute(
             job_runs.select().where(job_runs.c.job_id == job_id)
         ).fetchall()]
+    # Stop the thread before the rows go away, or it keeps polling for a job that no
+    # longer exists -- and can still book a court against the deleted run.
+    request_cancel(job_id)
     apscheduler_setup.remove_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
         if run_ids:
@@ -439,10 +447,14 @@ async def update_job(
     probe_account_id: str = Form(""),
     auto_transfer: str = Form(""),
 ):
+    from web.job_runner import request_cancel
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == j["org_id"])).fetchone())
 
+    # Retire the in-flight run before scheduling its replacement, otherwise both poll
+    # at once -- the old one against the pre-edit parameters.
+    request_cancel(job_id)
     apscheduler_setup.remove_job(j.get("apscheduler_id", ""))
 
     if j["type"] == "book_next":

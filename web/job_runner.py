@@ -74,6 +74,44 @@ from web.database import (engine, job_runs, jobs, bookings, accounts, organizati
 
 from net_errors import is_network_error as _is_network_error
 
+# ── Cooperative cancellation ──────────────────────────────────────────────────
+# A watch job polls for days inside a background thread. APScheduler's remove_job()
+# only drops the *trigger*, so editing, pausing or deleting a job that had already
+# started left the old thread running: still holding a browser, still polling, and
+# still able to book a court for a job that no longer exists. Threads register an
+# Event here and check it every cycle; callers set it and the thread winds down.
+
+_cancel_events: dict[int, threading.Event] = {}
+_cancel_lock = threading.Lock()
+
+
+def request_cancel(job_id: int) -> bool:
+    """Ask a running job's thread to stop at its next check. Returns True if a thread
+    was actually listening. Safe (and a no-op) for jobs that aren't running."""
+    with _cancel_lock:
+        event = _cancel_events.get(job_id)
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+def _register_cancel(job_id: int) -> threading.Event:
+    """Publish a fresh cancellation Event for a run that is about to start."""
+    event = threading.Event()
+    with _cancel_lock:
+        _cancel_events[job_id] = event
+    return event
+
+
+def _unregister_cancel(job_id: int, event: threading.Event) -> None:
+    with _cancel_lock:
+        # Only retract our own event. A replacement run for the same job may already
+        # have registered its own -- clobbering that would make the new run silently
+        # uncancellable, which is the bug this whole mechanism exists to fix.
+        if _cancel_events.get(job_id) is event:
+            del _cancel_events[job_id]
+
 # A run only fails-and-notifies when something went wrong — often the network itself.
 # Without an explicit timeout, smtplib blocks forever on a half-open connection (the
 # `read ETIMEDOUT` signature), so the alert never lands and never even errors. Bound
@@ -738,11 +776,16 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
     on the main account; otherwise it waits for the manual Transfer button.
     Transient network/timeout errors restart the browser session automatically.
     After 20 consecutive errors a warning email is sent, but the job keeps running.
+
+    Cancellable: editing, pausing or deleting the job sets this run's Event (see
+    request_cancel) and the poll loop winds down at its next check instead of
+    outliving the job it belongs to.
     """
     run_id = _start_run(job_id)
     buf = io.StringIO()
     status = "failed"
     slot = None
+    cancel_event = _register_cancel(job_id)
     try:
         account, org = _get_account_and_org(job_id, account_id)
         org_cfg = _org_config(org)
@@ -827,6 +870,13 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                         consecutive_errors = 0  # session established — reset streak
 
                         while not done:  # poll loop
+                            if cancel_event.is_set():
+                                ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
+                                print(f"[{ts}] Cancelled — the job was edited, paused or deleted.")
+                                browser.close()
+                                status = "cancelled"
+                                done = True
+                                break
                             try:
                                 slots = get_available_slots(probe_page, target_date, org_cfg)
                             except Exception as exc:
@@ -949,7 +999,10 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                             ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
                             print(f"[{ts}] No slot yet (checked as {probe_label}). Next check in {wait:.0f}s...")
                             _finish_run(run_id, "running", buf.getvalue())
-                            time.sleep(wait)
+                            # Wait on the Event, not sleep(): a cancel lands immediately
+                            # instead of after up to a full poll interval. The loop head
+                            # does the actual teardown.
+                            cancel_event.wait(wait)
 
                 except Exception as exc:
                     if _is_network_error(exc) and not done:
@@ -972,7 +1025,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                             wait = interval + jitter
                             print(f"[{ts}] Retrying in {wait:.0f}s...")
                             _finish_run(run_id, "running", buf.getvalue())
-                            time.sleep(wait)
+                            if cancel_event.wait(wait):
+                                # Browser is already gone on this path; nothing to close.
+                                print(f"[{ts}] Cancelled during error recovery — stopping.")
+                                status = "cancelled"
+                                done = True
                     else:
                         raise
                 else:
@@ -995,7 +1052,10 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                             wait = interval + jitter
                             print(f"[{ts}] Session restarting in {wait:.0f}s...")
                             _finish_run(run_id, "running", buf.getvalue())
-                            time.sleep(wait)
+                            if cancel_event.wait(wait):
+                                print(f"[{ts}] Cancelled before session restart — stopping.")
+                                status = "cancelled"
+                                done = True
 
         if slot is not None:
             _record_booking(run_id, account_id, slot, duration)
@@ -1003,8 +1063,17 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
     except Exception as exc:
         buf.write(f"\nERROR: {exc}\n")
         status = "failed"
+    finally:
+        _unregister_cancel(job_id, cancel_event)
 
     _finish_run(run_id, status, buf.getvalue())
+
+    # A cancelled run must not touch jobs.status. Whoever cancelled it owns that now:
+    # an edit has already set the row back to "active" and scheduled a replacement run,
+    # a pause set "paused", and a delete removed the row entirely. Writing "failed"
+    # here would clobber their state from a thread that is on its way out.
+    if status == "cancelled":
+        return
 
     # pending_transfer counts as a completed watch — we secured the court (the probe
     # holds it / it's being moved to main); the watch itself shouldn't reschedule.
