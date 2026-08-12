@@ -310,6 +310,19 @@ async def resume_job(job_id: int):
     apscheduler_setup.resume_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="active"))
+
+    # A one-shot watch fires from a DateTrigger that is spent once it has run, so
+    # un-pausing the trigger resumes nothing. Pausing used to leave the poll thread
+    # alive, which hid this; now that pause really stops it, resume has to put a
+    # replacement run back or the job sits "active" while watching nothing.
+    # Recurrent jobs are deliberately excluded: their cron trigger is never spent, so
+    # resume_job above is enough and rescheduling would leave two triggers firing.
+    if j["type"] == "watch":
+        # run_at may name a moment that has passed. misfire_grace_time is None, so
+        # APScheduler runs a past-dated trigger immediately rather than dropping it --
+        # which is exactly what resuming a live watch should do.
+        apscheduler_setup.schedule_watch(job_id, j["account_id"],
+                                         json.loads(j.get("params") or "{}"))
     return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
