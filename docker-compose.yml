@@ -21,6 +21,17 @@ services:
       TZ: America/Los_Angeles
       DATA_DIR: /data
     restart: unless-stopped
+    # Synology's default `db` log driver has no rotation. Long-running watch jobs
+    # print a poll line every ~60s each, so over weeks the log store grew until the
+    # driver stopped draining our stdout pipe: a thread blocked in write(), every
+    # other thread queued behind the buffered-writer lock, and the uvicorn event
+    # loop stopped answering HTTP while the container still looked "Up".
+    # json-file with a hard cap keeps that bounded (5 × 10MB = 50MB max).
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   court_data:
