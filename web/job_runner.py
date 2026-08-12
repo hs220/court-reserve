@@ -72,45 +72,51 @@ from scheduler import wait_until
 from web.database import (engine, job_runs, jobs, bookings, accounts, organizations,
                           pending_transfers, row_to_dict, get_days_out)
 
-# Treat any Playwright timeout (Page.goto, wait_for_selector, APIRequestContext.post,
-# etc.) as a transient/retriable condition — the site is just slow or briefly
-# unreachable. We'd rather retry than fail a booking/watch job outright.
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected",
-    # abrupt connection drops mid-request (seen from ReadConsolidated / Cloudflare)
-    "socket hang up", "connection reset", "econnreset", "reset by peer", "err_connection_reset",
-    # upstream/proxy hiccups that return an error page instead of data
-    "502", "503", "504", "bad gateway", "service unavailable", "gateway time"]
+from net_errors import is_network_error as _is_network_error
 
-def _is_network_error(exc: Exception) -> bool:
-    # A JSON decode failure from an API call means the site handed back an HTML error
-    # or Cloudflare challenge page instead of the expected JSON — a transient blip, not
-    # a real bug. Playwright's APIResponse.json() raises json.JSONDecodeError here.
-    if isinstance(exc, json.JSONDecodeError):
-        return True
-    return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
+# A run only fails-and-notifies when something went wrong — often the network itself.
+# Without an explicit timeout, smtplib blocks forever on a half-open connection (the
+# `read ETIMEDOUT` signature), so the alert never lands and never even errors. Bound
+# every attempt and retry a couple of times across a short brownout.
+SMTP_TIMEOUT_SECONDS = 30
+SMTP_ATTEMPTS = 3
+SMTP_RETRY_DELAY_SECONDS = 20
 
 
-def _send_warning_email(subject: str, body: str) -> None:
+def _send_warning_email(subject: str, body: str) -> str:
+    """Best-effort notification email. Returns a short status string describing the
+    outcome ("sent", "not configured", or "failed: ...") so callers can record it."""
     import os, smtplib
     from email.mime.text import MIMEText
     to_addr = os.environ.get("NOTIFY_EMAIL")
     smtp_password = os.environ.get("SMTP_PASSWORD")
     if not to_addr or not smtp_password:
-        return
+        return "not configured (NOTIFY_EMAIL / SMTP_PASSWORD unset)"
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER", to_addr)
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = f"[court-reserve] {subject}"
-        msg["From"] = smtp_user
-        msg["To"] = to_addr
-        with smtplib.SMTP(smtp_host, smtp_port) as s:
-            s.starttls()
-            s.login(smtp_user, smtp_password)
-            s.sendmail(smtp_user, [to_addr], msg.as_string())
-    except Exception as e:
-        print(f"Warning email send failed: {e}")
+
+    last_error = ""
+    for attempt in range(1, SMTP_ATTEMPTS + 1):
+        try:
+            msg = MIMEText(body)
+            msg["Subject"] = f"[court-reserve] {subject}"
+            msg["From"] = smtp_user
+            msg["To"] = to_addr
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT_SECONDS) as s:
+                s.starttls()
+                s.login(smtp_user, smtp_password)
+                s.sendmail(smtp_user, [to_addr], msg.as_string())
+            return "sent" if attempt == 1 else f"sent (attempt {attempt}/{SMTP_ATTEMPTS})"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            print(f"Warning email send failed (attempt {attempt}/{SMTP_ATTEMPTS}): {e}")
+            # Only a transient blip is worth waiting out; a bad password never recovers.
+            if attempt < SMTP_ATTEMPTS and _is_network_error(e):
+                time.sleep(SMTP_RETRY_DELAY_SECONDS)
+            else:
+                break
+    return f"failed: {last_error}"
 
 
 def _parse_preferred_times(time_val) -> list[str]:
@@ -174,10 +180,29 @@ def _finish_run(run_id: int, status: str, log: str):
         _notify_run_failed(run_id, log)
 
 
+def _append_run_log(run_id: int, line: str) -> None:
+    """Append one line to a run's stored log. Used for notes produced after the run's
+    stdout capture has already been closed, so they still show up on /runs/{id}."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                update(job_runs)
+                .where(job_runs.c.id == run_id)
+                .values(log_text=job_runs.c.log_text + f"\n{line}")
+            )
+    except Exception as e:
+        print(f"Could not append to run #{run_id} log: {e}")
+
+
 def _notify_run_failed(run_id: int, log: str) -> None:
     """Email a heads-up when a run ends in the failed state. Best-effort: never let a
     notification problem propagate into the job runner. No-op unless NOTIFY_EMAIL /
-    SMTP_PASSWORD are configured (see _send_warning_email)."""
+    SMTP_PASSWORD are configured (see _send_warning_email).
+
+    The outcome is appended to the run's log. This runs after the caller has already
+    snapshotted stdout into the run record, so a plain print() here would only ever
+    reach container stdout — invisible on the run page, which is exactly where you go
+    looking when an expected alert never arrives."""
     import os
     try:
         with engine.connect() as conn:
@@ -191,7 +216,7 @@ def _notify_run_failed(run_id: int, log: str) -> None:
         tail = "\n".join((log or "").strip().splitlines()[-30:]) or "(no log output)"
         base = os.environ.get("WEB_BASE_URL", "").rstrip("/")
         link = f"{base}/runs/{run_id}" if base else f"(open the web UI → run #{run_id})"
-        _send_warning_email(
+        outcome = _send_warning_email(
             f"Job failed: {job_type} (job #{job_id}, run #{run_id})",
             f"A {job_type} job failed.\n\n"
             f"Job:    #{job_id} ({job_type})\n"
@@ -200,8 +225,10 @@ def _notify_run_failed(run_id: int, log: str) -> None:
             f"Log:    {link}\n\n"
             f"Last log lines:\n{tail}\n",
         )
+        _append_run_log(run_id, f"[failure notification] {outcome}")
     except Exception as e:
         print(f"Failure notification error: {e}")
+        _append_run_log(run_id, f"[failure notification] errored before sending: {e}")
 
 
 def _record_booking(run_id: int, account_id: int, slot, duration_min: int):

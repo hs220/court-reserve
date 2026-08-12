@@ -20,16 +20,11 @@ from booking import (get_available_slots, find_best_slot, book_slot, _org_uses_c
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
                      CourtSelectionRequiredError, SlotNotBookableError)
 from scheduler import wait_until
+from net_errors import is_network_error
 
 PT = pytz.timezone("America/Los_Angeles")
 
-# Treat any Playwright timeout (Page.goto, wait_for_selector, APIRequestContext.post,
-# etc.) as a transient/retriable condition — the site is just slow or briefly
-# unreachable. We'd rather retry than fail a booking/watch job outright.
-_NETWORK_ERROR_MARKERS = ["eai_again", "getaddrinfo", "net::", "connection refused", "networkerror", "eof", "timeout", "timed out", "err_timed_out", "err_connection", "err_network", "err_name_not_resolved", "err_internet_disconnected"]
-
-def _is_network_error(exc: Exception) -> bool:
-    return any(k in str(exc).lower() for k in _NETWORK_ERROR_MARKERS)
+_is_network_error = is_network_error
 
 
 def _ts() -> str:
@@ -60,7 +55,10 @@ def _send_failure_email(subject: str, body: str) -> None:
         msg["Subject"] = f"[court-reserve] {subject}"
         msg["From"] = smtp_user
         msg["To"] = to_addr
-        with smtplib.SMTP(smtp_host, smtp_port) as s:
+        # Bounded: without a timeout smtplib blocks indefinitely on a half-open
+        # connection, and a failure notification is most needed exactly when the
+        # network is flaky. See SMTP_TIMEOUT_SECONDS in web/job_runner.py.
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
             s.starttls()
             s.login(smtp_user, smtp_password)
             s.sendmail(smtp_user, [to_addr], msg.as_string())
