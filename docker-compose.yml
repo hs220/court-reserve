@@ -75,7 +75,13 @@ services:
       AUTOHEAL_CONTAINER_LABEL: autoheal
       AUTOHEAL_INTERVAL: 30           # seconds between health polls
       AUTOHEAL_START_PERIOD: 300      # grace after autoheal itself starts (NAS reboot)
-      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 30
+      # A wedged app can't service SIGTERM, so Docker will wait out this whole
+      # timeout before SIGKILL -- that's the case we're here for. Keep it short,
+      # and keep CURL_TIMEOUT well above it: with both at the default 30s the
+      # restart call times out exactly as the restart lands, and autoheal logs a
+      # failure for a restart that actually worked (observed in testing).
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 10
+      CURL_TIMEOUT: 60
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     logging:
