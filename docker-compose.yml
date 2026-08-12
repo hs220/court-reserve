@@ -21,6 +21,26 @@ services:
       TZ: America/Los_Angeles
       DATA_DIR: /data
     restart: unless-stopped
+    # Playwright's chromium children reparent to PID 1 when they exit. Plain python
+    # as PID 1 never reaps them, so they pile up as zombies (6941 of them by the time
+    # anyone looked). tini reaps them.
+    init: true
+    # The outage this guards against had the container reporting "Up" the whole time:
+    # PID 1 was alive and the port accepted TCP, but no HTTP request ever completed.
+    # Only a real request distinguishes those, so hit an actual endpoint and bound it.
+    # NOTE: Docker does NOT restart a container for going unhealthy -- `restart:
+    # unless-stopped` reacts to *exit*, not health. This surfaces the state (docker ps
+    # / DSM both show "unhealthy"); acting on it automatically needs a watchdog,
+    # which is not wired up yet -- see "Monitoring" in CLAUDE.md.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--timeout=10",
+             "--output-document=/dev/null", "http://localhost:8080/"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      # Startup reschedules every active watch job, each launching its own browser,
+      # so first paint is slow. Don't let that count as failure.
+      start_period: 180s
     # Synology's default `db` log driver has no rotation. Long-running watch jobs
     # print a poll line every ~60s each, so over weeks the log store grew until the
     # driver stopped draining our stdout pipe: a thread blocked in write(), every
