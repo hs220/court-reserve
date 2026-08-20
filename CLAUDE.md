@@ -111,6 +111,25 @@ Guards now in `docker-compose.yml`:
 `deploy.sh` starts `web autoheal` explicitly; a bare `compose up` would also fire the
 one-shot CLI runner.
 
+A job can also fail *while looking healthy*: run #331 polled for 23 hours with every
+poll failing and stayed green, because a per-poll error restarts the browser session and
+the session restart reset the error streak. Retrying forever is not resilience — a run
+that never ends never notifies, so an endlessly-retrying job is indistinguishable from a
+working one.
+
+`net_errors.ErrorStreak` is the shared policy for that: `record()` every failed attempt,
+`clear()` on every success, and it returns True once the streak has lasted 30 minutes
+(min 3 attempts). It is deliberately blind to what the error *is* — a waiver gate, an
+expired login, a DNS outage all mean the same thing after half an hour. Both `run_watch`
+and the CLI's `watch_and_book` retry loops use it; `run_watch` warns by email at 20
+consecutive failures, then ends the run as `failed`, which is what sends the alert. The
+trade-off is deliberate: a 30-minute network outage now kills a watch instead of riding
+it out. Bounded loops (`run_book_next`'s `MAX_NET_RETRIES`) already ended in a failure
+and don't need it.
+
+`get_available_slots` also reports the response's title/text when the feed answers with
+HTML, so the log says *what* the site wanted instead of only "Expecting value: line 3".
+
 **Gaps that remain:**
 - All failure alerting goes through the app itself, so an app-down event is exactly
   what it cannot report. An out-of-band check (NAS cron curling the endpoint) is the

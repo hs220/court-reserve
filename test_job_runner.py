@@ -26,6 +26,7 @@ from sqlalchemy import insert
 from web.database import accounts, engine, init_db, job_runs, jobs, organizations
 from booking import Slot, find_best_slot
 import web.job_runner as jr
+from net_errors import ErrorStreak
 from web.job_runner import (_append_run_log, _deadline_timeout_minutes, _finish_run,
                             _is_network_error, _live_times, _notify_run_failed,
                             _parse_preferred_times, _send_warning_email, _start_run,
@@ -337,6 +338,175 @@ class RunWatchCancelPathTests(unittest.TestCase):
     def test_the_event_is_retracted_afterwards(self):
         self._run()
         self.assertFalse(request_cancel(self.job_id))
+
+
+class _AdvancingClock:
+    """A monotonic clock that jumps forward on every read, so a test can cross the
+    30-minute failure window in milliseconds. sleep() is a no-op for the same reason."""
+
+    def __init__(self, step=60):
+        self.now = 0.0
+        self.step = step
+
+    def monotonic(self):
+        self.now += self.step
+        return self.now
+
+    def sleep(self, _seconds):
+        pass
+
+
+class _ScriptedEvent:
+    """Stand-in for the cancel Event: never blocks, and can be flipped to "cancelled"
+    once the poll loop has run enough times."""
+
+    def __init__(self):
+        self._set = False
+
+    def is_set(self):
+        return self._set
+
+    def set(self):
+        self._set = True
+
+    def clear(self):
+        self._set = False
+
+    def wait(self, _timeout=None):
+        return self._set
+
+
+class ErrorStreakTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.streak = ErrorStreak(clock=lambda: self.now)
+
+    def test_a_short_streak_is_not_fatal(self):
+        for _ in range(50):
+            self.assertFalse(self.streak.record(RuntimeError("blip")))
+
+    def test_it_gives_up_once_the_streak_outlasts_the_window(self):
+        self.assertFalse(self.streak.record(RuntimeError("x")))
+        self.now = 30 * 60
+        self.assertFalse(self.streak.record(RuntimeError("x")), "two failures is too thin")
+        self.assertTrue(self.streak.record(RuntimeError("x")))
+
+    def test_success_clears_it(self):
+        self.streak.record(RuntimeError("x"))
+        self.now = 30 * 60
+        self.streak.clear()
+        self.assertEqual(self.streak.count, 0)
+        self.assertEqual(self.streak.elapsed, 0.0)
+        self.assertFalse(self.streak.record(RuntimeError("x")))
+
+    def test_it_warns_once_per_streak(self):
+        for n in range(1, 40):
+            self.streak.record(RuntimeError("x"))
+            self.assertEqual(self.streak.should_warn(), n == 20, f"attempt {n}")
+        self.streak.clear()
+        for _ in range(20):
+            self.streak.record(RuntimeError("x"))
+        self.assertTrue(self.streak.should_warn(), "a fresh streak warns again")
+
+    def test_describe_carries_the_last_error(self):
+        self.streak.record(RuntimeError("waiver page"))
+        self.now = 600
+        self.streak.record(ValueError("dns died"))
+        self.assertEqual(self.streak.describe(),
+                         "2 consecutive failures over 10m; last error: dns died")
+
+    def test_any_exception_counts(self):
+        # The policy is deliberately blind to the kind of error — what makes a streak
+        # fatal is that it isn't clearing.
+        self.streak.record(ValueError("nothing to do with the network"))
+        self.now = 30 * 60
+        self.streak.record(KeyboardInterrupt())
+        self.assertTrue(self.streak.record(json.JSONDecodeError("Expecting value", "x", 0)))
+
+
+class WatchGivesUpOnARepeatingErrorTests(unittest.TestCase):
+    """Run #331 polled for 23 hours while every single poll failed the same way,
+    restarting its session 1,151 times and reporting nothing — the run page still said
+    "running". A poll error that keeps repeating has to end the run, whatever it is,
+    because a failed run is the only thing that sends mail."""
+
+    def setUp(self):
+        self.job_id = _cancel_job_id()
+        with engine.begin() as conn:
+            conn.execute(jobs.update().where(jobs.c.id == self.job_id).values(status="active"))
+        self.event = _ScriptedEvent()
+        self.clock = _AdvancingClock()
+        for target, new in [("web.job_runner._register_cancel", lambda _job_id: self.event),
+                            ("web.job_runner.time", self.clock),
+                            ("web.job_runner.ErrorStreak",
+                             lambda **kw: ErrorStreak(clock=self.clock.monotonic, **kw)),
+                            ("web.job_runner.ensure_logged_in", mock.DEFAULT),
+                            ("web.job_runner.wait_until", mock.DEFAULT),
+                            ("web.job_runner.sync_playwright", mock.DEFAULT)]:
+            p = mock.patch(target, new) if new is not mock.DEFAULT else mock.patch(target)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, poll_side_effect):
+        self.polls = 0
+
+        def poll(*_a, **_kw):
+            self.polls += 1
+            self.assertLess(self.polls, 500, "run_watch never terminated")
+            return poll_side_effect(self.polls)
+
+        env = {"NOTIFY_EMAIL": "me@example.com", "SMTP_PASSWORD": "pw"}
+        with mock.patch("web.job_runner.get_available_slots", side_effect=poll), \
+                mock.patch.dict(os.environ, env), \
+                mock.patch("smtplib.SMTP") as smtp:
+            run_watch(self.job_id, _cancel_account_id(), "2026-08-23", "19:30",
+                      duration=120, interval=60, deadline_mode="infinite")
+        with engine.connect() as conn:
+            run = conn.execute(job_runs.select().where(job_runs.c.job_id == self.job_id)
+                               .order_by(job_runs.c.id.desc())).fetchone()
+        return run, smtp
+
+    @staticmethod
+    def _waiver_page_error(_n):
+        # What CourtReserve actually handed back: an HTML page where the feed should be.
+        raise json.JSONDecodeError("Expecting value", "\r\n\r\n<!DOCTYPE html>", 4)
+
+    def test_a_repeating_poll_error_ends_the_run_as_failed(self):
+        run, _ = self._run(self._waiver_page_error)
+        self.assertEqual(run.status, "failed")
+        self.assertIn("Giving up", run.log_text)
+
+    def test_it_notifies(self):
+        run, smtp = self._run(self._waiver_page_error)
+        smtp.assert_called()
+        self.assertIn("[failure notification] sent", run.log_text)
+
+    def test_the_jobs_row_is_marked_failed(self):
+        self._run(self._waiver_page_error)
+        with engine.connect() as conn:
+            job = conn.execute(jobs.select().where(jobs.c.id == self.job_id)).fetchone()
+        self.assertEqual(job.status, "failed")
+
+    def test_the_streak_survives_the_session_restart(self):
+        # The original bug: the streak was reset every time a session was established,
+        # and a per-poll failure restarts the session — so it never got past 1 and the
+        # 20-error warning never fired either.
+        run, _ = self._run(self._waiver_page_error)
+        self.assertIn("failed polls: 20", run.log_text)
+
+    def test_a_recovering_job_keeps_watching(self):
+        # Errors that do clear must not accumulate into a failure: only an unbroken
+        # streak counts.
+        def flaky(n):
+            if n > 60:
+                self.event.set()          # stand in for the user pausing the job
+            if n % 3:
+                raise json.JSONDecodeError("Expecting value", "x", 0)
+            return []
+        run, smtp = self._run(flaky)
+        self.assertEqual(run.status, "cancelled")
+        self.assertNotIn("Giving up", run.log_text)
+        smtp.assert_not_called()
 
 
 def _cancel_account_id():

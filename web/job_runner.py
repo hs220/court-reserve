@@ -72,7 +72,7 @@ from scheduler import wait_until
 from web.database import (engine, job_runs, jobs, bookings, accounts, organizations,
                           pending_transfers, row_to_dict, get_days_out)
 
-from net_errors import is_network_error as _is_network_error
+from net_errors import ErrorStreak, is_network_error as _is_network_error
 
 # ── Cooperative cancellation ──────────────────────────────────────────────────
 # A watch job polls for days inside a background thread. APScheduler's remove_job()
@@ -774,8 +774,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
     main account. When the probe secures the court, a pending_transfers row is created
     and (if auto_transfer) the court is immediately cancelled from the probe and re-booked
     on the main account; otherwise it waits for the manual Transfer button.
-    Transient network/timeout errors restart the browser session automatically.
-    After 20 consecutive errors a warning email is sent, but the job keeps running.
+    Transient network/timeout errors restart the browser session automatically, but not
+    forever: after 20 consecutive failed polls a warning email goes out, and once every
+    poll has failed for 30 minutes straight (see net_errors.ErrorStreak) the run ends as
+    "failed" so the usual failure notification fires. Retrying an error that never
+    clears is indistinguishable, from the outside, from a job that is working.
 
     Cancellable: editing, pausing or deleting the job sets this run's Event (see
     request_cancel) and the poll loop winds down at its next check instead of
@@ -829,8 +832,12 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
             release_hour, release_minute, 0,
         ))
 
-        WARNING_THRESHOLD = 20
-        consecutive_errors = 0
+        # A watch job whose every poll fails is worse than a dead one: it still reads
+        # "running" on the runs page, so nothing ever tells you the court isn't being
+        # watched. Whatever the polls are failing on, half an hour of solid failure
+        # means the job isn't working — end the run so the failure email goes out.
+        streak = ErrorStreak()
+        last_poll_error = None  # what the inner poll loop broke on, for the outer handler
         done = False  # set True on terminal exits (success / non-retriable error / deadline)
 
         with _capture(buf):
@@ -840,6 +847,21 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
             print(f"watch: polling for {time_desc} on {target_date_iso} (interval={interval}s, {deadline_desc}, ~{timeout_minutes}m remaining)")
 
             started = time.monotonic()
+
+            def note_poll_error(exc, ts) -> bool:
+                """Record one failed poll. Returns True when the job should stop: the
+                error, whatever it is, has not cleared in half an hour of retrying."""
+                if streak.record(exc):
+                    print(f"[{ts}] Giving up — retrying is not clearing this: {streak.describe()}")
+                    return True
+                if streak.should_warn():
+                    _send_warning_email(
+                        f"Watch job warning — {streak.count} consecutive errors",
+                        f"Watch job #{job_id} polling for {time_desc} on {target_date_iso} "
+                        f"has hit {streak.describe()}\n\n"
+                        f"Still running; it will give up and fail if this keeps up.",
+                    )
+                return False
 
             while not done:  # outer session-retry loop
                 try:
@@ -867,7 +889,11 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                             probe_page = booking_page
 
                         probe_label = (probe_account.get("label") or probe_account["email"]) if probe_account else (account.get("label") or account["email"])
-                        consecutive_errors = 0  # session established — reset streak
+                        # NOTE: the streak is deliberately NOT cleared here. Establishing
+                        # a session proves nothing — a poll that fails on every session in
+                        # turn cleared it here on every restart, which is exactly how run
+                        # #331 held a streak of 1 for 23 hours and never warned. Only a
+                        # poll that actually returns slots clears it (see below).
 
                         while not done:  # poll loop
                             if cancel_event.is_set():
@@ -884,8 +910,12 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                     # Break inner loop cleanly; outer try/else will restart session.
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
                                     print(f"[{ts}] Network error during poll — restarting session: {exc}")
+                                    last_poll_error = exc
                                     break
                                 raise
+
+                            # A poll that came back is the only thing that clears the streak.
+                            streak.clear()
 
                             # For picker orgs (Santa Clara), the feed is a useful cheap
                             # pre-filter: a slot can be open for its 30-min interval yet lack a
@@ -1006,18 +1036,13 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
 
                 except Exception as exc:
                     if _is_network_error(exc) and not done:
-                        consecutive_errors += 1
                         ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
-                        print(f"[{ts}] Transient error (streak={consecutive_errors}): {exc}")
-                        if consecutive_errors >= WARNING_THRESHOLD:
-                            _send_warning_email(
-                                f"Watch job warning — {consecutive_errors} consecutive errors",
-                                f"Watch job #{job_id} polling for {time_desc} on {target_date_iso} "
-                                f"has hit {consecutive_errors} consecutive transient errors.\n\n"
-                                f"Last error:\n{exc}\n\nThe job is still running.",
-                            )
-                            consecutive_errors = 0
-                        if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
+                        give_up = note_poll_error(exc, ts)
+                        print(f"[{ts}] Transient error (streak={streak.count}): {exc}")
+                        if give_up:
+                            status = "failed"
+                            done = True
+                        elif timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
                             print(f"[{ts}] Deadline reached during error recovery — stopping.")
                             done = True
                         else:
@@ -1036,21 +1061,16 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                     # sync_playwright exited without exception: inner poll loop broke due to a
                     # per-poll network error (not a session-setup exception). Restart session.
                     if not done:
-                        consecutive_errors += 1
                         ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
-                        if consecutive_errors >= WARNING_THRESHOLD:
-                            _send_warning_email(
-                                f"Watch job warning — {consecutive_errors} consecutive errors",
-                                f"Watch job #{job_id} polling for {time_desc} on {target_date_iso} "
-                                f"has hit {consecutive_errors} consecutive transient errors. Still running.",
-                            )
-                            consecutive_errors = 0
-                        if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
+                        if note_poll_error(last_poll_error, ts):
+                            status = "failed"
+                            done = True
+                        elif timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
                             done = True
                         else:
                             jitter = random.uniform(-0.2 * interval, 0.2 * interval)
                             wait = interval + jitter
-                            print(f"[{ts}] Session restarting in {wait:.0f}s...")
+                            print(f"[{ts}] Session restarting in {wait:.0f}s (failed polls: {streak.count})...")
                             _finish_run(run_id, "running", buf.getvalue())
                             if cancel_event.wait(wait):
                                 print(f"[{ts}] Cancelled before session restart — stopping.")

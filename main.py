@@ -20,7 +20,7 @@ from booking import (get_available_slots, find_best_slot, book_slot, _org_uses_c
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
                      CourtSelectionRequiredError, SlotNotBookableError)
 from scheduler import wait_until
-from net_errors import is_network_error
+from net_errors import ErrorStreak, is_network_error
 
 PT = pytz.timezone("America/Los_Angeles")
 
@@ -72,15 +72,33 @@ def watch_and_book(page, probe_page, target_date: date, target_time: str, durati
     """Poll for an available slot and book it. probe_page is used for availability checks
     (may be a different account); page is used for the actual booking."""
     started = time.monotonic()
+    # Retry transient failures, but not forever: a watch whose every poll fails looks
+    # exactly like one that's working — it just keeps printing and never books anything.
+    streak = ErrorStreak()
     while True:
         try:
             slots = get_available_slots(probe_page, target_date, org) if org else get_available_slots(probe_page, target_date)
         except Exception as exc:
-            if _is_network_error(exc):
-                print(f"[{_ts()}] Network error checking slots — will retry in {interval}s... ({exc})")
-                time.sleep(interval)
-                continue
-            raise
+            if not _is_network_error(exc):
+                raise
+            if streak.record(exc):
+                print(f"[{_ts()}] Giving up — retrying is not clearing this: {streak.describe()}")
+                _send_failure_email(
+                    f"Watch gave up on {target_time} for {target_date}",
+                    f"The watch for {target_time} on {target_date} stopped polling after "
+                    f"{streak.describe()}\n\nNo court was booked.",
+                )
+                return False
+            print(f"[{_ts()}] Network error checking slots (streak={streak.count}) — "
+                  f"will retry in {interval}s... ({exc})")
+            # The deadline still applies while erroring; without this the error path
+            # skips the timeout check at the bottom of the loop and polls forever.
+            if timeout_minutes > 0 and (time.monotonic() - started) >= timeout_minutes * 60:
+                print(f"[{_ts()}] Timeout after {timeout_minutes}m — no slot found at {target_time} on {target_date}.")
+                return False
+            time.sleep(interval)
+            continue
+        streak.clear()
 
         match = next((s for s in slots if s.start_time == target_time and not s.is_wait_list), None)
         if match:

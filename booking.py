@@ -28,6 +28,18 @@ class CourtSelectionRequiredError(BookingError):
     terminal failure — it just means a contiguous court isn't available *right now*, so
     the caller should keep watching until one frees up for the whole window."""
 
+class FeedNotJsonError(json.JSONDecodeError):
+    """ReadConsolidated answered with something that isn't the slot feed: an HTML error
+    page, a Cloudflare challenge, an expired-session redirect, or an app-level gate such
+    as an unsigned waiver.
+
+    It subclasses json.JSONDecodeError on purpose so the existing retry classification in
+    net_errors.py keeps treating it as transient. What it adds is a message you can act
+    on: run #331 logged "Expecting value: line 3 column 1 (char 4)" 1,151 times over 23
+    hours, which says nothing about *why* — the answer (a waiver waiting to be signed)
+    was sitting in the response body we threw away."""
+
+
 class SlotNotBookableError(BookingError):
     """Clicking the slot cell never opened the create-reservation modal, even after
     several retries. The cell exists in the grid but isn't bookable — typically the
@@ -145,6 +157,38 @@ def _build_json_data(target_date: date, org: OrgConfig) -> str:
     return json.dumps(payload)
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1>", re.I | re.S)
+
+
+def _body_summary(response, limit: int = 200) -> str:
+    """One-line, log-safe description of a response body: its <title> when it's a page,
+    plus the start of its visible text. Best-effort — never raises."""
+    try:
+        body = response.text()
+    except Exception as exc:
+        return f"(body unavailable: {exc})"
+    title = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    text = " ".join(_TAG_RE.sub(" ", _SCRIPT_RE.sub(" ", body)).split())
+    parts = []
+    if title:
+        parts.append(f"title={' '.join(title.group(1).split())!r}")
+    if text:
+        parts.append(text[:limit] + ("…" if len(text) > limit else ""))
+    return " | ".join(parts) or "(empty body)"
+
+
+def _feed_json(response):
+    """response.json(), but turn a non-JSON body into an error that says what came back."""
+    try:
+        return response.json()
+    except json.JSONDecodeError as exc:
+        raise FeedNotJsonError(
+            f"HTTP {response.status} from ReadConsolidated was not JSON — {_body_summary(response)}",
+            exc.doc, exc.pos,
+        ) from exc
+
+
 def get_available_slots(page: Page, target_date: date, org: OrgConfig = DEFAULT_ORG_CONFIG) -> list[Slot]:
     json_data = _build_json_data(target_date, org)
     post_body = f"sort=&group=&filter=&jsonData={quote(json_data)}"
@@ -158,7 +202,7 @@ def get_available_slots(page: Page, target_date: date, org: OrgConfig = DEFAULT_
         },
         data=post_body,
     )
-    data = response.json()
+    data = _feed_json(response)
 
     slots = []
     for item in data.get("Data", []):

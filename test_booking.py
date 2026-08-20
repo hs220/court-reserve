@@ -16,7 +16,7 @@ import pytz
 from booking import (
     Slot, slot_has_window, find_best_slot,
     _parse_ms, _build_json_data, _classify_booking_error, _org_uses_court_picker,
-    match_reservation_id,
+    match_reservation_id, _feed_json, FeedNotJsonError,
     OrgConfig, BookingError, BookingWindowError,
     NoAvailableCourtsError, AlreadyBookedError, CourtSelectionRequiredError,
 )
@@ -345,6 +345,61 @@ class OrgCourtPickerTests(unittest.TestCase):
     def test_unknown_org_defaults_to_no_picker(self):
         org = OrgConfig("99999", "0", "0")
         self.assertFalse(_org_uses_court_picker(org))
+
+
+class _FakeResponse:
+    """Stands in for a Playwright APIResponse whose body isn't the JSON feed."""
+
+    def __init__(self, body, status=200, text_raises=False):
+        self.status = status
+        self._body = body
+        self._text_raises = text_raises
+
+    def json(self):
+        return json.loads(self._body)
+
+    def text(self):
+        if self._text_raises:
+            raise RuntimeError("body already consumed")
+        return self._body
+
+
+WAIVER_PAGE = (
+    "\r\n\r\n<!DOCTYPE html><html><head><title>Membership Waiver</title></head>"
+    "<body><script>var a=1;</script><h1>Please sign your waiver</h1>"
+    "<p>A signed waiver is required before booking.</p></body></html>"
+)
+
+
+class FeedNotJsonTests(unittest.TestCase):
+    """Run #331 logged 'Expecting value: line 3 column 1 (char 4)' 1,151 times without
+    once saying that the site was asking for a waiver. The body holds the answer."""
+
+    def test_json_body_passes_through(self):
+        self.assertEqual(_feed_json(_FakeResponse('{"Data": []}')), {"Data": []})
+
+    def test_html_body_reports_status_title_and_text(self):
+        with self.assertRaises(FeedNotJsonError) as cm:
+            _feed_json(_FakeResponse(WAIVER_PAGE))
+        msg = str(cm.exception)
+        self.assertIn("HTTP 200", msg)
+        self.assertIn("Membership Waiver", msg)
+        self.assertIn("Please sign your waiver", msg)
+        self.assertNotIn("var a=1", msg)   # scripts are noise, not content
+
+    def test_it_stays_a_json_decode_error(self):
+        # net_errors.is_network_error keys off the type; breaking that would turn every
+        # Cloudflare blip into a hard failure.
+        from net_errors import is_network_error
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            _feed_json(_FakeResponse(WAIVER_PAGE))
+        self.assertTrue(is_network_error(cm.exception))
+
+    def test_unreadable_body_still_raises_cleanly(self):
+        with self.assertRaises(FeedNotJsonError) as cm:
+            _feed_json(_FakeResponse(WAIVER_PAGE, status=503, text_raises=True))
+        self.assertIn("HTTP 503", str(cm.exception))
+        self.assertIn("body unavailable", str(cm.exception))
 
 
 if __name__ == "__main__":
