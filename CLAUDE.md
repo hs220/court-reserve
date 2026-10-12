@@ -159,4 +159,17 @@ The tool automates CourtReserve's booking UI via Playwright. There is no officia
 - macOS: `com.courtreserve.booking.plist` loaded via `launchctl` fires at 11:50 AM PT daily; logs to `/tmp/court-reserve.log`
 - Docker/Synology: `docker-compose.yml` + `Dockerfile` with `TZ=America/Los_Angeles` baked in
 
+**Home agent API (`web/routes/agent_api.py`, `/api/agent/v1`):** a narrow JSON API for
+the home agent's `courtreserve` connector (hs220/home-agent). It reads jobs, runs,
+reservations, clubs and live availability; creates one-shot booking/watch jobs; pauses
+and resumes jobs; and re-syncs reservations. Nothing else — no delete/edit/run-now, no
+cancel or transfer, no account or org management. Auth is a bearer token whose SHA-256
+is `AGENT_API_TOKEN_SHA256` in `.env` (`python scripts/mint_agent_token.py`); unset
+means 503. Responses never carry a password, email or session file, and run text goes
+through `_redactor`. The connector reaches it as `court-reserve-web:8080` on the
+`court-reserve-share` network, which only `web` joins. Job creation, pause and resume
+share `create_book_next_job` / `create_watch_job` / `pause_job_by_id` /
+`resume_job_by_id` in `web/routes/jobs.py` with the form routes — change them there.
+Tests: `test_agent_api.py`.
+
 **Config (`config.yaml`):** `preferred_times`, `default_duration`, `days_out` (7=non-resident, 8=resident). Credentials come from `.env` (`CR_EMAIL`, `CR_PASSWORD`).

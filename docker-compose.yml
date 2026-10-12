@@ -55,6 +55,13 @@ services:
     # Opts this container in to the autoheal watchdog below.
     labels:
       autoheal: "true"
+    # `share` is how the home agent's connector (hs220/home-agent, `courtreserve`)
+    # reaches the agent API at court-reserve-web:8080 without a published port. Only
+    # this service is on it; the API behind it wants a bearer token (web/routes/agent_api.py).
+    networks:
+      default: {}
+      share:
+        aliases: [court-reserve-web]
 
   # Watchdog: restarts any container labelled autoheal=true when its healthcheck
   # reports unhealthy. Needed because Docker itself does NOT act on health status --
@@ -92,3 +99,9 @@ services:
 
 volumes:
   court_data:
+
+networks:
+  # Owned here; home-agent's connector joins it as `external`, and its deploy skips
+  # the connector when this network is absent (court-reserve down).
+  share:
+    name: court-reserve-share

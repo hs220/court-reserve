@@ -139,6 +139,33 @@ async def list_recurring(request: Request):
     })
 
 
+def create_book_next_job(account_id: int, org_db_id: int, date: str, time: str,
+                         duration: int, run_at: str = "") -> int:
+    """Insert and schedule a one-shot booking job. Shared by the form and the agent API,
+    so both fire at the same moment: 2 min before the booking window opens, or at once
+    when it already has."""
+    with engine.connect() as conn:
+        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
+
+    if not run_at:
+        run_at = _watch_window_run_at(account_id, org, date)
+
+    params = {"date": date, "time": time, "duration": duration, "run_at": run_at}
+    with engine.begin() as conn:
+        result = conn.execute(jobs.insert().values(
+            account_id=account_id,
+            org_id=org_db_id,
+            type="book_next",
+            params=json.dumps(params),
+            status="active",
+            cron_expr="",
+        ))
+        job_id = result.inserted_primary_key[0]
+
+    apscheduler_setup.schedule_book_next(job_id, account_id, params)
+    return job_id
+
+
 @router.post("/jobs/book_next")
 async def create_book_next(
     account_id: int = Form(...),
@@ -148,35 +175,35 @@ async def create_book_next(
     duration: int = Form(0),
     run_at: str = Form(""),
 ):
+    create_book_next_job(account_id, org_db_id, date, time, duration, run_at)
+    return RedirectResponse("/jobs", status_code=303)
+
+
+def create_watch_job(account_id: int, org_db_id: int, date: str, time: str, duration: int,
+                     interval: int, deadline_mode: str, probe_id: int | None = None,
+                     auto_xfer: bool = False) -> int:
+    """Insert and schedule a watch job. Shared by the form and the agent API."""
     with engine.connect() as conn:
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
 
-    if not run_at:
-        tz = pytz.timezone(org["timezone"])
-        days_out = get_days_out(account_id, org)
-        fire_date = date_cls.fromisoformat(date) - timedelta(days=days_out)
-        fire_dt = tz.localize(datetime(
-            fire_date.year, fire_date.month, fire_date.day,
-            org["release_hour"], org["release_minute"], 0,
-        )) - timedelta(minutes=2)
-        if fire_dt > datetime.now(tz):
-            run_at = fire_dt.strftime("%Y-%m-%dT%H:%M")
+    run_at = _watch_window_run_at(account_id, org, date)
 
-    params = json.dumps({"date": date, "time": time, "duration": duration, "run_at": run_at})
+    params = {"date": date, "time": time, "duration": duration,
+              "interval": interval, "deadline_mode": deadline_mode,
+              "probe_account_id": probe_id, "auto_transfer": auto_xfer, "run_at": run_at}
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
             account_id=account_id,
             org_id=org_db_id,
-            type="book_next",
-            params=params,
+            type="watch",
+            params=json.dumps(params),
             status="active",
             cron_expr="",
         ))
         job_id = result.inserted_primary_key[0]
 
-    apscheduler_setup.schedule_book_next(job_id, account_id,
-                                         {"date": date, "time": time, "duration": duration, "run_at": run_at})
-    return RedirectResponse("/jobs", status_code=303)
+    apscheduler_setup.schedule_watch(job_id, account_id, params)
+    return job_id
 
 
 @router.post("/jobs/watch")
@@ -194,31 +221,8 @@ async def create_watch(
     probe_id = int(probe_account_id) if probe_account_id.strip() else None
     # Auto-transfer only makes sense with a distinct probe account.
     auto_xfer = bool(auto_transfer.strip()) and probe_id is not None and probe_id != account_id
-
-    with engine.connect() as conn:
-        org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
-
-    run_at = _watch_window_run_at(account_id, org, date)
-
-    params = json.dumps({"date": date, "time": time, "duration": duration,
-                         "interval": interval, "deadline_mode": deadline_mode,
-                         "probe_account_id": probe_id, "auto_transfer": auto_xfer, "run_at": run_at})
-    with engine.begin() as conn:
-        result = conn.execute(jobs.insert().values(
-            account_id=account_id,
-            org_id=org_db_id,
-            type="watch",
-            params=params,
-            status="active",
-            cron_expr="",
-        ))
-        job_id = result.inserted_primary_key[0]
-
-    apscheduler_setup.schedule_watch(job_id, account_id,
-                                     {"date": date, "time": time, "duration": duration,
-                                      "interval": interval, "deadline_mode": deadline_mode,
-                                      "probe_account_id": probe_id, "auto_transfer": auto_xfer,
-                                      "run_at": run_at})
+    create_watch_job(account_id, org_db_id, date, time, duration, interval, deadline_mode,
+                     probe_id, auto_xfer)
     return RedirectResponse("/jobs", status_code=303)
 
 
@@ -289,8 +293,9 @@ async def create_recurrent_watch(
     return RedirectResponse("/recurring", status_code=303)
 
 
-@router.post("/jobs/{job_id}/pause")
-async def pause_job(job_id: int):
+def pause_job_by_id(job_id: int) -> dict:
+    """Stop a job's future firings and its in-flight run. Shared by the form and the
+    agent API. Returns the job row as it was before pausing."""
     from web.job_runner import request_cancel
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
@@ -300,11 +305,12 @@ async def pause_job(job_id: int):
     apscheduler_setup.pause_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
         conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="paused"))
-    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
+    return j
 
 
-@router.post("/jobs/{job_id}/resume")
-async def resume_job(job_id: int):
+def resume_job_by_id(job_id: int) -> dict:
+    """Re-arm a paused job. Shared by the form and the agent API. Returns the job row
+    as it was before resuming."""
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
     apscheduler_setup.resume_job(j.get("apscheduler_id", ""))
@@ -323,6 +329,18 @@ async def resume_job(job_id: int):
         # which is exactly what resuming a live watch should do.
         apscheduler_setup.schedule_watch(job_id, j["account_id"],
                                          json.loads(j.get("params") or "{}"))
+    return j
+
+
+@router.post("/jobs/{job_id}/pause")
+async def pause_job(job_id: int):
+    j = pause_job_by_id(job_id)
+    return RedirectResponse(_job_list_url(j["type"]), status_code=303)
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: int):
+    j = resume_job_by_id(job_id)
     return RedirectResponse(_job_list_url(j["type"]), status_code=303)
 
 
