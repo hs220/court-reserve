@@ -316,16 +316,24 @@ def resume_job_by_id(job_id: int) -> dict:
     as it was before resuming."""
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
-    apscheduler_setup.resume_job(j.get("apscheduler_id", ""))
-    with engine.begin() as conn:
-        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="active"))
 
     # A one-shot watch fires from a DateTrigger that is spent once it has run, so
     # un-pausing the trigger resumes nothing. Pausing used to leave the poll thread
     # alive, which hid this; now that pause really stops it, resume has to put a
     # replacement run back or the job sits "active" while watching nothing.
+    #
+    # The old trigger is removed rather than un-paused: a watch paused before its
+    # trigger fired still has it, and un-pausing it as well as scheduling a new one
+    # left two triggers -- two runs polling, and booking, for one job. (They could also
+    # collide on id when resumed in the same second the job was scheduled.)
     # Recurrent jobs are deliberately excluded: their cron trigger is never spent, so
-    # resume_job above is enough and rescheduling would leave two triggers firing.
+    # un-pausing it is enough and rescheduling would leave two triggers firing.
+    if j["type"] == "watch":
+        apscheduler_setup.remove_job(j.get("apscheduler_id", ""))
+    else:
+        apscheduler_setup.resume_job(j.get("apscheduler_id", ""))
+    with engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="active"))
     if j["type"] == "watch":
         # run_at may name a moment that has passed. misfire_grace_time is None, so
         # APScheduler runs a past-dated trigger immediately rather than dropping it --
