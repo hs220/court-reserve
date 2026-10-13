@@ -28,6 +28,7 @@ def _do_sync() -> dict:
     added = 0
     updated = 0
     removed = 0
+    kept = 0
     errors = []
 
     for acc in accs_list:
@@ -91,15 +92,24 @@ def _do_sync() -> dict:
 
         # Remove local bookings that are no longer on CourtReserve.
         # Only look at future dates — the API returns ~30 days ahead so anything
-        # in that window missing from live_keys has been cancelled.
+        # in that window missing from live_keys has been cancelled. Reaching here means
+        # the list was actually read (get_my_reservations raises otherwise, and the
+        # except above skips this account), so an empty list really is empty.
+        #
+        # Rows a job booked (job_run_id set) are kept even so: they are the only link
+        # from a job to the court it got, and a re-sync re-adds a court without it. One
+        # read missing them is not worth losing that; if the court really was cancelled,
+        # delete the row on the Reservations page.
         today_str = date_cls.today().isoformat()
         with engine.connect() as conn:
             future_rows = conn.execute(text("""
-                SELECT id, date, start_time FROM bookings
+                SELECT id, date, start_time, job_run_id FROM bookings
                 WHERE account_id = :aid AND date >= :today
             """), {"aid": acc["id"], "today": today_str}).fetchall()
 
-        stale_ids = [r[0] for r in future_rows if (r[1], r[2]) not in live_keys]
+        missing = [r for r in future_rows if (r[1], r[2]) not in live_keys]
+        kept += sum(1 for r in missing if r[3] is not None)
+        stale_ids = [r[0] for r in missing if r[3] is None]
         if stale_ids:
             placeholders = ",".join(f":id{i}" for i in range(len(stale_ids)))
             params = {f"id{i}": v for i, v in enumerate(stale_ids)}
@@ -107,7 +117,7 @@ def _do_sync() -> dict:
                 conn.execute(text(f"DELETE FROM bookings WHERE id IN ({placeholders})"), params)
             removed += len(stale_ids)
 
-    return {"added": added, "updated": updated, "removed": removed, "errors": errors}
+    return {"added": added, "updated": updated, "removed": removed, "kept": kept, "errors": errors}
 
 
 @router.get("/reservations", response_class=HTMLResponse)

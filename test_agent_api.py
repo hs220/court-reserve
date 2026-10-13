@@ -84,13 +84,21 @@ class AgentApiTestCase(unittest.TestCase):
                 label="", email=EMAIL, password=PASSWORD, session_file="")).inserted_primary_key[0]
             cls.link_id = conn.execute(insert(account_orgs).values(
                 account_id=cls.acc_id, org_id=cls.org_id, is_resident=True)).inserted_primary_key[0]
+            # A club nobody is linked to, and an account linked to nothing.
+            cls.lonely_org_id = conn.execute(insert(organizations).values(
+                name="Other Club", org_id="99998", scheduler_id="1", cost_type_id="2",
+                timezone="America/Los_Angeles")).inserted_primary_key[0]
+            cls.stray_acc_id = conn.execute(insert(accounts).values(
+                label="Stray", email="stray@example.com", password="StrayPw999",
+                session_file="")).inserted_primary_key[0]
 
     @classmethod
     def tearDownClass(cls):
         with engine.begin() as conn:
             conn.execute(account_orgs.delete().where(account_orgs.c.id == cls.link_id))
-            conn.execute(accounts.delete().where(accounts.c.id == cls.acc_id))
-            conn.execute(organizations.delete().where(organizations.c.id == cls.org_id))
+            conn.execute(accounts.delete().where(accounts.c.id.in_([cls.acc_id, cls.stray_acc_id])))
+            conn.execute(organizations.delete().where(
+                organizations.c.id.in_([cls.org_id, cls.lonely_org_id])))
 
     def setUp(self):
         env = mock.patch.dict(os.environ, {
@@ -118,6 +126,20 @@ class AgentApiTestCase(unittest.TestCase):
                 conn.execute(jobs.delete().where(jobs.c.id == jid))
             conn.execute(bookings.delete().where(
                 (bookings.c.account_id == self.acc_id) & bookings.c.job_run_id.is_(None)))
+
+    def add_run(self, job_id, status="running", log_text=""):
+        with engine.begin() as conn:
+            return conn.execute(insert(job_runs).values(
+                job_id=job_id, status=status, log_text=log_text)).inserted_primary_key[0]
+
+    @staticmethod
+    def set_account(acc_id, **values):
+        with engine.begin() as conn:
+            conn.execute(accounts.update().where(accounts.c.id == acc_id).values(**values))
+
+    def job_status(self, job_id):
+        with engine.connect() as conn:
+            return conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone().status
 
     def add_job(self, type_="watch", status="active", params=None):
         params = params or {"date": future(), "time": "19:00", "duration": 120,
@@ -362,6 +384,231 @@ class PauseResumeTests(AgentApiTestCase):
         for path in (f"/jobs/{jid}/delete", f"/jobs/{jid}/run_now", f"/jobs/{jid}/restart",
                      f"/jobs/{jid}/edit", "/transfers/1/execute", "/accounts"):
             self.assertIn(call("POST", "/api/agent/v1" + path)[0], (404, 405), path)
+
+
+class ReviewFixTests(AgentApiTestCase):
+    """The fixes from the review of court-reserve#4, one or more per finding."""
+
+    # 1. pause must never claim to have stopped a run that can still book.
+
+    def test_pausing_a_booking_job_mid_run_is_refused_and_changes_nothing(self):
+        jid = self.add_job(type_="book_next", status="active",
+                           params={"date": future(), "time": "19:00", "duration": 120})
+        self.add_run(jid, "running")
+        status, body, _ = call("POST", f"/api/agent/v1/jobs/{jid}/pause")
+        self.assertEqual(status, 409)
+        self.assertIn("booking right now", body["detail"])
+        self.assertEqual(self.job_status(jid), "active")
+        self.sched["pause_job"].assert_not_called()
+        self.request_cancel.assert_not_called()
+
+    def test_pausing_a_booking_job_before_it_fires_is_done(self):
+        jid = self.add_job(type_="book_next", status="active",
+                           params={"date": future(), "time": "19:00", "duration": 120})
+        status, body, _ = call("POST", f"/api/agent/v1/jobs/{jid}/pause")
+        self.assertEqual((status, body["status"], body["pause"]), (200, "paused", "done"))
+
+    def test_a_watch_that_stops_when_asked_is_paused(self):
+        jid = self.add_job()
+        rid = self.add_run(jid, "running")
+
+        def thread_notices(job_id):  # what run_watch does at its next check
+            with engine.begin() as conn:
+                conn.execute(job_runs.update().where(job_runs.c.id == rid).values(status="cancelled"))
+        self.request_cancel.side_effect = thread_notices
+        status, body, _ = call("POST", f"/api/agent/v1/jobs/{jid}/pause")
+        self.assertEqual((status, body["status"], body["pause"]), (200, "paused", "done"))
+
+    def test_a_watch_mid_attempt_is_reported_as_stopping_not_paused(self):
+        jid = self.add_job()
+        self.add_run(jid, "running")
+        with mock.patch.object(agent_api, "PAUSE_WAIT_S", 0.3):
+            status, body, _ = call("POST", f"/api/agent/v1/jobs/{jid}/pause")
+        self.assertEqual((status, body["pause"]), (200, "stopping"))
+        # ...and it can't be resumed while that run is still on its way out.
+        self.assertEqual(call("POST", f"/api/agent/v1/jobs/{jid}/resume")[0], 409)
+
+    def test_a_watch_that_books_before_the_pause_lands_says_so(self):
+        jid = self.add_job()
+        rid = self.add_run(jid, "running")
+
+        def it_booked(job_id):  # the run finished first and wrote its own outcome
+            with engine.begin() as conn:
+                conn.execute(job_runs.update().where(job_runs.c.id == rid).values(status="success"))
+                conn.execute(jobs.update().where(jobs.c.id == jid).values(status="completed"))
+        self.request_cancel.side_effect = it_booked
+        status, body, _ = call("POST", f"/api/agent/v1/jobs/{jid}/pause")
+        self.assertEqual((status, body["pause"], body["status"]), (200, "finished_first", "completed"))
+        # The pause must not have written "paused" over the booked job.
+        self.assertEqual(self.job_status(jid), "completed")
+
+    # 2. one spelling of a date.
+
+    def test_compact_and_dashed_dates_are_the_same_day(self):
+        d = future()
+        first = self.created(call("POST", "/api/agent/v1/jobs/booking", self.booking(date=d))[1])
+        self.assertEqual(first["date"], d)
+        status, body, _ = call("POST", "/api/agent/v1/jobs/booking",
+                               self.booking(date=d.replace("-", ""), times=["08:00"]))
+        self.assertEqual(status, 409, body)
+        self.assertIn(f"Job {first['id']}", body["detail"])
+
+    def test_a_compact_date_is_stored_dashed(self):
+        d = future()
+        out = self.created(call("POST", "/api/agent/v1/jobs/watch",
+                                self.booking(date=d.replace("-", "")))[1])
+        self.assertEqual(out["date"], d)
+        self.assertEqual(self.sched["schedule_watch"].call_args.args[2]["date"], d)
+
+    # 3. no booking job and watch for the same day.
+
+    def test_a_watch_for_a_day_a_booking_job_covers_is_refused(self):
+        first = self.created(call("POST", "/api/agent/v1/jobs/booking", self.booking())[1])
+        status, body, _ = call("POST", "/api/agent/v1/jobs/watch", self.booking(times=["08:00"]))
+        self.assertEqual(status, 409)
+        self.assertIn(f"Job {first['id']} (booking", body["detail"])
+
+    def test_a_booking_job_for_a_day_a_watch_covers_is_refused(self):
+        self.created(call("POST", "/api/agent/v1/jobs/watch", self.booking())[1])
+        self.assertEqual(call("POST", "/api/agent/v1/jobs/booking", self.booking())[0], 409)
+
+    def test_a_day_a_finished_job_already_booked_is_refused(self):
+        d = future()
+        jid = self.add_job(type_="book_next", status="completed",
+                           params={"date": d, "time": "19:00", "duration": 120})
+        rid = self.add_run(jid, "success")
+        with engine.begin() as conn:
+            conn.execute(insert(bookings).values(job_run_id=rid, account_id=self.acc_id, date=d,
+                                                 start_time="19:00", court_type="Hard"))
+        status, body, _ = call("POST", "/api/agent/v1/jobs/watch", self.booking(date=d))
+        self.assertEqual(status, 409)
+        self.assertIn(f"Job {jid} already booked", body["detail"])
+
+    # 4. a failed reservation read must not delete anything.
+
+    def _sync_with(self, reservations_or_error):
+        """Run the real _do_sync with Playwright, login and the list read faked."""
+        from web.routes import reservations as res
+
+        browser = mock.MagicMock()
+        pw = mock.MagicMock()
+        pw.__enter__.return_value.chromium.launch.return_value = browser
+
+        def read(page, org_cfg):
+            # Only our account answers; anything else in the shared test DB raises, so
+            # it is skipped rather than synced to nothing.
+            if org_cfg.org_id != "99999":
+                raise RuntimeError("not this test's account")
+            if isinstance(reservations_or_error, Exception):
+                raise reservations_or_error
+            return reservations_or_error
+
+        with mock.patch("playwright.sync_api.sync_playwright", return_value=pw), \
+             mock.patch("auth.ensure_logged_in"), \
+             mock.patch("booking.get_my_reservations", side_effect=read):
+            return res._do_sync()
+
+    def _seed_for_sync(self):
+        """Point the account at the club (sync reads accounts.org_id) and give it one
+        job-booked and one synced court."""
+        self.set_account(self.acc_id, org_id=self.org_id)
+        self.addCleanup(self.set_account, self.acc_id, org_id=None)
+        jid = self.add_job(type_="book_next", status="completed",
+                           params={"date": future(5), "time": "19:00"})
+        rid = self.add_run(jid, "success")
+        with engine.begin() as conn:
+            conn.execute(insert(bookings).values(job_run_id=rid, account_id=self.acc_id,
+                                                 date=future(5), start_time="19:00"))
+            conn.execute(insert(bookings).values(job_run_id=None, account_id=self.acc_id,
+                                                 date=future(6), start_time="08:00"))
+
+    def _my_rows(self):
+        with engine.connect() as conn:
+            return sorted((r.date, r.start_time, r.job_run_id is not None) for r in conn.execute(
+                bookings.select().where(bookings.c.account_id == self.acc_id)))
+
+    def test_an_unreadable_list_deletes_nothing(self):
+        from booking import ReservationListError
+        self._seed_for_sync()
+        before = self._my_rows()
+        result = self._sync_with(ReservationListError("the reservation list didn't load"))
+        self.assertEqual(self._my_rows(), before)
+        self.assertEqual(result["removed"], 0)
+        self.assertTrue(any("didn't load" in e for e in result["errors"]))
+
+    def test_a_read_empty_list_never_deletes_a_job_booked_court(self):
+        self._seed_for_sync()
+        result = self._sync_with([])
+        # The synced court is gone (CourtReserve says so); the job's court is kept.
+        self.assertEqual(self._my_rows(), [(future(5), "19:00", True)])
+        self.assertEqual((result["removed"], result["kept"]), (1, 1))
+
+    def test_get_my_reservations_raises_rather_than_returning_nothing(self):
+        from booking import OrgConfig, ReservationListError, get_my_reservations
+
+        def page_answering(body):
+            page = mock.MagicMock()
+            handlers = []
+            page.on.side_effect = lambda _ev, fn: handlers.append(fn)
+
+            def goto(*a, **k):
+                if body is not None:
+                    resp = mock.MagicMock(url="https://x/my-bookings-portal/get-list?y")
+                    resp.text.return_value = body
+                    for fn in handlers:
+                        fn(resp)
+            page.goto.side_effect = goto
+            return page
+
+        org = OrgConfig(org_id="1", scheduler_id="1", cost_type_id="1")
+        for body in (None, "<html>login</html>", "[]", '{"Errors": "x"}'):
+            with self.assertRaises(ReservationListError, msg=body):
+                get_my_reservations(page_answering(body), org)
+        self.assertEqual(get_my_reservations(page_answering('{"Data": []}'), org), [])
+
+    # 5. account must belong to the club; redactor; malformed hash.
+
+    def test_an_account_not_linked_to_the_club_is_refused(self):
+        status, body, _ = call("POST", "/api/agent/v1/jobs/booking",
+                               self.booking(account_id=self.stray_acc_id))
+        self.assertEqual(status, 409)
+        self.assertIn("isn't linked", body["detail"])
+        with mock.patch.object(agent_api, "_fetch_slots") as fetch:
+            status, _, _ = call("GET", f"/api/agent/v1/availability?org_id={self.org_id}"
+                                       f"&date={future()}&account_id={self.stray_acc_id}")
+        self.assertEqual(status, 409)
+        fetch.assert_not_called()
+
+    def test_availability_never_falls_back_to_another_clubs_account(self):
+        with mock.patch.object(agent_api, "_fetch_slots") as fetch:
+            status, body, _ = call("GET", f"/api/agent/v1/availability?org_id={self.lonely_org_id}"
+                                          f"&date={future()}")
+        self.assertEqual(status, 409)
+        self.assertIn("No account is linked to Other Club", body["detail"])
+        fetch.assert_not_called()
+
+    def test_the_redactor_catches_other_spellings(self):
+        from urllib.parse import quote, quote_plus
+        odd = 'Odd/&"pw 1'  # a password whose encodings differ from itself
+        self.set_account(self.stray_acc_id, password=odd)
+        self.addCleanup(self.set_account, self.stray_acc_id, password="StrayPw999")
+        spellings = [PASSWORD.upper(), PASSWORD.lower(), quote(odd), quote(odd, safe=""),
+                     quote_plus(odd), json.dumps(odd)[1:-1], EMAIL.upper(), quote(EMAIL)]
+        jid = self.add_job()
+        self.add_run(jid, "failed", "\n".join(f"line {i}: {v}" for i, v in enumerate(spellings)))
+        _, body, raw = call("GET", f"/api/agent/v1/jobs/{jid}")
+        for v in spellings:
+            self.assertNotIn(v, body["runs"][0]["log_tail"], v)
+        self.assertNotIn("Odd/", raw)
+        self.assertNotIn(PASSWORD.lower(), raw.lower())
+        self.assertEqual(body["runs"][0]["log_tail"].count("[redacted]"), 6)
+        self.assertEqual(body["runs"][0]["log_tail"].count("p***@example.com"), 2)
+
+    def test_a_malformed_hash_is_a_503_not_a_401(self):
+        with mock.patch.dict(os.environ, {agent_api.TOKEN_HASH_ENV: TOKEN}):
+            status, body, _ = call("GET", "/api/agent/v1/status")
+        self.assertEqual(status, 503)
+        self.assertIn("misconfigured", body["detail"])
 
 
 class MintTokenTests(unittest.TestCase):
