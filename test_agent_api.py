@@ -442,6 +442,25 @@ class ReviewFixTests(AgentApiTestCase):
         # The pause must not have written "paused" over the booked job.
         self.assertEqual(self.job_status(jid), "completed")
 
+    def test_resuming_a_watch_replaces_its_trigger_rather_than_adding_one(self):
+        # Found running the connector against the app: resume un-paused a watch's
+        # unfired trigger AND scheduled another -- two runs for one job.
+        jid = self.add_job(status="paused")
+        with engine.begin() as conn:
+            conn.execute(jobs.update().where(jobs.c.id == jid).values(apscheduler_id="watch_old"))
+        with mock.patch("web.apscheduler_setup.remove_job") as remove:
+            self.assertEqual(call("POST", f"/api/agent/v1/jobs/{jid}/resume")[0], 200)
+        remove.assert_called_once_with("watch_old")
+        self.sched["resume_job"].assert_not_called()
+        self.sched["schedule_watch"].assert_called_once()
+
+    def test_resuming_a_booking_job_unpauses_its_own_trigger(self):
+        jid = self.add_job(type_="book_next", status="paused",
+                           params={"date": future(), "time": "19:00", "duration": 120})
+        self.assertEqual(call("POST", f"/api/agent/v1/jobs/{jid}/resume")[0], 200)
+        self.sched["resume_job"].assert_called_once()
+        self.sched["schedule_book_next"].assert_not_called()
+
     # 2. one spelling of a date.
 
     def test_compact_and_dashed_dates_are_the_same_day(self):
