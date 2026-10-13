@@ -56,7 +56,7 @@ def _capture(buf: io.StringIO):
 
 import pytz
 from playwright.sync_api import sync_playwright
-from sqlalchemy import update, insert
+from sqlalchemy import insert, select, update
 
 from booking import (OrgConfig, Slot, get_available_slots, find_best_slot, book_slot, slot_has_window,
                      _org_uses_court_picker, get_my_reservations, cancel_reservation, match_reservation_id,
@@ -94,6 +94,22 @@ def request_cancel(job_id: int) -> bool:
         return False
     event.set()
     return True
+
+
+def _job_is_active(job_id: int) -> bool:
+    """Whether the job a run is starting for still wants to run. A trigger can fire in
+    the same moment as a pause: the run then misses the cancel (pause sent it before the
+    run registered) and, unchecked, would poll and book under a job marked paused.
+    Pause writes "paused" before it cancels and a run registers before it checks this,
+    so one of the two always sees the other."""
+    with engine.connect() as conn:
+        row = conn.execute(select(jobs.c.status).where(jobs.c.id == job_id)).fetchone()
+    return row is not None and row.status == "active"
+
+
+def _skip_run(run_id: int) -> None:
+    _finish_run(run_id, "cancelled",
+                "Not started: the job was paused, edited or deleted as this run began.")
 
 
 def _register_cancel(job_id: int) -> threading.Event:
@@ -528,14 +544,20 @@ def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_acco
 
 def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                   target_date_iso: str | None = None, target_time: str = "",
-                  duration_override: int = 0):
+                  duration_override: int = 0, manual: bool = False):
     """
     Book a court for target_date_iso (or days_out from today if not given).
     target_time may be a comma-separated list of preferred times in priority order.
     duration_override=0 = any duration.
     Retries automatically on transient network errors.
+    manual=True is the UI's Run Now, which runs whatever the job's status; a scheduled
+    run only proceeds if the job is still active (see _job_is_active).
     """
     run_id = _start_run(job_id)
+    if not manual and not _job_is_active(job_id):
+        # Leaves jobs.status alone: whoever paused, edited or deleted the job owns it.
+        _skip_run(run_id)
+        return
     buf = io.StringIO()
     status = "failed"
     slot = None
@@ -789,6 +811,12 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
     status = "failed"
     slot = None
     cancel_event = _register_cancel(job_id)
+    # Registered first, checked second: a pause that lands after this check finds the
+    # event and sets it; one that landed before it is seen here.
+    if not _job_is_active(job_id):
+        _unregister_cancel(job_id, cancel_event)
+        _skip_run(run_id)
+        return
     try:
         account, org = _get_account_and_org(job_id, account_id)
         org_cfg = _org_config(org)
