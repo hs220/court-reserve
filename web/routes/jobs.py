@@ -304,7 +304,10 @@ def pause_job_by_id(job_id: int) -> dict:
     request_cancel(job_id)
     apscheduler_setup.pause_job(j.get("apscheduler_id", ""))
     with engine.begin() as conn:
-        conn.execute(update(jobs).where(jobs.c.id == job_id).values(status="paused"))
+        # Only from active: a run that finished in the meantime has already written
+        # completed/failed, and "paused" over a booked court would hide that it booked.
+        conn.execute(update(jobs).where((jobs.c.id == job_id) & (jobs.c.status == "active"))
+                     .values(status="paused"))
     return j
 
 

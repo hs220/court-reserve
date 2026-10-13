@@ -31,7 +31,9 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import date as date_cls, datetime, timedelta, timezone
+from urllib.parse import quote, quote_plus
 
 import pytz
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -59,6 +61,11 @@ MAX_DAYS_AHEAD = 60
 LOG_TAIL_LINES = 20
 LOG_TAIL_CHARS = 2000
 WATCH_INTERVAL_S = 60
+#: How long pause waits for a watch's in-flight run to notice and stop. A watch checks
+#: between polls, so this is normally well under a second; it is longer only when the
+#: run is mid-attempt at booking, which can't be interrupted.
+PAUSE_WAIT_S = 20.0
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 #: One browser at a time for agent-initiated work. Each availability check or sync
 #: launches Chromium and may log in; a watcher asking in a loop must not be able to
@@ -70,6 +77,12 @@ def _require_token(authorization: str = Header(default="")) -> None:
     want = os.environ.get(TOKEN_HASH_ENV, "").strip().lower()
     if not want:
         raise HTTPException(503, f"The agent API is off: {TOKEN_HASH_ENV} is not set.")
+    # A value that can't be a SHA-256 (the plaintext token pasted by mistake, a
+    # truncated line) would refuse every token as 401, which reads as "the agent's token
+    # is wrong" when it's the app that's misconfigured.
+    if not SHA256_HEX.match(want):
+        raise HTTPException(503, f"The agent API is misconfigured: {TOKEN_HASH_ENV} is not a "
+                                 "SHA-256 hex digest.")
     scheme, _, token = authorization.partition(" ")
     got = hashlib.sha256(token.strip().encode()).hexdigest()
     # compare_digest on the hashes, so the check takes the same time however much of
@@ -93,20 +106,33 @@ def _label(acc) -> str:
     return acc.get("label") or _mask_email(acc.get("email", ""))
 
 
+def _encodings(value: str) -> set[str]:
+    """The forms a value takes in the text a run produces: as typed, in a URL or form
+    body, and inside a JSON string (a logged request or response)."""
+    return {value, quote(value), quote(value, safe=""), quote_plus(value),
+            json.dumps(value)[1:-1]}
+
+
 def _redactor(conn):
-    """A function that makes run text safe to return: secrets out, emails to labels."""
+    """A function that makes run text safe to return: secrets out, emails to labels.
+    Case-insensitive, and over each value's encoded forms too: what matters is that no
+    spelling of a password gets out, and over-redacting a look-alike costs nothing."""
     rows = conn.execute(select(accounts)).fetchall()
     secrets = {r.password for r in rows if r.password}
     secrets |= {os.environ[k] for k in ENV_SECRETS if os.environ.get(k)}
+    forms = set().union(*(_encodings(v) for v in secrets)) if secrets else set()
     # Longest first, so a password containing another is replaced whole.
-    ordered = sorted(secrets, key=len, reverse=True)
-    emails = {r.email: _label(r) for r in rows if r.email}
+    secret_re = (re.compile("|".join(map(re.escape, sorted(forms, key=len, reverse=True))),
+                            re.IGNORECASE) if forms else None)
+    emails = [(re.compile("|".join(map(re.escape, sorted(_encodings(r.email), key=len,
+                                                          reverse=True))), re.IGNORECASE),
+               _label(r)) for r in rows if r.email]
 
     def scrub(s: str) -> str:
-        for secret in ordered:
-            s = s.replace(secret, "[redacted]")
-        for email, label in emails.items():
-            s = s.replace(email, label)
+        if secret_re:
+            s = secret_re.sub("[redacted]", s)
+        for pattern, label in emails:
+            s = pattern.sub(lambda _m, label=label: label, s)
         return s
 
     return scrub
@@ -318,19 +344,34 @@ def _fetch_slots(org: dict, account: dict, target_date: date_cls) -> list[dict]:
             for s in sorted(slots, key=lambda s: (s.start_ms, s.court_type))]
 
 
-def _pick_account(conn, org_id: int, account_id: int | None) -> dict:
+def _club_account(conn, org: dict, account_id: int | None) -> dict:
+    """The account to act as at this club: the one given, or the club's first linked
+    one. Either way it must be linked to the club (Clubs page), so one club's
+    credentials are never tried on another club's site."""
+    linked = select(accounts).join(account_orgs, account_orgs.c.account_id == accounts.c.id) \
+        .where(account_orgs.c.org_id == org["id"])
     if account_id is not None:
-        row = conn.execute(accounts.select().where(accounts.c.id == account_id)).fetchone()
-        if not row:
+        if not conn.execute(accounts.select().where(accounts.c.id == account_id)).fetchone():
             raise HTTPException(404, f"No account with id {account_id}.")
+        row = conn.execute(linked.where(accounts.c.id == account_id)).fetchone()
+        if not row:
+            raise HTTPException(409, f"Account {account_id} isn't linked to {org['name']}. "
+                                     "Link it on the app's Clubs page first.")
         return row_to_dict(row)
-    row = conn.execute(
-        select(accounts).join(account_orgs, account_orgs.c.account_id == accounts.c.id)
-        .where(account_orgs.c.org_id == org_id).order_by(accounts.c.id).limit(1)
-    ).fetchone() or conn.execute(accounts.select().order_by(accounts.c.id).limit(1)).fetchone()
+    row = conn.execute(linked.order_by(accounts.c.id).limit(1)).fetchone()
     if not row:
-        raise HTTPException(409, "No CourtReserve account is set up in the app.")
+        raise HTTPException(409, f"No account is linked to {org['name']}. "
+                                 "Link one on the app's Clubs page first.")
     return row_to_dict(row)
+
+
+def _iso(value) -> str | None:
+    """A date as YYYY-MM-DD however it was written (3.12's fromisoformat also takes
+    20261022 and week dates), so stored and compared dates are one spelling."""
+    try:
+        return date_cls.fromisoformat(str(value)).isoformat()
+    except ValueError:
+        return None
 
 
 @router.get("/availability")
@@ -341,7 +382,7 @@ async def availability(org_id: int, date: str, account_id: int | None = None):
         raise HTTPException(400, "date is YYYY-MM-DD.")
     with engine.connect() as conn:
         org = _org(conn, org_id)
-        account = _pick_account(conn, org_id, account_id)
+        account = _club_account(conn, org, account_id)
         scrub = _redactor(conn)
     if not _browser_lock.acquire(blocking=False):
         raise HTTPException(409, "Another availability check or sync is running; try again in a minute.")
@@ -374,16 +415,21 @@ class NewWatch(NewBooking):
     stop_before: str = "4h10m"
 
 
-def _validate(conn, body: NewBooking, job_type: str) -> tuple[dict, list[str]]:
+#: The job types that book one court on one date. A booking job and a watch for the
+#: same day are as much a double booking as two of either.
+ONE_SHOT = ("book_next", "watch")
+
+
+def _validate(conn, body: NewBooking) -> tuple[dict, str, list[str]]:
+    """Checks a new job and returns the club, the date as YYYY-MM-DD, and the times."""
     org = _org(conn, body.org_id)
-    if not conn.execute(accounts.select().where(accounts.c.id == body.account_id)).fetchone():
-        raise HTTPException(404, f"No account with id {body.account_id}.")
+    _club_account(conn, org, body.account_id)
     tz = pytz.timezone(org["timezone"])
     now = datetime.now(tz)
-    try:
-        d = date_cls.fromisoformat(body.date)
-    except ValueError:
+    iso = _iso(body.date)
+    if iso is None:
         raise HTTPException(400, "date is YYYY-MM-DD.")
+    d = date_cls.fromisoformat(iso)
     if not now.date() <= d <= now.date() + timedelta(days=MAX_DAYS_AHEAD):
         raise HTTPException(400, f"date must be between today and {MAX_DAYS_AHEAD} days ahead.")
     times = list(dict.fromkeys(t.strip() for t in body.times))
@@ -398,13 +444,24 @@ def _validate(conn, body: NewBooking, job_type: str) -> tuple[dict, list[str]]:
     if body.duration_min not in DURATIONS:
         raise HTTPException(400, f"duration_min is one of {', '.join(map(str, DURATIONS))}.")
     # Two jobs for the same court day would book twice: say which one exists instead.
+    # Booking and watch jobs alike, and stored dates normalised too, so neither the
+    # job type nor the spelling of the date is a way past this.
     for r in conn.execute(jobs.select().where(
-            (jobs.c.type == job_type) & (jobs.c.account_id == body.account_id) &
+            jobs.c.type.in_(ONE_SHOT) & (jobs.c.account_id == body.account_id) &
             (jobs.c.org_id == body.org_id) & jobs.c.status.in_(["active", "paused"]))):
-        if json.loads(r.params or "{}").get("date") == body.date:
-            raise HTTPException(409, f"Job {r.id} already covers {body.date} for this account "
-                                     f"and club ({r.status}).")
-    return org, times
+        if _iso(json.loads(r.params or "{}").get("date")) == iso:
+            raise HTTPException(409, f"Job {r.id} ({KINDS[r.type]}, {r.status}) already covers "
+                                     f"{iso} for this account and club.")
+    # ...and a court one of its jobs already booked that day is the same mistake, later.
+    done = conn.execute(text("""
+        SELECT j.id FROM bookings b
+        JOIN job_runs jr ON jr.id = b.job_run_id JOIN jobs j ON j.id = jr.job_id
+        WHERE b.account_id = :aid AND j.org_id = :oid AND b.date = :d LIMIT 1
+    """), {"aid": body.account_id, "oid": body.org_id, "d": iso}).fetchone()
+    if done:
+        raise HTTPException(409, f"Job {done.id} already booked a court on {iso} for this "
+                                 "account and club.")
+    return org, iso, times
 
 
 def _created(job_id: int, org: dict) -> dict:
@@ -421,8 +478,8 @@ def create_booking(body: NewBooking):
     that is free. Booking commits the person to the court."""
     from web.routes.jobs import create_book_next_job
     with engine.connect() as conn:
-        org, times = _validate(conn, body, "book_next")
-    job_id = create_book_next_job(body.account_id, body.org_id, body.date, ",".join(times),
+        org, iso, times = _validate(conn, body)
+    job_id = create_book_next_job(body.account_id, body.org_id, iso, ",".join(times),
                                   body.duration_min)
     return _created(job_id, org)
 
@@ -434,22 +491,56 @@ def create_watch(body: NewWatch):
     if body.stop_before not in STOP_BEFORE:
         raise HTTPException(400, f"stop_before is one of {', '.join(STOP_BEFORE)}.")
     with engine.connect() as conn:
-        org, times = _validate(conn, body, "watch")
-    job_id = create_watch_job(body.account_id, body.org_id, body.date, ",".join(times),
+        org, iso, times = _validate(conn, body)
+    job_id = create_watch_job(body.account_id, body.org_id, iso, ",".join(times),
                               body.duration_min, WATCH_INTERVAL_S, body.stop_before)
     return _created(job_id, org)
 
 
+def _running_run(conn, job_id: int):
+    return conn.execute(
+        job_runs.select().where((job_runs.c.job_id == job_id) & (job_runs.c.status == "running"))
+        .order_by(job_runs.c.id.desc()).limit(1)
+    ).fetchone()
+
+
 @router.post("/jobs/{job_id}/pause")
 def pause(job_id: int):
+    """Pause a job, and say what really happened.
+
+    A booking job's run (from 2 min before the window opens until it has booked or
+    given up) does not listen for cancellation, so pausing it then would stop nothing
+    while claiming to: refused with 409, nothing changed. A watch stops at its next
+    check between polls; this waits for that, and reports `pause` as `done`, as
+    `stopping` when the run is mid-attempt and may still book, or as `finished_first`
+    when the job ended on its own (booked, or failed) before the pause reached it."""
     from web.routes.jobs import pause_job_by_id
     with engine.connect() as conn:
         j = _job_row(conn, job_id)
+        running = _running_run(conn, job_id)
     if j["status"] != "active":
         raise HTTPException(409, f"Job {job_id} is {j['status']}; only an active job can be paused.")
+    if j["type"] == "book_next" and running:
+        raise HTTPException(409, f"Job {job_id} is booking right now (run {running.id}) and can't "
+                                 "be stopped; it finishes within minutes. Nothing was changed.")
     pause_job_by_id(job_id)
-    with engine.connect() as conn:
-        return _job_out(conn, _job_row(conn, job_id))
+    deadline = time.monotonic() + PAUSE_WAIT_S
+    while True:
+        with engine.connect() as conn:
+            still = _running_run(conn, job_id)
+            out = _job_out(conn, _job_row(conn, job_id))
+        if not still or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    if out["status"] != "paused":
+        out["pause"] = "finished_first"
+    elif still:
+        # Covers a booking job whose trigger fired between the check above and the
+        # pause, too: it is running and can't be stopped.
+        out["pause"] = "stopping"
+    else:
+        out["pause"] = "done"
+    return out
 
 
 @router.post("/jobs/{job_id}/resume")
@@ -458,11 +549,15 @@ def resume(job_id: int):
     with engine.connect() as conn:
         j = _job_row(conn, job_id)
         org = _org(conn, j["org_id"])
+        running = _running_run(conn, job_id)
     if j["status"] != "paused":
         raise HTTPException(409, f"Job {job_id} is {j['status']}; only a paused job can be resumed.")
-    d = json.loads(j.get("params") or "{}").get("date")
-    if d and d < datetime.now(pytz.timezone(org["timezone"])).date().isoformat():
-        raise HTTPException(409, f"Job {job_id} was for {d}, which has passed.")
+    if running:
+        raise HTTPException(409, f"Job {job_id}'s last run is still stopping; try again shortly.")
+    raw = json.loads(j.get("params") or "{}").get("date")
+    d = _iso(raw) if raw else None
+    if raw and (d is None or d < datetime.now(pytz.timezone(org["timezone"])).date().isoformat()):
+        raise HTTPException(409, f"Job {job_id} was for {raw}, which has passed.")
     resume_job_by_id(job_id)
     with engine.connect() as conn:
         return _job_out(conn, _job_row(conn, job_id))

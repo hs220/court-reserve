@@ -40,6 +40,12 @@ class FeedNotJsonError(json.JSONDecodeError):
     was sitting in the response body we threw away."""
 
 
+class ReservationListError(Exception):
+    """The account's reservation list couldn't be read: the list response never arrived
+    or wasn't the JSON it should be. Distinct from an empty list on purpose -- a sync
+    that took this for "no reservations" deleted every upcoming booking it knew of."""
+
+
 class SlotNotBookableError(BookingError):
     """Clicking the slot cell never opened the create-reservation modal, even after
     several retries. The cell exists in the grid but isn't bookable — typically the
@@ -759,7 +765,8 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: Or
 
 
 def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:
-    """Fetch upcoming reservations for the logged-in account from CourtReserve."""
+    """Fetch upcoming reservations for the logged-in account from CourtReserve. Raises
+    ReservationListError when the list can't be read; [] means it was read and empty."""
     captured = {}
 
     def _on_response(resp):
@@ -782,13 +789,16 @@ def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:
 
     raw_body = captured.get("body")
     if not raw_body:
-        return []
+        raise ReservationListError("the reservation list didn't load (no get-list response)")
 
     try:
         payload = json.loads(raw_body)
-        items = payload.get("Data") or []
-    except Exception:
-        return []
+    except ValueError as exc:
+        raise ReservationListError(f"the reservation list wasn't JSON: {exc}") from exc
+    items = payload.get("Data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        # "Data": [] is a real empty list; a missing or odd "Data" is not.
+        raise ReservationListError("the reservation list wasn't in the expected shape")
 
     results = []
     for item in items:

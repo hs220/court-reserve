@@ -56,8 +56,10 @@ services:
     labels:
       autoheal: "true"
     # `share` is how the home agent's connector (hs220/home-agent, `courtreserve`)
-    # reaches the agent API at court-reserve-web:8080 without a published port. Only
-    # this service is on it; the API behind it wants a bearer token (web/routes/agent_api.py).
+    # reaches the agent API at court-reserve-web:8080. Only this service is on it. The
+    # API is part of this same app, so it also answers on the published :7000 to anyone
+    # on the LAN with its bearer token (web/routes/agent_api.py) -- as the UI there
+    # already does, with no auth at all.
     networks:
       default: {}
       share:
