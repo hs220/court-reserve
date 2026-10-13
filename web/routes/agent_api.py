@@ -198,6 +198,9 @@ def _job_out(conn, j: dict) -> dict:
     last = conn.execute(
         job_runs.select().where(job_runs.c.job_id == j["id"]).order_by(job_runs.c.id.desc()).limit(1)
     ).fetchone()
+    # Paused, but a run hasn't finished stopping: it may still book. Said here, not only
+    # in pause's reply, so list and get never show a plain "paused" in that window.
+    out["stopping"] = bool(j["status"] == "paused" and last and last.status == "running")
     out["last_run"] = ({"id": last.id, "status": last.status,
                         "started_at": _iso_utc(last.started_at),
                         "finished_at": _iso_utc(last.finished_at)} if last else None)
@@ -534,7 +537,7 @@ def pause(job_id: int):
         time.sleep(0.25)
     if out["status"] != "paused":
         out["pause"] = "finished_first"
-    elif still:
+    elif out["stopping"]:
         # Covers a booking job whose trigger fired between the check above and the
         # pause, too: it is running and can't be stopped.
         out["pause"] = "stopping"

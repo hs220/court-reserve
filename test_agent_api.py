@@ -26,7 +26,11 @@ from sqlalchemy import insert
 
 from web.database import (account_orgs, accounts, bookings, engine, init_db, job_runs, jobs,
                           organizations)
+import web.job_runner as jr
 from web.routes import agent_api
+
+#: Saved before any test patches it, for the tests that need the real thing.
+REAL_REQUEST_CANCEL = jr.request_cancel
 
 TOKEN = "cr_agent_test-token"
 PASSWORD = "Sup3rS3cretCRpw"  # a fixture value that must never come back
@@ -628,6 +632,82 @@ class ReviewFixTests(AgentApiTestCase):
             status, body, _ = call("GET", "/api/agent/v1/status")
         self.assertEqual(status, 503)
         self.assertIn("misconfigured", body["detail"])
+
+
+class PauseRaceTests(AgentApiTestCase):
+    """A run starting in the same moment as a pause (follow-up review of #4)."""
+
+    def runs_of(self, job_id):
+        with engine.connect() as conn:
+            return [(r.status, r.log_text) for r in conn.execute(
+                job_runs.select().where(job_runs.c.job_id == job_id))]
+
+    def test_a_watch_that_starts_after_the_pause_exits_without_polling(self):
+        # The pause wrote "paused" first; the run's trigger fired anyway.
+        jid = self.add_job(status="paused")
+        with mock.patch("web.job_runner.sync_playwright") as pw:
+            jr.run_watch(jid, self.acc_id, future(), "19:00", 120)
+        pw.assert_not_called()
+        [(status, log)] = self.runs_of(jid)
+        self.assertEqual(status, "cancelled")
+        self.assertIn("Not started", log)
+        self.assertEqual(self.job_status(jid), "paused")  # left to whoever paused it
+        self.assertNotIn(jid, jr._cancel_events)
+
+    def test_a_watch_registered_before_the_pause_is_cancelled_by_it(self):
+        # The other order: the run registered and found the job active, then the pause
+        # landed. Pause must still reach it, which needs "paused" written before the
+        # cancel is sent and the real request_cancel.
+        from web.routes.jobs import pause_job_by_id
+        jid = self.add_job(status="active")
+        event = jr._register_cancel(jid)
+        self.addCleanup(jr._unregister_cancel, jid, event)
+        self.assertTrue(jr._job_is_active(jid))
+        seen = []
+        self.request_cancel.side_effect = lambda job_id: (
+            seen.append(self.job_status(job_id)), REAL_REQUEST_CANCEL(job_id))[1]
+        pause_job_by_id(jid)
+        self.assertTrue(event.is_set())
+        self.assertEqual(seen, ["paused"])
+
+    def test_a_scheduled_booking_run_on_a_paused_job_does_not_book(self):
+        jid = self.add_job(type_="book_next", status="paused",
+                           params={"date": future(), "time": "19:00", "duration": 120})
+        with mock.patch("web.job_runner.sync_playwright") as pw:
+            jr.run_book_next(jid, self.acc_id, target_date_iso=future(), target_time="19:00")
+        pw.assert_not_called()
+        self.assertEqual(self.runs_of(jid)[0][0], "cancelled")
+        self.assertEqual(self.job_status(jid), "paused")
+
+    def test_run_now_still_runs_a_job_that_is_not_active(self):
+        # The UI's Run Now is the person asking, whatever the status: it gets through.
+        jid = self.add_job(type_="book_next", status="paused",
+                           params={"date": future(), "time": "19:00", "duration": 120})
+        with mock.patch("web.job_runner.sync_playwright",
+                        side_effect=RuntimeError("stop here")) as pw:
+            jr.run_book_next(jid, self.acc_id, target_date_iso=future(), target_time="19:00",
+                             manual=True)
+        pw.assert_called_once()
+        self.assertEqual(self.runs_of(jid)[0][0], "failed")  # it ran, and hit our stop
+
+    def test_the_run_now_route_passes_manual(self):
+        from web.routes import jobs as job_routes
+        jid = self.add_job(type_="book_next", status="failed",
+                           params={"date": future(), "time": "19:00", "duration": 120})
+        with mock.patch("threading.Thread") as thread:
+            asyncio.run(job_routes.run_now(jid))
+        self.assertIs(thread.call_args.kwargs["target"], jr.run_book_next)
+        self.assertTrue(thread.call_args.kwargs["kwargs"]["manual"])
+
+    def test_a_paused_job_with_a_run_still_going_reads_as_stopping(self):
+        jid = self.add_job(status="paused")
+        self.add_run(jid, "running")
+        _, j, _ = call("GET", f"/api/agent/v1/jobs/{jid}")
+        self.assertEqual((j["status"], j["stopping"]), ("paused", True))
+        listed = next(x for x in call("GET", "/api/agent/v1/jobs")[1]["jobs"] if x["id"] == jid)
+        self.assertTrue(listed["stopping"])
+        settled = self.add_job(status="paused")
+        self.assertFalse(call("GET", f"/api/agent/v1/jobs/{settled}")[1]["stopping"])
 
 
 class MintTokenTests(unittest.TestCase):

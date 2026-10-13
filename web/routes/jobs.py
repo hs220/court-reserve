@@ -299,15 +299,20 @@ def pause_job_by_id(job_id: int) -> dict:
     from web.job_runner import request_cancel
     with engine.connect() as conn:
         j = row_to_dict(conn.execute(jobs.select().where(jobs.c.id == job_id)).fetchone())
-    # pause_job only stops future firings; a watch already mid-poll would keep running
-    # (and could still book) unless we ask its thread to stop.
-    request_cancel(job_id)
-    apscheduler_setup.pause_job(j.get("apscheduler_id", ""))
+    # "paused" is written FIRST. A run that starts now checks the status after
+    # registering for cancellation (job_runner._job_is_active): if it checks after this
+    # write it sees "paused" and exits; if before, it has already registered and the
+    # request_cancel below reaches it. Cancelling first left a gap a run could slip
+    # through and book under a job marked paused.
     with engine.begin() as conn:
         # Only from active: a run that finished in the meantime has already written
         # completed/failed, and "paused" over a booked court would hide that it booked.
         conn.execute(update(jobs).where((jobs.c.id == job_id) & (jobs.c.status == "active"))
                      .values(status="paused"))
+    # pause_job only stops future firings; a watch already mid-poll would keep running
+    # (and could still book) unless we ask its thread to stop.
+    request_cancel(job_id)
+    apscheduler_setup.pause_job(j.get("apscheduler_id", ""))
     return j
 
 
@@ -418,6 +423,8 @@ async def run_now(job_id: int):
             "target_date_iso": params.get("date"),
             "target_time": params.get("time", ""),
             "duration_override": int(params.get("duration") or 0),
+            # Run Now is the person asking for it, whatever the job's status.
+            "manual": True,
         }, daemon=True)
     t.start()
     return RedirectResponse(f"/jobs/{job_id}/runs", status_code=303)
