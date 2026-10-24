@@ -6,12 +6,13 @@ tools need and nothing more:
 
 - read: jobs and their runs, upcoming reservations the app knows about, clubs and
   account labels, and a live availability check for one date;
-- write: create a one-shot booking or watch job, pause or resume a job, and re-sync
-  the reservations mirror from CourtReserve.
+- write: create a one-shot booking or watch job, pause or resume a job, re-sync
+  the reservations mirror from CourtReserve, and complete a pending probe-to-main
+  transfer (the UI's Transfer button, through the same code).
 
 What is deliberately absent: deleting, editing, restarting or run-now on a job;
-cancelling or transferring a reservation; anything about accounts or organizations
-beyond their names. A missing endpoint is the only guarantee that survives a
+cancelling a reservation; creating a job with a probe account or auto-transfer;
+anything about accounts or organizations beyond their names. A missing endpoint is the only guarantee that survives a
 confused or misled agent.
 
 **No secrets leave.** Responses never carry a CourtReserve password, an email
@@ -42,7 +43,8 @@ from sqlalchemy import select, text
 from starlette.concurrency import run_in_threadpool
 
 from web import apscheduler_setup
-from web.database import account_orgs, accounts, engine, job_runs, jobs, organizations, row_to_dict
+from web.database import (account_orgs, accounts, engine, job_runs, jobs, organizations,
+                          pending_transfers, row_to_dict)
 
 TOKEN_HASH_ENV = "AGENT_API_TOKEN_SHA256"
 #: The app's own secrets, scrubbed from any text the API returns.
@@ -66,6 +68,11 @@ WATCH_INTERVAL_S = 60
 #: run is mid-attempt at booking, which can't be interrupted.
 PAUSE_WAIT_S = 20.0
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+#: How long completing a transfer waits for its result before answering "running". A
+#: transfer logs in twice, cancels, then tries the main account up to three times:
+#: typically 30-100 s. The connector's timeout must stay above this.
+TRANSFER_WAIT_S = 150.0
+OPEN_TRANSFERS = ("pending", "held_by_probe", "transferring")
 
 #: One browser at a time for agent-initiated work. Each availability check or sync
 #: launches Chromium and may log in; a watcher asking in a loop must not be able to
@@ -581,3 +588,188 @@ async def sync_reservations():
         scrub = _redactor(conn)
     result["errors"] = [scrub(e)[:300] for e in result.get("errors", [])]
     return result
+
+
+# ── transfers ────────────────────────────────────────────────────────────────
+#
+# A job with a probe account books with the probe, then leaves a pending_transfers row:
+# the probe holds the court until someone moves it to the main account. Completing one
+# is the UI's Transfer button (job_runner.run_transfer, unchanged logic): log in as both,
+# cancel the probe's reservation, book the same slot as the main account (3 tries),
+# and if that fails have the probe book it back. Between the cancel and the re-book the
+# court is open to anyone, so a completed transfer can lose the court.
+
+def _transfer_row(conn, transfer_id: int) -> dict:
+    row = conn.execute(pending_transfers.select()
+                       .where(pending_transfers.c.id == transfer_id)).fetchone()
+    if not row:
+        raise HTTPException(404, f"No transfer with id {transfer_id}.")
+    return row_to_dict(row)
+
+
+def _transfer_refusal(conn, t: dict) -> str | None:
+    """Why this transfer can't be completed now, or None. Shared by list (as
+    `why_not`) and complete (as a 409), so the two never disagree."""
+    n = t["id"]
+    if t["status"] == "transferring":
+        return (f"Transfer {n} is running right now (from the app or the agent). Don't start "
+                "it again; check list_transfers in a minute.")
+    if t["status"] == "transferred":
+        return f"Transfer {n} already moved the court to the main account."
+    if t["status"] not in ("pending", "held_by_probe"):
+        return f"Transfer {n} is {t['status']} and can't be completed."
+    if not t.get("reservation_id"):
+        return (f"The app has no CourtReserve reservation id for transfer {n}'s court, so it "
+                "can't cancel it on the probe account. Move it by hand on CourtReserve.")
+    org = conn.execute(organizations.select().where(organizations.c.id == t["org_id"])).fetchone()
+    if not org:
+        return f"Transfer {n}'s club no longer exists in the app."
+    tz = pytz.timezone(org.timezone or "America/Los_Angeles")
+    try:
+        start = tz.localize(datetime.strptime(f"{t['date']} {t['start_time']}", "%Y-%m-%d %H:%M"))
+    except (TypeError, ValueError):
+        return f"Transfer {n} has no readable court time."
+    if start <= datetime.now(tz):
+        return f"Transfer {n}'s court time ({t['date']} {t['start_time']}) has passed."
+    for role, acc_id in (("probe", t["probe_account_id"]), ("main", t["main_account_id"])):
+        try:
+            _club_account(conn, row_to_dict(org), acc_id)
+        except HTTPException as e:
+            return f"The {role} account: {e.detail}"
+    return None
+
+
+def _transfer_out(conn, t: dict, scrub) -> dict:
+    org = conn.execute(organizations.select().where(organizations.c.id == t["org_id"])).fetchone()
+    labels = {a.id: _label(a) for a in conn.execute(accounts.select().where(
+        accounts.c.id.in_([t["probe_account_id"], t["main_account_id"]])))}
+    why_not = _transfer_refusal(conn, t)
+    return {
+        "id": t["id"], "status": t["status"],
+        "club": {"id": t["org_id"], "name": org.name if org else "?"},
+        "probe_account": {"id": t["probe_account_id"], "label": labels.get(t["probe_account_id"], "?")},
+        "main_account": {"id": t["main_account_id"], "label": labels.get(t["main_account_id"], "?")},
+        "date": t["date"], "start_time": t["start_time"],
+        "duration_min": t["duration_min"], "court_type": t.get("court_type") or "",
+        "job_id": t["job_id"], "auto": bool(t.get("auto")),
+        "note": scrub(t.get("note") or "")[:300],
+        "created_at": _iso_utc(t.get("created_at")),
+        "resolved_at": _iso_utc(t.get("resolved_at")),
+        "completable": why_not is None,
+        "why_not": why_not,
+    }
+
+
+@router.get("/transfers")
+def list_transfers(state: str = "open", limit: int = 20):
+    """Courts a probe account holds for a main account. `open` is pending, held by
+    the probe after a failed try, or running now; `all` adds transferred and failed."""
+    if state not in ("open", "all"):
+        raise HTTPException(400, "state is open or all.")
+    limit = max(1, min(limit, 100))
+    q = pending_transfers.select().order_by(pending_transfers.c.id.desc()).limit(limit)
+    if state == "open":
+        q = q.where(pending_transfers.c.status.in_(OPEN_TRANSFERS))
+    with engine.connect() as conn:
+        scrub = _redactor(conn)
+        return {"transfers": [_transfer_out(conn, row_to_dict(r), scrub) for r in conn.execute(q)]}
+
+
+class CompleteTransfer(BaseModel):
+    """The court being moved, repeated back: the approval shows a court, not a bare id,
+    and a call with a stale or mistaken id is refused instead of moving another court."""
+    model_config = ConfigDict(extra="forbid")
+    date: str
+    start_time: str
+
+
+def _transfer_result(outcome: dict) -> tuple[str, str, str]:
+    """(outcome, court, message) for what run_transfer reported. `court` is where the
+    court is now: main, probe, lost or unknown."""
+    status = outcome.get("status")
+    if status is None and outcome.get("ended"):
+        return ("errored", "unknown",
+                "The transfer stopped on an internal error in the app and may still be marked as "
+                "running there. Check CourtReserve and the app's Jobs page before anything else.")
+    if status is None:
+        return ("running", "unknown",
+                "The transfer started and is still running. It cancels the probe's reservation, "
+                "then books the court as the main account. Don't start it again; check "
+                "list_transfers in a minute or two.")
+    if status == "transferred":
+        return ("transferred", "main",
+                "Transferred: the probe's reservation was cancelled and the main account booked "
+                "the court.")
+    if status == "held_by_probe" and not outcome.get("cancelled"):
+        if outcome.get("cancel_error"):
+            return ("cancel_uncertain", "unknown",
+                    "Not transferred. The cancel on the probe account errored part-way, so it may "
+                    "or may not have gone through, and no booking was tried for the main account. "
+                    "The court MAY BE LOST. Check CourtReserve before doing anything else.")
+        why = ("the app couldn't open a browser or log in"
+               if outcome.get("errored_before_cancel") else
+               "CourtReserve didn't confirm the cancel")
+        return ("failed_before_cancel", "probe",
+                f"Not transferred, and nothing changed: {why}. The probe account still holds "
+                "the court.")
+    if status == "held_by_probe":
+        held = ("" if outcome.get("reservation_id") else
+                " Its new reservation id wasn't captured, so this transfer can't be retried here.")
+        return ("failed_after_cancel", "probe",
+                "Not transferred. The probe's reservation was cancelled, the main account couldn't "
+                "book the court, and the probe booked it back: the probe account holds it again, "
+                f"as a new reservation.{held}")
+    if "may be lost" in (outcome.get("note") or ""):
+        return ("failed_after_cancel", "unknown",
+                "The transfer errored after the probe's reservation was cancelled. The court MAY "
+                "BE LOST. Check CourtReserve.")
+    return ("failed_after_cancel", "lost",
+            "The court is LOST. The probe's reservation was cancelled, then neither the main "
+            "account nor the probe could book it again; someone else most likely took it.")
+
+
+@router.post("/transfers/{transfer_id}/complete")
+def complete_transfer(transfer_id: int, body: CompleteTransfer):
+    """Move a court the probe account holds to the main account, through the code the
+    UI's Transfer button runs. Refused (409, nothing changed) unless it is pending or
+    held by the probe, for this court, with a reservation id, in the future, with both
+    accounts linked to the club. Never runs twice: the transfer is claimed in one
+    UPDATE, and a running, transferred or failed one is refused."""
+    from web import job_runner
+    with engine.connect() as conn:
+        t = _transfer_row(conn, transfer_id)
+        if (_iso(body.date), body.start_time.strip()) != (t["date"], t["start_time"]):
+            raise HTTPException(409, f"Transfer {transfer_id} is for {t['date']} {t['start_time']}, "
+                                     f"not {body.date} {body.start_time}. Nothing was changed.")
+        why_not = _transfer_refusal(conn, t)
+    if why_not:
+        raise HTTPException(409, f"{why_not} Nothing was changed.")
+    if not _browser_lock.acquire(blocking=False):
+        raise HTTPException(409, "Another availability check, sync or transfer is running; try "
+                                 "again in a minute. Nothing was changed.")
+    outcome: dict = {}
+
+    def work():
+        try:
+            job_runner.run_transfer(transfer_id, outcome)
+        finally:
+            _browser_lock.release()
+
+    # Its own thread, not this request's: a client that gives up must not stop a
+    # transfer between the cancel and the re-book.
+    thread = threading.Thread(target=work, name=f"agent-transfer-{transfer_id}", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + TRANSFER_WAIT_S
+    while thread.is_alive() and "status" not in outcome and time.monotonic() < deadline:
+        if outcome.get("claimed") is False:
+            break
+        time.sleep(0.25)
+    if not thread.is_alive() and "status" not in outcome:
+        outcome["ended"] = True
+    if outcome.get("claimed") is False:
+        raise HTTPException(409, f"Transfer {transfer_id} was started from elsewhere a moment ago "
+                                 "(the app's Transfer button?). Nothing was changed by this call.")
+    result, court, message = _transfer_result(outcome)
+    with engine.connect() as conn:
+        out = _transfer_out(conn, _transfer_row(conn, transfer_id), _redactor(conn))
+    return {"outcome": result, "court": court, "message": message, "transfer": out}
