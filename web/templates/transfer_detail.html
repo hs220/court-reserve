@@ -19,6 +19,28 @@
   {% if t.note %}&nbsp;·&nbsp; {{ t.note }}{% endif %}
 </p>
 
+{% if t.status == "needs_check" %}
+<div class="card" style="border:1px solid var(--accent);margin-bottom:16px">
+  <div class="card-header"><h2>Check CourtReserve first</h2></div>
+  <p style="margin:0 16px 12px">
+    The cancel on <strong>{{ t.probe_label }}</strong> may have gone through, so nobody knows
+    where the {{ t.date }} {{ t.start_time }} court is. Look at both accounts' reservations on
+    CourtReserve, then record what you found. Until then the transfer can't be run, from here
+    or by the home agent.
+  </p>
+  <div style="margin:0 16px 16px;display:flex;gap:8px;flex-wrap:wrap">
+    {% for holder, label in [("probe", t.probe_label ~ " still holds the original reservation"),
+                             ("main", t.main_label ~ " has the court"),
+                             ("closed", "Neither / I'll handle it on CourtReserve")] %}
+    <form method="post" action="/transfers/{{ t.id }}/checked" style="display:inline">
+      <input type="hidden" name="holder" value="{{ holder }}">
+      <button class="btn btn-ghost btn-sm">{{ label }}</button>
+    </form>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
 <div class="card">
   <div class="card-header">
     <h2>Log Output</h2>

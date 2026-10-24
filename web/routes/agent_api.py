@@ -72,7 +72,7 @@ SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 #: transfer logs in twice, cancels, then tries the main account up to three times:
 #: typically 30-100 s. The connector's timeout must stay above this.
 TRANSFER_WAIT_S = 150.0
-OPEN_TRANSFERS = ("pending", "held_by_probe", "transferring")
+OPEN_TRANSFERS = ("pending", "held_by_probe", "transferring", "needs_check")
 
 #: One browser at a time for agent-initiated work. Each availability check or sync
 #: launches Chromium and may log in; a watcher asking in a loop must not be able to
@@ -616,6 +616,11 @@ def _transfer_refusal(conn, t: dict) -> str | None:
                 "it again; check list_transfers in a minute.")
     if t["status"] == "transferred":
         return f"Transfer {n} already moved the court to the main account."
+    if t["status"] == "needs_check":
+        return (f"Transfer {n}'s cancel on the probe account may have gone through, so where "
+                "the court is now is unknown and it MAY BE LOST. A person must check "
+                f"CourtReserve and record what they found on the app's page for transfer {n} "
+                "before it can be completed.")
     if t["status"] not in ("pending", "held_by_probe"):
         return f"Transfer {n} is {t['status']} and can't be completed."
     if not t.get("reservation_id"):
@@ -700,15 +705,19 @@ def _transfer_result(outcome: dict) -> tuple[str, str, str]:
         return ("transferred", "main",
                 "Transferred: the probe's reservation was cancelled and the main account booked "
                 "the court.")
+    if status == "needs_check":
+        return ("cancel_uncertain", "unknown",
+                "Not transferred. The cancel on the probe account errored after it was submitted, "
+                "so it may or may not have gone through, and no booking was tried for the main "
+                "account. The court MAY BE LOST. A person must check CourtReserve and record what "
+                "they found in the app before this transfer can be tried again.")
     if status == "held_by_probe" and not outcome.get("cancelled"):
-        if outcome.get("cancel_error"):
-            return ("cancel_uncertain", "unknown",
-                    "Not transferred. The cancel on the probe account errored part-way, so it may "
-                    "or may not have gone through, and no booking was tried for the main account. "
-                    "The court MAY BE LOST. Check CourtReserve before doing anything else.")
-        why = ("the app couldn't open a browser or log in"
-               if outcome.get("errored_before_cancel") else
-               "CourtReserve didn't confirm the cancel")
+        if outcome.get("errored_before_cancel"):
+            why = "the app couldn't open a browser or log in"
+        elif outcome.get("cancel_error"):
+            why = "CourtReserve's cancel page wasn't as expected, and nothing was submitted"
+        else:
+            why = "CourtReserve didn't confirm the cancel"
         return ("failed_before_cancel", "probe",
                 f"Not transferred, and nothing changed: {why}. The probe account still holds "
                 "the court.")

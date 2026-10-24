@@ -404,3 +404,47 @@ class FeedNotJsonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CancelAndCaptureTests(unittest.TestCase):
+    """What a transfer relies on: knowing whether a cancel was submitted, and never
+    taking another reservation's id for the one just booked."""
+
+    def _page(self, has_reason_field=True, has_submit=True):
+        from unittest import mock
+        page = mock.MagicMock()
+        page.url = "https://app.courtreserve.com/Online/MyProfile/Reservation/1/12345678"
+        page.evaluate.return_value = "Reservation cancelled"
+        if not has_reason_field:
+            page.wait_for_selector.side_effect = TimeoutError("Timeout 5000ms exceeded")
+        submit = mock.MagicMock() if has_submit else None
+        page.query_selector.return_value = submit
+        return page, submit
+
+    def test_before_submit_runs_just_before_the_click(self):
+        from booking import OrgConfig, cancel_reservation
+        page, submit = self._page()
+        order = []
+        submit.click.side_effect = lambda: order.append("click")
+        ok = cancel_reservation(page, "12345678", OrgConfig(org_id="1", scheduler_id="1",
+                                                            cost_type_id="1"),
+                                before_submit=lambda: order.append("before"))
+        self.assertTrue(ok)
+        self.assertEqual(order, ["before", "click"])
+
+    def test_nothing_is_submitted_when_the_form_isnt_there(self):
+        from booking import OrgConfig, cancel_reservation
+        org = OrgConfig(org_id="1", scheduler_id="1", cost_type_id="1")
+        for kwargs in ({"has_reason_field": False}, {"has_submit": False}):
+            page, _ = self._page(**kwargs)
+            called = []
+            with self.assertRaises(Exception, msg=kwargs):
+                cancel_reservation(page, "12345678", org, before_submit=lambda: called.append(1))
+            self.assertEqual(called, [], kwargs)
+
+    def test_the_grid_feed_is_never_a_source_of_the_new_id(self):
+        from booking import _may_carry_new_reservation_id as ok
+        self.assertFalse(ok("https://app.courtreserve.com/Online/Reservations/ReadConsolidated/13234"))
+        self.assertTrue(ok("https://reservations.courtreserve.com/Online/ReservationsApi/CreateReservation"))
+        self.assertTrue(ok("https://app.courtreserve.com/Online/Bookings/Save"))
+        self.assertFalse(ok("https://app.courtreserve.com/Online/Portal/Index"))

@@ -46,8 +46,11 @@ def _cleanup_orphaned_runs():
 def _recover_stuck_transfers():
     """Tidy up transfers that can no longer make progress:
 
-    1. 'transferring' was interrupted by a restart (the worker thread doesn't survive),
-       so flip it back to 'held_by_probe' — recoverable via the Transfer button.
+    1. 'transferring' was interrupted by a restart (the worker thread doesn't survive).
+       If the probe's cancel hadn't been submitted yet (no cancel_submitted_at), nothing
+       changed on CourtReserve: flip it back to 'held_by_probe', recoverable via the
+       Transfer button. If it had, the court may be on the probe, on the main account,
+       or lost: 'needs_check', for a person to look and record what they found.
     2. Any unresolved transfer whose slot time is already in the past is moot (the court
        is gone), so mark it 'failed' instead of leaving it hung in the UI forever.
     """
@@ -57,16 +60,29 @@ def _recover_stuck_transfers():
     with engine.begin() as conn:
         conn.execute(
             update(pending_transfers)
-            .where(pending_transfers.c.status == "transferring")
+            .where((pending_transfers.c.status == "transferring") &
+                   pending_transfers.c.cancel_submitted_at.is_(None))
             .values(
                 status="held_by_probe",
-                note="Transfer interrupted by a server restart; probe likely still holds "
-                     "the court — retry with the Transfer button.",
+                note="Transfer interrupted by a server restart before the cancel was sent; "
+                     "the probe still holds the court — retry with the Transfer button.",
+            )
+        )
+        conn.execute(
+            update(pending_transfers)
+            .where((pending_transfers.c.status == "transferring") &
+                   pending_transfers.c.cancel_submitted_at.isnot(None))
+            .values(
+                status="needs_check",
+                note="Transfer interrupted by a server restart after the probe's cancel was "
+                     "sent: the court may be on the probe, on the main account, or lost. "
+                     "Check CourtReserve, then record what you found on this transfer's page.",
             )
         )
         for t in conn.execute(
             select(pending_transfers).where(
-                pending_transfers.c.status.in_(["pending", "held_by_probe", "transferring"])
+                pending_transfers.c.status.in_(
+                    ["pending", "held_by_probe", "transferring", "needs_check"])
             )
         ).fetchall():
             try:

@@ -538,6 +538,16 @@ def _dump_no_modal_diagnostics(page: Page, slot_label: str, bbox) -> None:
         print(f"  [debug] dom probe failed: {e}")
 
 
+def _may_carry_new_reservation_id(url: str) -> bool:
+    """Whether a response seen after Save may name the reservation just made. Anything
+    reservation- or booking-ish, except the grid's slot feed (Reservations/
+    ReadConsolidated): it matches "reservation" too, and a grid refresh after Save would
+    carry other reservations' ids. A transfer cancels whatever id is captured, so the
+    feed is never a source."""
+    u = url.lower()
+    return ("reservation" in u or "booking" in u) and "readconsolidated" not in u
+
+
 def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig = DEFAULT_ORG_CONFIG, dry_run: bool = False, result: Optional[dict] = None) -> bool:
     print("Booking modal opened — waiting for full AJAX load...")
 
@@ -699,8 +709,7 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: Or
     def _on_save_response(resp):
         if _save_capture.get("id"):
             return
-        u = resp.url.lower()
-        if "reservation" not in u and "booking" not in u:
+        if not _may_carry_new_reservation_id(resp.url):
             return
         try:
             body = resp.text()
@@ -835,7 +844,11 @@ def match_reservation_id(reservations: list[dict], slot_date: str, slot_time: st
     return None
 
 
-def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT_ORG_CONFIG) -> bool:
+def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT_ORG_CONFIG,
+                       before_submit=None) -> bool:
+    """Cancel one reservation through its detail page. `before_submit`, if given, is
+    called just before the final Cancel click: an error before it means nothing was
+    sent to CourtReserve, an error after it means the cancel may have gone through."""
     reason = random.choice(CANCEL_REASONS)
     detail_url = f"https://app.courtreserve.com/Online/MyProfile/Reservation/{org.org_id}/{reservation_id}"
     print(f"Cancelling reservation {reservation_id} (reason: '{reason}')...")
@@ -851,7 +864,12 @@ def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT
     reason_field.fill(reason)
     page.wait_for_timeout(300)
 
-    page.query_selector('button[type="submit"]:has-text("Cancel Reservation")').click()
+    submit = page.query_selector('button[type="submit"]:has-text("Cancel Reservation")')
+    if submit is None:
+        raise BookingError("the Cancel Reservation button wasn't on the page")
+    if before_submit:
+        before_submit()
+    submit.click()
     page.wait_for_timeout(4000)
 
     page_text = page.evaluate("document.body.innerText")
