@@ -845,10 +845,13 @@ def match_reservation_id(reservations: list[dict], slot_date: str, slot_time: st
 
 
 def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT_ORG_CONFIG,
-                       before_submit=None) -> bool:
-    """Cancel one reservation through its detail page. `before_submit`, if given, is
-    called just before the final Cancel click: an error before it means nothing was
-    sent to CourtReserve, an error after it means the cancel may have gone through."""
+                       before_first_click=None) -> bool:
+    """Cancel one reservation through its detail page. `before_first_click`, if given,
+    is called once the page has loaded and before anything on it is clicked: an error
+    before it means nothing was done on CourtReserve. From the first click on, a page
+    that isn't what this code expects (a changed cancel dialog, a slow update) can't
+    tell "not cancelled" from "cancelled", so callers must treat any failure after it
+    as "may have gone through"."""
     reason = random.choice(CANCEL_REASONS)
     detail_url = f"https://app.courtreserve.com/Online/MyProfile/Reservation/{org.org_id}/{reservation_id}"
     print(f"Cancelling reservation {reservation_id} (reason: '{reason}')...")
@@ -856,6 +859,8 @@ def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT
     page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
     page.wait_for_timeout(2000)
 
+    if before_first_click:
+        before_first_click()
     page.get_by_text("Cancel Reservation", exact=True).first.click()
     page.wait_for_timeout(2000)
 
@@ -867,8 +872,6 @@ def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT
     submit = page.query_selector('button[type="submit"]:has-text("Cancel Reservation")')
     if submit is None:
         raise BookingError("the Cancel Reservation button wasn't on the page")
-    if before_submit:
-        before_submit()
     submit.click()
     page.wait_for_timeout(4000)
 

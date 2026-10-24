@@ -111,10 +111,10 @@ pending_transfers = Table("pending_transfers", metadata,
     Column("auto", Boolean, default=False),            # auto-transfer requested
     Column("note", Text, default=""),                  # last status detail
     Column("log_text", Text, default=""),              # full transfer run output
-    # Set just before the probe's cancel is submitted, cleared when a transfer is
-    # claimed: after a restart, it tells "interrupted before the cancel" (safe to
-    # retry) from "after it" (the court may have moved or been lost).
-    Column("cancel_submitted_at", DateTime, nullable=True),
+    # Set just before the first click on the probe's cancel, cleared when a transfer
+    # is claimed: after a restart, it tells "interrupted before the cancel started"
+    # (safe to retry) from "after" (the court may have moved or been lost).
+    Column("cancel_started_at", DateTime, nullable=True),
     Column("created_at", DateTime, default=datetime.utcnow),
     Column("resolved_at", DateTime, nullable=True),
 )
@@ -147,7 +147,7 @@ def init_db():
     _migrate_orgs_resident_days_out()
     _migrate_bug_reports_gh_columns()
     _migrate_pending_transfers_log_text()
-    _migrate_pending_transfers_cancel_submitted_at()
+    _migrate_pending_transfers_cancel_started_at()
     _seed_orgs()
 
 
@@ -163,16 +163,16 @@ def _migrate_pending_transfers_log_text():
         conn.execute(text("ALTER TABLE pending_transfers ADD COLUMN log_text TEXT DEFAULT ''"))
 
 
-def _migrate_pending_transfers_cancel_submitted_at():
-    """Add pending_transfers.cancel_submitted_at if missing."""
+def _migrate_pending_transfers_cancel_started_at():
+    """Add pending_transfers.cancel_started_at if missing."""
     with engine.connect() as conn:
         row = conn.execute(text(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_transfers'"
         )).fetchone()
-        if not row or "cancel_submitted_at" in (row[0] or ""):
+        if not row or "cancel_started_at" in (row[0] or ""):
             return
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE pending_transfers ADD COLUMN cancel_submitted_at DATETIME"))
+        conn.execute(text("ALTER TABLE pending_transfers ADD COLUMN cancel_started_at DATETIME"))
 
 
 def _migrate_accounts_org_optional():

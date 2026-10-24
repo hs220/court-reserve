@@ -707,7 +707,7 @@ def _transfer_result(outcome: dict) -> tuple[str, str, str]:
                 "the court.")
     if status == "needs_check":
         return ("cancel_uncertain", "unknown",
-                "Not transferred. The cancel on the probe account errored after it was submitted, "
+                "Not transferred. The cancel on the probe account started but wasn't confirmed, "
                 "so it may or may not have gone through, and no booking was tried for the main "
                 "account. The court MAY BE LOST. A person must check CourtReserve and record what "
                 "they found in the app before this transfer can be tried again.")
@@ -715,7 +715,7 @@ def _transfer_result(outcome: dict) -> tuple[str, str, str]:
         if outcome.get("errored_before_cancel"):
             why = "the app couldn't open a browser or log in"
         elif outcome.get("cancel_error"):
-            why = "CourtReserve's cancel page wasn't as expected, and nothing was submitted"
+            why = "CourtReserve's reservation page didn't load, and nothing was clicked"
         else:
             why = "CourtReserve didn't confirm the cancel"
         return ("failed_before_cancel", "probe",

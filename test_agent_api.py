@@ -750,6 +750,12 @@ class TransferTestCase(AgentApiTestCase):
         p = mock.patch("web.job_runner.time")
         p.start()
         self.addCleanup(p.stop)
+        # Like the real one: the hook runs once the page has loaded, then the answer.
+        def cancel(page, rid, org, before_first_click=None):
+            if before_first_click:
+                before_first_click()
+            return mock.DEFAULT
+        self.fake["cancel_reservation"].side_effect = cancel
         self.fake["cancel_reservation"].return_value = True
         self.fake["book_slot"].return_value = True
 
@@ -888,15 +894,35 @@ class TransferCompleteTests(TransferTestCase):
         self.assertEqual(call("POST", f"/api/agent/v1/transfers/{tid}/complete", None)[0], 422)
         self.fake["sync_playwright"].assert_not_called()
 
-    def test_a_cancel_that_does_not_go_through_changes_nothing(self):
+    def test_a_cancel_submitted_but_not_confirmed_needs_a_check(self):
+        # A slow or changed page after the submit: cancel_reservation returns False.
         tid = self.add_transfer()
         self.fake["cancel_reservation"].return_value = False
         body = self.complete(tid)[1]
-        self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
-        self.assertIn("nothing changed", body["message"])
+        self.assertEqual((body["outcome"], body["court"]), ("cancel_uncertain", "unknown"))
+        self.assertNotIn("nothing changed", body["message"])
         self.fake["book_slot"].assert_not_called()
-        self.assertEqual(self.transfer(tid).status, "held_by_probe")
-        self.assertEqual(self.courts(tid), [(self.acc_id, future(), "19:30")])
+        t = self.transfer(tid)
+        self.assertEqual((t.status, t.note), ("needs_check", jr.CANCEL_UNCERTAIN_NOTE))
+        self.assertIsNotNone(t.cancel_started_at)
+        self.assertFalse(body["transfer"]["completable"])
+        self.assertEqual(self.courts(tid), [])
+        self.assertEqual(self.complete(tid)[0], 409)
+        self.assertEqual(self.fake["cancel_reservation"].call_count, 1)
+
+    def test_39s_failure_mode_needs_a_check(self):
+        # The first click happened, then the reason field timed out (live transfer #39).
+        tid = self.add_transfer()
+
+        def cancel(page, rid, org, before_first_click=None):
+            before_first_click()
+            raise TimeoutError('Page.wait_for_selector: Timeout 5000ms exceeded. waiting for '
+                               'locator("#SelectedReservation_CancellationReason")')
+
+        self.fake["cancel_reservation"].side_effect = cancel
+        body = self.complete(tid)[1]
+        self.assertEqual(body["outcome"], "cancel_uncertain")
+        self.assertEqual(self.transfer(tid).status, "needs_check")
 
     def test_a_failed_login_is_before_the_cancel(self):
         tid = self.add_transfer()
@@ -910,17 +936,17 @@ class TransferCompleteTests(TransferTestCase):
         self.assertTrue(body["transfer"]["completable"])
 
     @staticmethod
-    def cancel_raising(after_submit):
-        """A fake cancel that raises before, or after, it submits."""
-        def cancel(page, rid, org, before_submit=None):
-            if after_submit:
-                before_submit()
+    def cancel_raising(after_start):
+        """A fake cancel that raises before, or after, its first click."""
+        def cancel(page, rid, org, before_first_click=None):
+            if after_start:
+                before_first_click()
             raise RuntimeError("Execution context was destroyed")
         return cancel
 
-    def test_a_cancel_that_errors_after_submitting_is_stored_as_needing_a_check(self):
+    def test_a_cancel_that_errors_after_starting_is_stored_as_needing_a_check(self):
         tid = self.add_transfer()
-        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_submit=True)
+        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_start=True)
         body = self.complete(tid)[1]
         self.assertEqual((body["outcome"], body["court"]), ("cancel_uncertain", "unknown"))
         self.assertIn("MAY BE LOST", body["message"])
@@ -929,7 +955,7 @@ class TransferCompleteTests(TransferTestCase):
         t = self.transfer(tid)
         self.assertEqual(t.status, "needs_check")
         self.assertEqual(t.note, jr.CANCEL_UNCERTAIN_NOTE)
-        self.assertIsNotNone(t.cancel_submitted_at)
+        self.assertIsNotNone(t.cancel_started_at)
         self.assertIsNone(t.resolved_at)
         self.assertFalse(body["transfer"]["completable"])
         self.assertIn("MAY BE LOST", body["transfer"]["why_not"])
@@ -949,27 +975,27 @@ class TransferCompleteTests(TransferTestCase):
         listed = {x["id"]: x for x in call("GET", "/api/agent/v1/transfers")[1]["transfers"]}
         self.assertEqual(listed[tid]["status"], "needs_check")
 
-    def test_a_cancel_that_errors_before_submitting_changed_nothing(self):
-        # Transfer #39, live: the reason field never appeared, so nothing was sent.
+    def test_a_cancel_that_errors_before_its_first_click_changed_nothing(self):
+        # The reservation page never loaded: nothing was clicked on CourtReserve.
         tid = self.add_transfer()
-        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_submit=False)
+        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_start=False)
         body = self.complete(tid)[1]
         self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
-        self.assertIn("nothing was submitted", body["message"])
+        self.assertIn("nothing was clicked", body["message"])
         t = self.transfer(tid)
         self.assertEqual(t.status, "held_by_probe")
-        self.assertIn("before it was submitted", t.note)
-        self.assertIsNone(t.cancel_submitted_at)
+        self.assertIn("before anything was clicked", t.note)
+        self.assertIsNone(t.cancel_started_at)
         self.assertTrue(body["transfer"]["completable"])
 
     def test_a_retry_clears_the_last_attempts_marker(self):
         tid = self.add_transfer(status="held_by_probe")
         with engine.begin() as conn:
             conn.execute(pending_transfers.update().where(pending_transfers.c.id == tid)
-                         .values(cancel_submitted_at=datetime.utcnow()))
-        self.fake["cancel_reservation"].return_value = False
+                         .values(cancel_started_at=datetime.utcnow()))
+        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_start=False)
         self.complete(tid)
-        self.assertIsNone(self.transfer(tid).cancel_submitted_at)
+        self.assertIsNone(self.transfer(tid).cancel_started_at)
 
     def test_a_court_the_probe_books_back_gets_its_new_id(self):
         tid = self.add_transfer()
@@ -1106,7 +1132,7 @@ class TransferRecoveryTests(TransferTestCase):
         tid = self.add_transfer(status="transferring")
         with engine.begin() as conn:
             conn.execute(pending_transfers.update().where(pending_transfers.c.id == tid)
-                         .values(cancel_submitted_at=datetime.utcnow()))
+                         .values(cancel_started_at=datetime.utcnow()))
         self.recover()
         t = self.transfer(tid)
         self.assertEqual(t.status, "needs_check")
@@ -1116,13 +1142,13 @@ class TransferRecoveryTests(TransferTestCase):
         self.assertIn("MAY BE LOST", body["detail"])
         self.fake["sync_playwright"].assert_not_called()
 
-    def test_the_marker_is_written_when_the_cancel_is_submitted(self):
-        # A real transfer that dies right after submitting is recovered as needs_check.
+    def test_the_marker_is_written_when_the_cancel_starts(self):
+        # A real transfer that dies once its cancel has started is recovered as needs_check.
         tid = self.add_transfer()
 
-        def cancel(page, rid, org, before_submit=None):
-            before_submit()
-            self.assertIsNotNone(self.transfer(tid).cancel_submitted_at)
+        def cancel(page, rid, org, before_first_click=None):
+            before_first_click()
+            self.assertIsNotNone(self.transfer(tid).cancel_started_at)
             raise SystemExit("the process died here")  # not caught by the runner
 
         self.fake["cancel_reservation"].side_effect = cancel
@@ -1232,7 +1258,7 @@ class AutoTransferTests(TransferTestCase):
         self.transfer_ids.append(row.id)
         self.assertEqual(status, "pending_transfer")
         self.assertEqual((row.status, row.note), ("needs_check", jr.CANCEL_UNCERTAIN_NOTE))
-        self.assertIsNotNone(row.cancel_submitted_at)
+        self.assertIsNotNone(row.cancel_started_at)
         self.assertEqual(booked, [])
         self.assertIn("may have gone through", self.fake["_send_warning_email"].call_args.args[1])
 
