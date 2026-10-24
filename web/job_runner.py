@@ -298,6 +298,20 @@ def _record_booking(run_id: int, account_id: int, slot, duration_min: int):
         ))
 
 
+def _record_transfer_court(run_id, holder_id, slot, duration_min, account_ids):
+    """Make the app's record of a transferred court say who holds it now: one row for
+    `holder_id` (None: nobody, the court was lost), and none for the transfer's other
+    account. A transfer can be retried, and sync never deletes job-linked rows, so
+    adding a row each time would leave the probe's court listed for good after the
+    main account took it."""
+    with engine.begin() as conn:
+        conn.execute(bookings.delete().where(
+            (bookings.c.job_run_id == run_id) & bookings.c.account_id.in_(account_ids) &
+            (bookings.c.date == slot.start_date) & (bookings.c.start_time == slot.start_time)))
+    if holder_id is not None:
+        _record_booking(run_id, holder_id, slot, duration_min)
+
+
 # ── probe → main transfer ───────────────────────────────────────────────────────
 
 def _slot_from_fields(date_str: str, start_time: str, duration_min: int, court_type: str, tz: str) -> Slot:
@@ -330,29 +344,43 @@ def _create_pending_transfer(job_id, run_id, org, probe_account, main_account,
         return result.inserted_primary_key[0]
 
 
-def _update_pending_transfer(transfer_id, status, note=""):
+def _update_pending_transfer(transfer_id, status, note="", reservation_id=None):
     resolved = datetime.utcnow() if status in ("transferred", "failed") else None
+    values = dict(status=status, note=note, resolved_at=resolved)
+    if reservation_id is not None:
+        values["reservation_id"] = reservation_id
     with engine.begin() as conn:
         conn.execute(update(pending_transfers).where(pending_transfers.c.id == transfer_id)
-                     .values(status=status, note=note, resolved_at=resolved))
+                     .values(**values))
 
 
-def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_id, slot, duration, log):
+def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_id, slot, duration, log,
+                                 info=None):
     """Cancel the probe's reservation and re-book on the main account, using two
     already-logged-in pages. Returns (status, note):
       transferred    – main holds it
       held_by_probe  – probe still holds it (cancel failed, or main re-book failed but
                        probe re-booked to retain)
-      failed         – court lost (cancel ok, main and probe both failed to re-book)"""
+      failed         – court lost (cancel ok, main and probe both failed to re-book)
+
+    `info`, when given, is filled with what a status alone can't say: `cancelled`
+    (the probe's reservation was cancelled), `cancel_error` (the cancel raised part-way,
+    so it may or may not have gone through), and `reservation_id` when the probe
+    re-booked: its new reservation's id, or "" if none was captured. The stored id then
+    names a cancelled reservation and must be replaced before any retry."""
+    info = {} if info is None else info
+    info["cancelled"] = False
     if not reservation_id:
         return "held_by_probe", "No reservation id captured — probe still holds the court; cancel manually."
     try:
         cancelled = cancel_reservation(probe_page, reservation_id, org_cfg)
     except Exception as e:
         log(f"Cancel raised: {e}")
+        info["cancel_error"] = str(e)
         cancelled = False
     if not cancelled:
         return "held_by_probe", "Cancel failed — probe still holds the court."
+    info["cancelled"] = True
 
     # Re-book on main as fast as possible (the court is exposed during this window).
     main_ok = False
@@ -370,8 +398,11 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
 
     # Safety fallback: probe re-books to retain the court rather than lose it.
     log("Main re-book failed — probe re-booking to retain the court...")
+    rebooked = {}
     try:
-        if book_slot(probe_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg):
+        if book_slot(probe_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg,
+                     result=rebooked):
+            info["reservation_id"] = rebooked.get("reservation_id", "")
             return "held_by_probe", "Main re-book failed; probe re-booked to retain the court."
     except Exception as e:
         log(f"Probe re-book error: {e}")
@@ -390,25 +421,32 @@ def _persist_transfer_log(transfer_id: int, buf: io.StringIO):
         pass
 
 
-def run_transfer(transfer_id: int):
-    """Execute a pending transfer (manual Transfer button): cancel the probe's
-    reservation and re-book on the main account. Launches its own browser. All output is
-    captured to pending_transfers.log_text so it can be viewed from the UI."""
+def run_transfer(transfer_id: int, outcome: dict | None = None):
+    """Execute a pending transfer (manual Transfer button, or the agent API): cancel the
+    probe's reservation and re-book on the main account. Launches its own browser. All
+    output is captured to pending_transfers.log_text so it can be viewed from the UI.
+
+    `outcome`, when given, is filled as the transfer goes: `claimed` once it has (or
+    hasn't) taken the transfer, then `status`, `note` and the step details of
+    _perform_transfer_with_pages's `info` once the result is stored -- before the result
+    email, which can take minutes on a bad network."""
     buf = io.StringIO()
     with _capture(buf):
         try:
-            _run_transfer_inner(transfer_id, buf)
+            _run_transfer_inner(transfer_id, buf, {} if outcome is None else outcome)
         finally:
             _persist_transfer_log(transfer_id, buf)
 
 
-def _run_transfer_inner(transfer_id: int, buf: io.StringIO):
+def _run_transfer_inner(transfer_id: int, buf: io.StringIO, outcome: dict):
     ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{ts}] Transfer #{transfer_id} starting...")
     # Atomically claim the transfer: flip a runnable transfer (pending/held_by_probe) to
     # 'transferring' in one UPDATE. If nothing was claimed, it's already resolved or being
     # run by another click — bail. (The caller must NOT pre-set 'transferring' itself, or
     # this claim would never match and the worker would no-op — that was the original bug.)
+    # This claim is the one lock between the UI's button and the agent API: whoever
+    # flips the row runs the transfer, and the other finds it 'transferring'.
     with engine.begin() as conn:
         claimed = conn.execute(
             update(pending_transfers)
@@ -416,6 +454,7 @@ def _run_transfer_inner(transfer_id: int, buf: io.StringIO):
                    (pending_transfers.c.status.in_(["pending", "held_by_probe"])))
             .values(status="transferring", note="Transfer started.")
         )
+        outcome["claimed"] = claimed.rowcount == 1
         if claimed.rowcount == 0:
             row = conn.execute(pending_transfers.select()
                                .where(pending_transfers.c.id == transfer_id)).fetchone()
@@ -435,6 +474,8 @@ def _run_transfer_inner(transfer_id: int, buf: io.StringIO):
     slot = _slot_from_fields(t["date"], t["start_time"], t["duration_min"], t.get("court_type", ""), org_cfg.timezone)
 
     # (status already set to 'transferring' by the atomic claim above)
+    info: dict = {}
+    result = None
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True, args=BROWSER_ARGS)
@@ -446,22 +487,43 @@ def _run_transfer_inner(transfer_id: int, buf: io.StringIO):
             main_page = main_ctx.new_page()
             ensure_logged_in(main_ctx, main_page, main["email"], main["password"],
                              org_cfg.booking_url, _session_file(main, org))
-            status, note = _perform_transfer_with_pages(
-                probe_page, main_page, org_cfg, t["reservation_id"], slot, t["duration_min"], print)
+            result = _perform_transfer_with_pages(
+                probe_page, main_page, org_cfg, t["reservation_id"], slot, t["duration_min"], print,
+                info=info)
             browser.close()
     except Exception as exc:
-        _update_pending_transfer(transfer_id, "held_by_probe",
-                                 f"Transfer errored ({exc}); probe likely still holds the court.")
-        _send_warning_email("Court transfer errored",
-                            f"Transfer #{transfer_id} for {t['date']} {t['start_time']} errored: {exc}\n"
-                            f"The probe account likely still holds the court — check and retry.")
-        return
+        if result is not None:
+            # Closing the browser failed after the transfer finished: the result stands.
+            print(f"Browser shutdown error after the transfer ({exc}); keeping its result.")
+        elif info.get("cancelled"):
+            # The probe's court was already given up when this escaped: don't call it
+            # held, and don't leave it retryable with an id that names a cancelled court.
+            note = (f"Transfer errored after the probe's reservation was cancelled ({exc}); "
+                    "the court may be lost — check CourtReserve.")
+            _update_pending_transfer(transfer_id, "failed", note)
+            outcome.update(status="failed", note=note, **info)
+            _send_warning_email("Court transfer errored",
+                                f"Transfer #{transfer_id} for {t['date']} {t['start_time']}: {note}")
+            return
+        else:
+            note = f"Transfer errored ({exc}); probe likely still holds the court."
+            _update_pending_transfer(transfer_id, "held_by_probe", note)
+            outcome.update(status="held_by_probe", note=note, errored_before_cancel=True, **info)
+            _send_warning_email("Court transfer errored",
+                                f"Transfer #{transfer_id} for {t['date']} {t['start_time']} errored: {exc}\n"
+                                f"The probe account likely still holds the court — check and retry.")
+            return
 
-    _update_pending_transfer(transfer_id, status, note)
+    status, note = result
+    _update_pending_transfer(transfer_id, status, note, reservation_id=info.get("reservation_id"))
+    outcome.update(status=status, note=note, **info)
+    ids = (probe["id"], main["id"])
     if status == "transferred":
-        _record_booking(t["run_id"], main["id"], slot, t["duration_min"])
+        _record_transfer_court(t["run_id"], main["id"], slot, t["duration_min"], ids)
     elif status == "held_by_probe":
-        _record_booking(t["run_id"], probe["id"], slot, t["duration_min"])
+        _record_transfer_court(t["run_id"], probe["id"], slot, t["duration_min"], ids)
+    elif info.get("cancelled"):
+        _record_transfer_court(t["run_id"], None, slot, t["duration_min"], ids)
     _send_warning_email(
         f"Court transfer {status}: {t['date']} {t['start_time']}",
         f"Transfer #{transfer_id} for {t['date']} {t['start_time']} ({t['duration_min']}min): {status}.\n{note}",
@@ -498,8 +560,13 @@ def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_acco
     if not reservation_id:
         print(f"[{ts}] Warning: no reservation id captured — transfer will need a manual cancel.")
 
+    # An auto-transfer is created already 'transferring', not 'pending': the notice below
+    # can take minutes to send, and a pending row in that gap would let the UI's button
+    # or the agent API claim and run the same transfer alongside this one.
     transfer_id = _create_pending_transfer(
-        job_id, run_id, org, probe_account, main_account, reservation_id, slot, duration, auto_transfer)
+        job_id, run_id, org, probe_account, main_account, reservation_id, slot, duration, auto_transfer,
+        status="transferring" if auto_transfer else "pending",
+        note="Auto-transfer queued." if auto_transfer else "")
 
     probe_label = probe_account.get("label") or probe_account["email"]
     _send_warning_email(
@@ -516,14 +583,20 @@ def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_acco
 
     # Auto-transfer now, reusing the already-warm probe/main pages.
     _update_pending_transfer(transfer_id, "transferring", "Auto-transfer started.")
+    info: dict = {}
     try:
         t_status, t_note = _perform_transfer_with_pages(
             probe_page, booking_page, org_cfg, reservation_id, slot, duration,
-            log=lambda m: print(f"[{datetime.now(tz_obj).strftime('%Y-%m-%d %H:%M:%S %Z')}] {m}"))
+            log=lambda m: print(f"[{datetime.now(tz_obj).strftime('%Y-%m-%d %H:%M:%S %Z')}] {m}"),
+            info=info)
     except Exception as e:
-        # Probe already holds the court; leave it recoverable via the Transfer button.
-        t_status, t_note = "held_by_probe", f"Auto-transfer errored ({e}); probe still holds the court."
-    _update_pending_transfer(transfer_id, t_status, t_note)
+        if info.get("cancelled"):
+            t_status, t_note = "failed", (f"Auto-transfer errored after the probe's reservation was "
+                                          f"cancelled ({e}); the court may be lost — check CourtReserve.")
+        else:
+            # Probe already holds the court; leave it recoverable via the Transfer button.
+            t_status, t_note = "held_by_probe", f"Auto-transfer errored ({e}); probe still holds the court."
+    _update_pending_transfer(transfer_id, t_status, t_note, reservation_id=info.get("reservation_id"))
     print(f"[{ts}] Auto-transfer #{transfer_id} result: {t_status} — {t_note}")
 
     if t_status == "transferred":
