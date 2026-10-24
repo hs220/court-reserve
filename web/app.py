@@ -47,7 +47,7 @@ def _recover_stuck_transfers():
     """Tidy up transfers that can no longer make progress:
 
     1. 'transferring' was interrupted by a restart (the worker thread doesn't survive).
-       If the probe's cancel hadn't been submitted yet (no cancel_submitted_at), nothing
+       If the probe's cancel hadn't started yet (no cancel_started_at), nothing
        changed on CourtReserve: flip it back to 'held_by_probe', recoverable via the
        Transfer button. If it had, the court may be on the probe, on the main account,
        or lost: 'needs_check', for a person to look and record what they found.
@@ -61,7 +61,7 @@ def _recover_stuck_transfers():
         conn.execute(
             update(pending_transfers)
             .where((pending_transfers.c.status == "transferring") &
-                   pending_transfers.c.cancel_submitted_at.is_(None))
+                   pending_transfers.c.cancel_started_at.is_(None))
             .values(
                 status="held_by_probe",
                 note="Transfer interrupted by a server restart before the cancel was sent; "
@@ -71,7 +71,7 @@ def _recover_stuck_transfers():
         conn.execute(
             update(pending_transfers)
             .where((pending_transfers.c.status == "transferring") &
-                   pending_transfers.c.cancel_submitted_at.isnot(None))
+                   pending_transfers.c.cancel_started_at.isnot(None))
             .values(
                 status="needs_check",
                 note="Transfer interrupted by a server restart after the probe's cancel was "

@@ -402,12 +402,8 @@ class FeedNotJsonTests(unittest.TestCase):
         self.assertIn("body unavailable", str(cm.exception))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CancelAndCaptureTests(unittest.TestCase):
-    """What a transfer relies on: knowing whether a cancel was submitted, and never
+    """What a transfer relies on: knowing whether a cancel was started, and never
     taking another reservation's id for the one just booked."""
 
     def _page(self, has_reason_field=True, has_submit=True):
@@ -421,26 +417,42 @@ class CancelAndCaptureTests(unittest.TestCase):
         page.query_selector.return_value = submit
         return page, submit
 
-    def test_before_submit_runs_just_before_the_click(self):
-        from booking import OrgConfig, cancel_reservation
+    def org(self):
+        from booking import OrgConfig
+        return OrgConfig(org_id="1", scheduler_id="1", cost_type_id="1")
+
+    def test_the_hook_runs_before_the_first_click(self):
+        from booking import cancel_reservation
         page, submit = self._page()
         order = []
-        submit.click.side_effect = lambda: order.append("click")
-        ok = cancel_reservation(page, "12345678", OrgConfig(org_id="1", scheduler_id="1",
-                                                            cost_type_id="1"),
-                                before_submit=lambda: order.append("before"))
+        page.get_by_text.return_value.first.click.side_effect = lambda: order.append("open")
+        submit.click.side_effect = lambda: order.append("submit")
+        ok = cancel_reservation(page, "12345678", self.org(),
+                                before_first_click=lambda: order.append("hook"))
         self.assertTrue(ok)
-        self.assertEqual(order, ["before", "click"])
+        self.assertEqual(order, ["hook", "open", "submit"])
 
-    def test_nothing_is_submitted_when_the_form_isnt_there(self):
-        from booking import OrgConfig, cancel_reservation
-        org = OrgConfig(org_id="1", scheduler_id="1", cost_type_id="1")
+    def test_a_changed_cancel_dialog_fails_after_the_hook(self):
+        # Transfer #39, live: "Cancel Reservation" was clicked, then the reason field
+        # never appeared. Something was done on CourtReserve, so the hook has run.
+        from booking import cancel_reservation
         for kwargs in ({"has_reason_field": False}, {"has_submit": False}):
             page, _ = self._page(**kwargs)
             called = []
             with self.assertRaises(Exception, msg=kwargs):
-                cancel_reservation(page, "12345678", org, before_submit=lambda: called.append(1))
-            self.assertEqual(called, [], kwargs)
+                cancel_reservation(page, "12345678", self.org(),
+                                   before_first_click=lambda: called.append(1))
+            self.assertEqual(called, [1], kwargs)
+
+    def test_a_page_that_never_loads_fails_before_the_hook(self):
+        from booking import cancel_reservation
+        page, _ = self._page()
+        page.goto.side_effect = TimeoutError("Timeout 20000ms exceeded")
+        called = []
+        with self.assertRaises(TimeoutError):
+            cancel_reservation(page, "12345678", self.org(), before_first_click=lambda: called.append(1))
+        self.assertEqual(called, [])
+        page.get_by_text.assert_not_called()
 
     def test_the_grid_feed_is_never_a_source_of_the_new_id(self):
         from booking import _may_carry_new_reservation_id as ok
@@ -448,3 +460,7 @@ class CancelAndCaptureTests(unittest.TestCase):
         self.assertTrue(ok("https://reservations.courtreserve.com/Online/ReservationsApi/CreateReservation"))
         self.assertTrue(ok("https://app.courtreserve.com/Online/Bookings/Save"))
         self.assertFalse(ok("https://app.courtreserve.com/Online/Portal/Index"))
+
+
+if __name__ == "__main__":
+    unittest.main()

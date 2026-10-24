@@ -187,9 +187,10 @@ cancel_uncertain / failed_after_cancel (`court`: probe, lost or unknown) / runni
 errored.
 After a probe re-books, the stored reservation id is replaced with the new one (or
 cleared), since the old one names a cancelled reservation. `cancel_reservation` calls
-`before_submit` just before its final click, and the transfer persists that moment as
-`cancel_submitted_at`. A cancel that raises after it is stored as `needs_check` (it may
-have gone through), and so is a `transferring` row a restart finds with the marker set;
+`before_first_click` once the reservation page has loaded, before its first click, and the
+transfer persists that moment as `cancel_started_at`. From then on, any cancel that isn't
+confirmed -- it raises, or returns False -- is stored as `needs_check` (it may have gone
+through), and so is a `transferring` row a restart finds with the marker set;
 without it, recovery returns the row to `held_by_probe`. Nothing runs a `needs_check`
 transfer (the claim doesn't take it, and the API refuses it) until a person records
 what CourtReserve shows on its page (`POST /transfers/{id}/checked`, UI only).
