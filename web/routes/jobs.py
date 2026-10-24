@@ -95,7 +95,8 @@ async def list_jobs(request: Request, page: int = 1):
         # not the failed/expired/transferred ones.
         transfers = [row_to_dict(r) for r in conn.execute(
             pending_transfers.select()
-            .where(pending_transfers.c.status.in_(["pending", "transferring", "held_by_probe"]))
+            .where(pending_transfers.c.status.in_(
+                ["pending", "transferring", "held_by_probe", "needs_check"]))
             .order_by(pending_transfers.c.created_at.desc())
         )]
         # Map each job to its latest transfer (any status) so jobs can link to it.
@@ -445,6 +446,44 @@ async def execute_transfer(transfer_id: int):
                          .values(note="Transfer queued..."))
     threading.Thread(target=run_transfer, kwargs={"transfer_id": transfer_id}, daemon=True).start()
     return RedirectResponse("/jobs", status_code=303)
+
+
+#: What a person can record after checking CourtReserve for a needs_check transfer.
+CHECKED = {
+    "probe": ("held_by_probe", "Checked on CourtReserve by a person: the probe still holds the "
+                               "original reservation (the cancel didn't go through)."),
+    "main": ("transferred", "Checked on CourtReserve by a person: the main account has the court."),
+    "closed": ("failed", "Checked on CourtReserve by a person and closed: not transferable from "
+                         "the app (lost, or handled by hand)."),
+}
+
+
+@router.post("/transfers/{transfer_id}/checked")
+async def transfer_checked(transfer_id: int, holder: str = Form(...)):
+    """Record what a person found on CourtReserve for a transfer whose cancel may have
+    gone through (needs_check). Until this, neither the Transfer button nor the agent
+    API will run it: a retry could cancel or book on a state nobody has looked at."""
+    from web.job_runner import _record_transfer_court, _slot_from_fields
+    if holder not in CHECKED:
+        return PlainTextResponse("holder is probe, main or closed.", status_code=400)
+    status, note = CHECKED[holder]
+    with engine.begin() as conn:
+        done = conn.execute(
+            update(pending_transfers)
+            .where((pending_transfers.c.id == transfer_id) &
+                   (pending_transfers.c.status == "needs_check"))
+            .values(status=status, note=note,
+                    resolved_at=None if status == "held_by_probe" else datetime.utcnow())
+        ).rowcount
+        t = conn.execute(pending_transfers.select()
+                         .where(pending_transfers.c.id == transfer_id)).fetchone()
+    if done and t:
+        slot = _slot_from_fields(t.date, t.start_time, t.duration_min, t.court_type or "",
+                                 "America/Los_Angeles")
+        holder_id = {"probe": t.probe_account_id, "main": t.main_account_id}.get(holder)
+        _record_transfer_court(t.run_id, holder_id, slot, t.duration_min,
+                               (t.probe_account_id, t.main_account_id))
+    return RedirectResponse(f"/transfers/{transfer_id}", status_code=303)
 
 
 @router.get("/transfers/{transfer_id}/log", response_class=PlainTextResponse)

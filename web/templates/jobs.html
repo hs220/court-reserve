@@ -97,6 +97,8 @@
           </form>
           {% elif t.status == 'transferring' %}
           <span style="color:var(--muted);font-size:12px">in progress…</span>
+          {% elif t.status == 'needs_check' %}
+          <a href="/transfers/{{ t.id }}" class="btn btn-primary btn-sm">Check needed →</a>
           {% endif %}
         </td>
       </tr>

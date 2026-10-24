@@ -909,13 +909,67 @@ class TransferCompleteTests(TransferTestCase):
         # held by the probe and retryable
         self.assertTrue(body["transfer"]["completable"])
 
-    def test_a_cancel_that_errors_part_way_says_the_court_may_be_lost(self):
+    @staticmethod
+    def cancel_raising(after_submit):
+        """A fake cancel that raises before, or after, it submits."""
+        def cancel(page, rid, org, before_submit=None):
+            if after_submit:
+                before_submit()
+            raise RuntimeError("Execution context was destroyed")
+        return cancel
+
+    def test_a_cancel_that_errors_after_submitting_is_stored_as_needing_a_check(self):
         tid = self.add_transfer()
-        self.fake["cancel_reservation"].side_effect = RuntimeError("Execution context was destroyed")
+        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_submit=True)
         body = self.complete(tid)[1]
         self.assertEqual((body["outcome"], body["court"]), ("cancel_uncertain", "unknown"))
         self.assertIn("MAY BE LOST", body["message"])
         self.fake["book_slot"].assert_not_called()
+        # What's stored, listed and emailed says the same, and it isn't offered again.
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "needs_check")
+        self.assertEqual(t.note, jr.CANCEL_UNCERTAIN_NOTE)
+        self.assertIsNotNone(t.cancel_submitted_at)
+        self.assertIsNone(t.resolved_at)
+        self.assertFalse(body["transfer"]["completable"])
+        self.assertIn("MAY BE LOST", body["transfer"]["why_not"])
+        subject, email = self.fake["_send_warning_email"].call_args.args
+        self.assertIn("needs_check", subject)
+        self.assertIn("may have gone through", email)
+        self.assertNotIn("still holds", email)
+        status, again, _ = self.complete(tid)
+        self.assertEqual(status, 409)
+        self.assertIn("A person must check CourtReserve", again["detail"])
+        self.assertEqual(self.fake["cancel_reservation"].call_count, 1)
+        # The UI's button can't run it either: the claim doesn't take needs_check.
+        out = {}
+        jr.run_transfer(tid, out)
+        self.assertFalse(out["claimed"])
+        self.assertEqual(self.courts(tid), [])  # nothing recorded as booked
+        listed = {x["id"]: x for x in call("GET", "/api/agent/v1/transfers")[1]["transfers"]}
+        self.assertEqual(listed[tid]["status"], "needs_check")
+
+    def test_a_cancel_that_errors_before_submitting_changed_nothing(self):
+        # Transfer #39, live: the reason field never appeared, so nothing was sent.
+        tid = self.add_transfer()
+        self.fake["cancel_reservation"].side_effect = self.cancel_raising(after_submit=False)
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
+        self.assertIn("nothing was submitted", body["message"])
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "held_by_probe")
+        self.assertIn("before it was submitted", t.note)
+        self.assertIsNone(t.cancel_submitted_at)
+        self.assertTrue(body["transfer"]["completable"])
+
+    def test_a_retry_clears_the_last_attempts_marker(self):
+        tid = self.add_transfer(status="held_by_probe")
+        with engine.begin() as conn:
+            conn.execute(pending_transfers.update().where(pending_transfers.c.id == tid)
+                         .values(cancel_submitted_at=datetime.utcnow()))
+        self.fake["cancel_reservation"].return_value = False
+        self.complete(tid)
+        self.assertIsNone(self.transfer(tid).cancel_submitted_at)
 
     def test_a_court_the_probe_books_back_gets_its_new_id(self):
         tid = self.add_transfer()
@@ -1032,6 +1086,98 @@ class TransferCompleteTests(TransferTestCase):
         self.assertEqual(self.transfer(tid).status, "transferred")
 
 
+class TransferRecoveryTests(TransferTestCase):
+    """A restart in the middle of a transfer (web/app.py _recover_stuck_transfers)."""
+
+    def recover(self):
+        from web.app import _recover_stuck_transfers
+        _recover_stuck_transfers()
+
+    def test_interrupted_before_the_cancel_is_safe_to_retry(self):
+        tid = self.add_transfer(status="transferring")
+        self.recover()
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "held_by_probe")
+        self.assertIn("before the cancel was sent", t.note)
+        listed = {x["id"]: x for x in call("GET", "/api/agent/v1/transfers")[1]["transfers"]}
+        self.assertTrue(listed[tid]["completable"])
+
+    def test_interrupted_after_the_cancel_needs_a_check(self):
+        tid = self.add_transfer(status="transferring")
+        with engine.begin() as conn:
+            conn.execute(pending_transfers.update().where(pending_transfers.c.id == tid)
+                         .values(cancel_submitted_at=datetime.utcnow()))
+        self.recover()
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "needs_check")
+        self.assertIn("may be on the probe, on the main account, or lost", t.note)
+        status, body, _ = self.complete(tid)
+        self.assertEqual(status, 409)
+        self.assertIn("MAY BE LOST", body["detail"])
+        self.fake["sync_playwright"].assert_not_called()
+
+    def test_the_marker_is_written_when_the_cancel_is_submitted(self):
+        # A real transfer that dies right after submitting is recovered as needs_check.
+        tid = self.add_transfer()
+
+        def cancel(page, rid, org, before_submit=None):
+            before_submit()
+            self.assertIsNotNone(self.transfer(tid).cancel_submitted_at)
+            raise SystemExit("the process died here")  # not caught by the runner
+
+        self.fake["cancel_reservation"].side_effect = cancel
+        with self.assertRaises(SystemExit):
+            jr.run_transfer(tid)
+        self.assertEqual(self.transfer(tid).status, "transferring")
+        self.recover()
+        self.assertEqual(self.transfer(tid).status, "needs_check")
+
+    def test_a_past_needs_check_transfer_is_closed(self):
+        past = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+        tid = self.add_transfer(status="needs_check", date=past)
+        self.recover()
+        self.assertEqual(self.transfer(tid).status, "failed")
+
+
+class TransferCheckedTests(TransferTestCase):
+    """The UI's record of what a person found for a needs_check transfer."""
+
+    def checked(self, tid, holder):
+        from web.routes import jobs as job_routes
+        return asyncio.run(job_routes.transfer_checked(tid, holder))
+
+    def test_the_probe_still_holding_it_makes_it_completable_again(self):
+        tid = self.add_transfer(status="needs_check")
+        self.checked(tid, "probe")
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "held_by_probe")
+        self.assertIn("Checked on CourtReserve by a person", t.note)
+        self.assertEqual(self.courts(tid), [(self.acc_id, future(), "19:30")])
+        self.assertEqual(self.complete(tid)[1]["outcome"], "transferred")
+
+    def test_main_having_it_or_closing_it_ends_the_transfer(self):
+        for holder, status, courts in (("main", "transferred", [(None, future(), "19:30")]),
+                                       ("closed", "failed", [])):
+            tid = self.add_transfer(status="needs_check")
+            self.checked(tid, holder)
+            self.assertEqual(self.transfer(tid).status, status, holder)
+            expected = [(self.main_id, d, t) for _, d, t in courts]
+            self.assertEqual(self.courts(tid), expected, holder)
+            self.assertEqual(self.complete(tid)[0], 409, holder)
+
+    def test_only_a_needs_check_transfer_is_changed(self):
+        tid = self.add_transfer(status="pending")
+        self.checked(tid, "main")
+        self.assertEqual(self.transfer(tid).status, "pending")
+        self.assertEqual(self.checked(tid, "bogus").status_code, 400)
+
+    def test_the_agent_cannot_record_a_check(self):
+        tid = self.add_transfer(status="needs_check")
+        for path in (f"/transfers/{tid}/checked", f"/transfers/{tid}/confirm"):
+            self.assertIn(call("POST", "/api/agent/v1" + path, {"holder": "probe"})[0], (404, 405))
+        self.assertEqual(self.transfer(tid).status, "needs_check")
+
+
 class AutoTransferTests(TransferTestCase):
     def test_an_auto_transfer_is_never_claimable_while_its_notice_sends(self):
         jid = self.add_job()
@@ -1063,6 +1209,32 @@ class AutoTransferTests(TransferTestCase):
         listed = {t["id"]: t for t in call("GET", "/api/agent/v1/transfers?state=all")[1]
                   ["transfers"]}
         self.assertEqual(listed[self.transfer_ids[-1]]["status"], "transferred")
+
+    def test_an_auto_transfer_whose_cancel_may_have_gone_through_needs_a_check(self):
+        jid = self.add_job()
+        rid = self.add_run(jid)
+        self.fake["cancel_reservation"].side_effect = TransferCompleteTests.cancel_raising(True)
+        with engine.connect() as conn:
+            org = row_to_dict(conn.execute(organizations.select()
+                                           .where(organizations.c.id == self.org_id)).fetchone())
+            probe = row_to_dict(conn.execute(accounts.select()
+                                             .where(accounts.c.id == self.acc_id)).fetchone())
+            main = row_to_dict(conn.execute(accounts.select()
+                                            .where(accounts.c.id == self.main_id)).fetchone())
+        slot = jr._slot_from_fields(future(), "19:30", 30, "Hard", "America/Los_Angeles")
+        status = jr._handle_probe_secured(jid, rid, org, jr._org_config(org), main, probe,
+                                          mock.MagicMock(), mock.MagicMock(), slot, 30, True, TZ,
+                                          captured_reservation_id="12345678")
+        with engine.connect() as conn:
+            row = conn.execute(pending_transfers.select()
+                               .where(pending_transfers.c.run_id == rid)).fetchone()
+            booked = conn.execute(bookings.select().where(bookings.c.job_run_id == rid)).fetchall()
+        self.transfer_ids.append(row.id)
+        self.assertEqual(status, "pending_transfer")
+        self.assertEqual((row.status, row.note), ("needs_check", jr.CANCEL_UNCERTAIN_NOTE))
+        self.assertIsNotNone(row.cancel_submitted_at)
+        self.assertEqual(booked, [])
+        self.assertIn("may have gone through", self.fake["_send_warning_email"].call_args.args[1])
 
 
 class MintTokenTests(unittest.TestCase):

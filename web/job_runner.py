@@ -344,6 +344,18 @@ def _create_pending_transfer(job_id, run_id, org, probe_account, main_account,
         return result.inserted_primary_key[0]
 
 
+#: Stored, emailed and shown when the cancel errored after it was submitted.
+CANCEL_UNCERTAIN_NOTE = ("The cancel on the probe account errored after it was submitted and "
+                         "may have gone through, so the court may be lost. Check CourtReserve, "
+                         "then record what you found on this transfer's page before retrying.")
+
+
+def _mark_cancel_submitted(transfer_id):
+    with engine.begin() as conn:
+        conn.execute(update(pending_transfers).where(pending_transfers.c.id == transfer_id)
+                     .values(cancel_submitted_at=datetime.utcnow()))
+
+
 def _update_pending_transfer(transfer_id, status, note="", reservation_id=None):
     resolved = datetime.utcnow() if status in ("transferred", "failed") else None
     values = dict(status=status, note=note, resolved_at=resolved)
@@ -355,29 +367,41 @@ def _update_pending_transfer(transfer_id, status, note="", reservation_id=None):
 
 
 def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_id, slot, duration, log,
-                                 info=None):
+                                 info=None, on_submit=None):
     """Cancel the probe's reservation and re-book on the main account, using two
     already-logged-in pages. Returns (status, note):
       transferred    – main holds it
       held_by_probe  – probe still holds it (cancel failed, or main re-book failed but
                        probe re-booked to retain)
+      needs_check    – the cancel raised after it was submitted: it may have gone
+                       through, so nobody knows where the court is
       failed         – court lost (cancel ok, main and probe both failed to re-book)
 
     `info`, when given, is filled with what a status alone can't say: `cancelled`
-    (the probe's reservation was cancelled), `cancel_error` (the cancel raised part-way,
-    so it may or may not have gone through), and `reservation_id` when the probe
-    re-booked: its new reservation's id, or "" if none was captured. The stored id then
-    names a cancelled reservation and must be replaced before any retry."""
+    (the probe's reservation was cancelled), `submitted` (the cancel's final click was
+    about to be sent), `cancel_error` (the cancel raised), and `reservation_id` when the
+    probe re-booked: its new reservation's id, or "" if none was captured. The stored id
+    then names a cancelled reservation and must be replaced before any retry.
+    `on_submit` is called just before the cancel is submitted, to persist that a
+    restart from here on can't assume the probe still holds the court."""
     info = {} if info is None else info
     info["cancelled"] = False
     if not reservation_id:
         return "held_by_probe", "No reservation id captured — probe still holds the court; cancel manually."
+
+    def before_submit():
+        info["submitted"] = True
+        if on_submit:
+            on_submit()
+
     try:
-        cancelled = cancel_reservation(probe_page, reservation_id, org_cfg)
+        cancelled = cancel_reservation(probe_page, reservation_id, org_cfg, before_submit=before_submit)
     except Exception as e:
         log(f"Cancel raised: {e}")
         info["cancel_error"] = str(e)
-        cancelled = False
+        if info.get("submitted"):
+            return "needs_check", CANCEL_UNCERTAIN_NOTE
+        return "held_by_probe", "Cancel failed before it was submitted — probe still holds the court."
     if not cancelled:
         return "held_by_probe", "Cancel failed — probe still holds the court."
     info["cancelled"] = True
@@ -452,7 +476,7 @@ def _run_transfer_inner(transfer_id: int, buf: io.StringIO, outcome: dict):
             update(pending_transfers)
             .where((pending_transfers.c.id == transfer_id) &
                    (pending_transfers.c.status.in_(["pending", "held_by_probe"])))
-            .values(status="transferring", note="Transfer started.")
+            .values(status="transferring", note="Transfer started.", cancel_submitted_at=None)
         )
         outcome["claimed"] = claimed.rowcount == 1
         if claimed.rowcount == 0:
@@ -489,7 +513,7 @@ def _run_transfer_inner(transfer_id: int, buf: io.StringIO, outcome: dict):
                              org_cfg.booking_url, _session_file(main, org))
             result = _perform_transfer_with_pages(
                 probe_page, main_page, org_cfg, t["reservation_id"], slot, t["duration_min"], print,
-                info=info)
+                info=info, on_submit=lambda: _mark_cancel_submitted(transfer_id))
             browser.close()
     except Exception as exc:
         if result is not None:
@@ -522,8 +546,9 @@ def _run_transfer_inner(transfer_id: int, buf: io.StringIO, outcome: dict):
         _record_transfer_court(t["run_id"], main["id"], slot, t["duration_min"], ids)
     elif status == "held_by_probe":
         _record_transfer_court(t["run_id"], probe["id"], slot, t["duration_min"], ids)
-    elif info.get("cancelled"):
+    elif status == "failed" and info.get("cancelled"):
         _record_transfer_court(t["run_id"], None, slot, t["duration_min"], ids)
+    # needs_check: where the court is isn't known, so the app's records are left as they were.
     _send_warning_email(
         f"Court transfer {status}: {t['date']} {t['start_time']}",
         f"Transfer #{transfer_id} for {t['date']} {t['start_time']} ({t['duration_min']}min): {status}.\n{note}",
@@ -588,7 +613,7 @@ def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_acco
         t_status, t_note = _perform_transfer_with_pages(
             probe_page, booking_page, org_cfg, reservation_id, slot, duration,
             log=lambda m: print(f"[{datetime.now(tz_obj).strftime('%Y-%m-%d %H:%M:%S %Z')}] {m}"),
-            info=info)
+            info=info, on_submit=lambda: _mark_cancel_submitted(transfer_id))
     except Exception as e:
         if info.get("cancelled"):
             t_status, t_note = "failed", (f"Auto-transfer errored after the probe's reservation was "
@@ -604,6 +629,9 @@ def _handle_probe_secured(job_id, run_id, org, org_cfg, main_account, probe_acco
         run_status = "success"
     elif t_status == "held_by_probe":
         _record_booking(run_id, probe_account["id"], slot, duration)
+        run_status = "pending_transfer"
+    elif t_status == "needs_check":
+        # The transfer is left open for a person to check; nothing is recorded as booked.
         run_status = "pending_transfer"
     else:
         run_status = "failed"
