@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
@@ -25,8 +26,9 @@ from fastapi import FastAPI
 from sqlalchemy import insert
 
 from web.database import (account_orgs, accounts, bookings, engine, init_db, job_runs, jobs,
-                          organizations)
+                          organizations, pending_transfers)
 import web.job_runner as jr
+from web.database import row_to_dict
 from web.routes import agent_api
 
 #: Saved before any test patches it, for the tests that need the real thing.
@@ -708,6 +710,359 @@ class PauseRaceTests(AgentApiTestCase):
         self.assertTrue(listed["stopping"])
         settled = self.add_job(status="paused")
         self.assertFalse(call("GET", f"/api/agent/v1/jobs/{settled}")[1]["stopping"])
+
+
+class TransferTestCase(AgentApiTestCase):
+    """Probe-to-main transfers. The fixture account is the probe; "Main" is a second
+    account linked to the same club. CourtReserve is faked at job_runner's seams:
+    Playwright, login, cancel_reservation and book_slot, and the result email."""
+
+    MAIN_PASSWORD = "MainAcctPw#42"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with engine.begin() as conn:
+            cls.main_id = conn.execute(insert(accounts).values(
+                label="Main", email="main@example.com", password=cls.MAIN_PASSWORD,
+                session_file="")).inserted_primary_key[0]
+            cls.main_link = conn.execute(insert(account_orgs).values(
+                account_id=cls.main_id, org_id=cls.org_id, is_resident=False)).inserted_primary_key[0]
+
+    @classmethod
+    def tearDownClass(cls):
+        with engine.begin() as conn:
+            conn.execute(account_orgs.delete().where(account_orgs.c.id == cls.main_link))
+            conn.execute(accounts.delete().where(accounts.c.id == cls.main_id))
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        self.transfer_ids = []
+        self.addCleanup(self._drop_transfers)
+        self.fake = {}
+        for name in ("sync_playwright", "ensure_logged_in", "cancel_reservation", "book_slot",
+                     "_send_warning_email"):
+            p = mock.patch(f"web.job_runner.{name}")
+            self.fake[name] = p.start()
+            self.addCleanup(p.stop)
+        # No 0.5 s pauses between re-book tries.
+        p = mock.patch("web.job_runner.time")
+        p.start()
+        self.addCleanup(p.stop)
+        self.fake["cancel_reservation"].return_value = True
+        self.fake["book_slot"].return_value = True
+
+    def _drop_transfers(self):
+        with engine.begin() as conn:
+            conn.execute(pending_transfers.delete().where(
+                pending_transfers.c.id.in_(self.transfer_ids)))
+
+    def add_transfer(self, status="pending", reservation_id="12345678", date=None,
+                     start_time="19:30", note="", probe=None, main=None):
+        jid = self.add_job(params={"date": date or future(), "time": start_time})
+        rid = self.add_run(jid, "pending_transfer")
+        with engine.begin() as conn:
+            tid = conn.execute(insert(pending_transfers).values(
+                job_id=jid, run_id=rid, org_id=self.org_id,
+                probe_account_id=probe or self.acc_id, main_account_id=main or self.main_id,
+                reservation_id=reservation_id, date=date or future(), start_time=start_time,
+                duration_min=30, court_type="Hard", status=status, auto=False, note=note,
+                created_at=datetime.utcnow())).inserted_primary_key[0]
+        self.transfer_ids.append(tid)
+        return tid
+
+    def transfer(self, tid):
+        with engine.connect() as conn:
+            return conn.execute(pending_transfers.select()
+                                .where(pending_transfers.c.id == tid)).fetchone()
+
+    def courts(self, tid):
+        """(account, date, time) rows the app records for this transfer's run."""
+        t = self.transfer(tid)
+        with engine.connect() as conn:
+            return sorted((r.account_id, r.date, r.start_time) for r in conn.execute(
+                bookings.select().where(bookings.c.job_run_id == t.run_id)))
+
+    def complete(self, tid, date=None, start_time="19:30", **extra):
+        body = {"date": date or future(), "start_time": start_time, **extra}
+        return call("POST", f"/api/agent/v1/transfers/{tid}/complete", body)
+
+
+class TransferListTests(TransferTestCase):
+    def test_open_transfers_are_listed_with_labels_only(self):
+        tid = self.add_transfer(note=f"login as {EMAIL} with {PASSWORD} failed")
+        done = self.add_transfer(status="transferred", start_time="20:00")
+        status, body, raw = call("GET", "/api/agent/v1/transfers")
+        self.assertEqual(status, 200)
+        ids = [t["id"] for t in body["transfers"]]
+        self.assertIn(tid, ids)
+        self.assertNotIn(done, ids)  # open only, by default
+        t = next(t for t in body["transfers"] if t["id"] == tid)
+        self.assertEqual((t["status"], t["date"], t["start_time"]), ("pending", future(), "19:30"))
+        self.assertEqual(t["main_account"], {"id": self.main_id, "label": "Main"})
+        self.assertEqual(t["probe_account"]["label"], "p***@example.com")
+        self.assertTrue(t["completable"])
+        self.assertIsNone(t["why_not"])
+        for secret in (PASSWORD, EMAIL, self.MAIN_PASSWORD, "main@example.com", "12345678"):
+            self.assertNotIn(secret, raw)
+        self.assertIn(done, [t["id"] for t in call("GET", "/api/agent/v1/transfers?state=all")[1]
+                             ["transfers"]])
+        self.assertEqual(call("GET", "/api/agent/v1/transfers?state=bogus")[0], 400)
+
+    def test_why_a_transfer_cant_be_completed_is_listed(self):
+        cases = {
+            self.add_transfer(status="transferring"): "running right now",
+            self.add_transfer(reservation_id=""): "no CourtReserve reservation id",
+            self.add_transfer(date=(datetime.now(TZ).date() - timedelta(days=1)).isoformat()):
+                "has passed",
+            self.add_transfer(main=self.stray_acc_id): "isn't linked",
+        }
+        listed = {t["id"]: t for t in call("GET", "/api/agent/v1/transfers")[1]["transfers"]}
+        for tid, why in cases.items():
+            self.assertFalse(listed[tid]["completable"], why)
+            self.assertIn(why, listed[tid]["why_not"])
+
+    def test_listing_needs_the_token(self):
+        self.assertEqual(call("GET", "/api/agent/v1/transfers", token=None)[0], 401)
+
+
+class TransferCompleteTests(TransferTestCase):
+    def test_a_transfer_moves_the_court_to_the_main_account(self):
+        tid = self.add_transfer()
+        status, body, raw = self.complete(tid)
+        self.assertEqual(status, 200, body)
+        self.assertEqual((body["outcome"], body["court"]), ("transferred", "main"))
+        self.assertEqual(body["transfer"]["status"], "transferred")
+        # The UI's code path: cancel as the probe, then book as main.
+        self.assertEqual(self.fake["cancel_reservation"].call_args.args[1], "12345678")
+        self.assertEqual(self.fake["book_slot"].call_count, 1)
+        self.assertEqual(self.courts(tid), [(self.main_id, future(), "19:30")])
+        self.assertNotIn(PASSWORD, raw)
+
+    def test_a_second_call_is_refused_and_never_repeats_the_transfer(self):
+        tid = self.add_transfer()
+        self.assertEqual(self.complete(tid)[0], 200)
+        status, body, _ = self.complete(tid)
+        self.assertEqual(status, 409)
+        self.assertIn("already moved", body["detail"])
+        self.assertEqual(self.fake["cancel_reservation"].call_count, 1)
+
+    def test_a_transfer_already_running_is_refused(self):
+        tid = self.add_transfer(status="transferring")
+        status, body, _ = self.complete(tid)
+        self.assertEqual(status, 409)
+        self.assertIn("running right now", body["detail"])
+        self.fake["sync_playwright"].assert_not_called()
+        self.assertEqual(self.transfer(tid).status, "transferring")
+
+    def test_the_court_must_match(self):
+        tid = self.add_transfer()
+        for date, time_ in ((future(11), "19:30"), (future(), "20:00"), ("soon", "19:30")):
+            status, body, _ = self.complete(tid, date=date, start_time=time_)
+            self.assertEqual(status, 409, (date, time_))
+            self.assertIn("Nothing was changed", body["detail"])
+        self.fake["sync_playwright"].assert_not_called()
+        self.assertEqual(self.transfer(tid).status, "pending")
+        # The same day written compactly is the same court.
+        self.assertEqual(self.complete(tid, date=future().replace("-", ""))[0], 200)
+
+    def test_refusals_change_nothing(self):
+        past = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+        for tid, date in ((self.add_transfer(status="failed"), None),
+                          (self.add_transfer(reservation_id=""), None),
+                          (self.add_transfer(date=past), past),
+                          (self.add_transfer(probe=self.stray_acc_id), None)):
+            before = self.transfer(tid).status
+            status, body, _ = self.complete(tid, date=date)
+            self.assertEqual(status, 409, body)
+            self.assertEqual(self.transfer(tid).status, before)
+        self.fake["sync_playwright"].assert_not_called()
+        self.assertEqual(call("POST", "/api/agent/v1/transfers/999999/complete",
+                              {"date": future(), "start_time": "19:30"})[0], 404)
+
+    def test_only_the_court_is_accepted_in_the_body(self):
+        tid = self.add_transfer()
+        self.assertEqual(self.complete(tid, auto_transfer=True)[0], 422)
+        self.assertEqual(call("POST", f"/api/agent/v1/transfers/{tid}/complete", {})[0], 422)
+        self.assertEqual(call("POST", f"/api/agent/v1/transfers/{tid}/complete", None)[0], 422)
+        self.fake["sync_playwright"].assert_not_called()
+
+    def test_a_cancel_that_does_not_go_through_changes_nothing(self):
+        tid = self.add_transfer()
+        self.fake["cancel_reservation"].return_value = False
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
+        self.assertIn("nothing changed", body["message"])
+        self.fake["book_slot"].assert_not_called()
+        self.assertEqual(self.transfer(tid).status, "held_by_probe")
+        self.assertEqual(self.courts(tid), [(self.acc_id, future(), "19:30")])
+
+    def test_a_failed_login_is_before_the_cancel(self):
+        tid = self.add_transfer()
+        self.fake["ensure_logged_in"].side_effect = RuntimeError(f"Login failed for {EMAIL}")
+        status, body, raw = self.complete(tid)
+        self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
+        self.assertIn("log in", body["message"])
+        self.fake["cancel_reservation"].assert_not_called()
+        self.assertNotIn(EMAIL, raw)
+        # held by the probe and retryable
+        self.assertTrue(body["transfer"]["completable"])
+
+    def test_a_cancel_that_errors_part_way_says_the_court_may_be_lost(self):
+        tid = self.add_transfer()
+        self.fake["cancel_reservation"].side_effect = RuntimeError("Execution context was destroyed")
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("cancel_uncertain", "unknown"))
+        self.assertIn("MAY BE LOST", body["message"])
+        self.fake["book_slot"].assert_not_called()
+
+    def test_a_court_the_probe_books_back_gets_its_new_id(self):
+        tid = self.add_transfer()
+
+        def book(page, url, slot, duration_minutes=60, org=None, result=None):
+            if result is None:  # main's tries
+                return False
+            result["reservation_id"] = "87654321"  # the probe's new reservation
+            return True
+
+        self.fake["book_slot"].side_effect = book
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("failed_after_cancel", "probe"))
+        self.assertIn("holds it again", body["message"])
+        t = self.transfer(tid)
+        self.assertEqual((t.status, t.reservation_id), ("held_by_probe", "87654321"))
+        self.assertEqual(self.fake["book_slot"].call_count, 4)  # 3 for main, 1 for the probe
+        self.assertEqual(self.courts(tid), [(self.acc_id, future(), "19:30")])
+        # A retry cancels the new reservation, never the one already cancelled.
+        self.fake["book_slot"].side_effect = None
+        self.assertEqual(self.complete(tid)[1]["outcome"], "transferred")
+        self.assertEqual(self.fake["cancel_reservation"].call_args.args[1], "87654321")
+        self.assertEqual(self.courts(tid), [(self.main_id, future(), "19:30")])
+
+    def test_a_probe_book_back_without_an_id_cannot_be_retried(self):
+        tid = self.add_transfer()
+        self.fake["book_slot"].side_effect = lambda *a, result=None, **k: result is not None
+        body = self.complete(tid)[1]
+        self.assertEqual(body["outcome"], "failed_after_cancel")
+        self.assertIn("can't be retried here", body["message"])
+        self.assertEqual(self.transfer(tid).reservation_id, "")
+        status, again, _ = self.complete(tid)
+        self.assertEqual(status, 409)
+        self.assertIn("no CourtReserve reservation id", again["detail"])
+        self.assertEqual(self.fake["cancel_reservation"].call_count, 1)
+
+    def test_a_lost_court_is_said_plainly_and_ends_the_transfer(self):
+        tid = self.add_transfer(status="held_by_probe")
+        self.fake["book_slot"].return_value = False
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("failed_after_cancel", "lost"))
+        self.assertIn("LOST", body["message"])
+        self.assertEqual(self.transfer(tid).status, "failed")
+        self.assertEqual(self.courts(tid), [])
+        self.assertEqual(self.complete(tid)[0], 409)
+
+    def test_a_browser_that_fails_to_close_keeps_the_result(self):
+        tid = self.add_transfer()
+        browser = self.fake["sync_playwright"].return_value.__enter__.return_value \
+            .chromium.launch.return_value
+        browser.close.side_effect = RuntimeError("browser has been closed")
+        body = self.complete(tid)[1]
+        self.assertEqual(body["outcome"], "transferred")
+        self.assertEqual(self.transfer(tid).status, "transferred")
+
+    def test_one_browser_at_a_time(self):
+        tid = self.add_transfer()
+        agent_api._browser_lock.acquire()
+        try:
+            status, body, _ = self.complete(tid)
+        finally:
+            agent_api._browser_lock.release()
+        self.assertEqual(status, 409)
+        self.assertIn("Nothing was changed", body["detail"])
+        self.assertEqual(self.transfer(tid).status, "pending")
+
+    def test_a_slow_transfer_answers_running_and_holds_the_browser(self):
+        import threading
+        tid = self.add_transfer()
+        gate = threading.Event()
+        self.fake["book_slot"].side_effect = lambda *a, **k: gate.wait(10)
+        with mock.patch.object(agent_api, "TRANSFER_WAIT_S", 0.3):
+            body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("running", "unknown"))
+        self.assertEqual(body["transfer"]["status"], "transferring")
+        # Still running: a second complete and a browser check are both refused.
+        self.assertIn("running right now", self.complete(tid)[1]["detail"])
+        with mock.patch.object(agent_api, "_fetch_slots") as fetch:
+            self.assertEqual(call("GET", f"/api/agent/v1/availability?org_id={self.org_id}"
+                                         f"&date={future()}")[0], 409)
+        fetch.assert_not_called()
+        gate.set()
+        for _ in range(100):
+            if self.transfer(tid).status != "transferring" and not agent_api._browser_lock.locked():
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.transfer(tid).status, "transferred")
+        self.assertFalse(agent_api._browser_lock.locked())
+
+    def test_losing_the_claim_to_the_ui_is_a_409(self):
+        # The UI's button claimed it between this call's checks and its own claim.
+        tid = self.add_transfer()
+        real = jr.run_transfer
+
+        def ui_first(transfer_id, outcome=None):
+            with engine.begin() as conn:
+                conn.execute(pending_transfers.update().where(pending_transfers.c.id == transfer_id)
+                             .values(status="transferring"))
+            real(transfer_id, outcome)
+
+        with mock.patch("web.job_runner.run_transfer", side_effect=ui_first):
+            status, body, _ = self.complete(tid)
+        self.assertEqual(status, 409)
+        self.assertIn("started from elsewhere", body["detail"])
+        self.fake["cancel_reservation"].assert_not_called()
+
+    def test_the_ui_button_still_runs_the_same_code(self):
+        from web.routes import jobs as job_routes
+        tid = self.add_transfer()
+        with mock.patch("threading.Thread") as thread:
+            asyncio.run(job_routes.execute_transfer(tid))
+        self.assertIs(thread.call_args.kwargs["target"], jr.run_transfer)
+        thread.call_args.kwargs["target"](**thread.call_args.kwargs["kwargs"])
+        self.assertEqual(self.transfer(tid).status, "transferred")
+
+
+class AutoTransferTests(TransferTestCase):
+    def test_an_auto_transfer_is_never_claimable_while_its_notice_sends(self):
+        jid = self.add_job()
+        rid = self.add_run(jid)
+        seen = []
+
+        def email(subject, body):
+            with engine.connect() as conn:
+                row = conn.execute(pending_transfers.select()
+                                   .where(pending_transfers.c.run_id == rid)).fetchone()
+            self.transfer_ids.append(row.id)
+            seen.append(row.status)
+            return "sent"
+
+        self.fake["_send_warning_email"].side_effect = email
+        with engine.connect() as conn:
+            org = row_to_dict(conn.execute(organizations.select()
+                                           .where(organizations.c.id == self.org_id)).fetchone())
+            probe = row_to_dict(conn.execute(accounts.select()
+                                             .where(accounts.c.id == self.acc_id)).fetchone())
+            main = row_to_dict(conn.execute(accounts.select()
+                                            .where(accounts.c.id == self.main_id)).fetchone())
+        slot = jr._slot_from_fields(future(), "19:30", 30, "Hard", "America/Los_Angeles")
+        status = jr._handle_probe_secured(jid, rid, org, jr._org_config(org), main, probe,
+                                          mock.MagicMock(), mock.MagicMock(), slot, 30, True, TZ,
+                                          captured_reservation_id="12345678")
+        self.assertEqual(status, "success")
+        self.assertEqual(seen[0], "transferring")  # the "court secured" notice
+        listed = {t["id"]: t for t in call("GET", "/api/agent/v1/transfers?state=all")[1]
+                  ["transfers"]}
+        self.assertEqual(listed[self.transfer_ids[-1]]["status"], "transferred")
 
 
 class MintTokenTests(unittest.TestCase):

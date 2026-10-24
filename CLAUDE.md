@@ -161,9 +161,10 @@ The tool automates CourtReserve's booking UI via Playwright. There is no officia
 
 **Home agent API (`web/routes/agent_api.py`, `/api/agent/v1`):** a narrow JSON API for
 the home agent's `courtreserve` connector (hs220/home-agent). It reads jobs, runs,
-reservations, clubs and live availability; creates one-shot booking/watch jobs; pauses
-and resumes jobs; and re-syncs reservations. Nothing else — no delete/edit/run-now, no
-cancel or transfer, no account or org management. Auth is a bearer token whose SHA-256
+reservations, clubs, pending transfers and live availability; creates one-shot
+booking/watch jobs; pauses and resumes jobs; re-syncs reservations; and completes a
+pending probe→main transfer. Nothing else — no delete/edit/run-now, no cancel, no probe
+account or auto-transfer on job creation, no account or org management. Auth is a bearer token whose SHA-256
 is `AGENT_API_TOKEN_SHA256` in `.env` (`python scripts/mint_agent_token.py`); unset
 means 503. Responses never carry a password, email or session file, and run text goes
 through `_redactor`. The connector reaches it as `court-reserve-web:8080` on the
@@ -176,6 +177,16 @@ Accounts must be linked to the club. Sync never deletes job-linked `bookings` ro
 read. Job creation, pause and resume
 share `create_book_next_job` / `create_watch_job` / `pause_job_by_id` /
 `resume_job_by_id` in `web/routes/jobs.py` with the form routes — change them there.
+Completing a transfer (`POST /transfers/{id}/complete`) runs `job_runner.run_transfer`,
+the Transfer button's code, in its own thread: the body must repeat the court's date and
+start time, and it is refused (409) unless the transfer is pending or held_by_probe, has
+a reservation id, is in the future and both accounts are linked to the club. The atomic
+pending/held_by_probe→transferring claim in `_run_transfer_inner` is the lock between
+the UI and the agent. It answers `outcome` transferred / failed_before_cancel /
+cancel_uncertain / failed_after_cancel (`court`: probe, lost or unknown) / running /
+errored.
+After a probe re-books, the stored reservation id is replaced with the new one (or
+cleared), since the old one names a cancelled reservation.
 Tests: `test_agent_api.py`.
 
 **Config (`config.yaml`):** `preferred_times`, `default_duration`, `days_out` (7=non-resident, 8=resident). Credentials come from `.env` (`CR_EMAIL`, `CR_PASSWORD`).
