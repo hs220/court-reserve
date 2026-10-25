@@ -151,6 +151,20 @@ The tool automates CourtReserve's booking UI via Playwright. There is no officia
 4. `booking.py:book_slot` — navigates the Kendo Scheduler via `page.evaluate` JS to the target date, clicks the matching time cell, then handles the two-hop AJAX modal (CourtReserve loads a skeleton first, then fires a second request to `reservations.courtreserve.com` for the actual form)
 5. `booking.py:find_best_slot` — picks slot by `preferred_times` order, falls back to first non-waitlist slot
 
+**CourtReserve's new portal (Oct 2026):** between Oct 23 and 24, 2026 the booking page
+and the reservation page moved to a React portal (`ClientApp/pages/bundle-portal.js`).
+It has no jQuery, no Kendo and no server-rendered forms, so steps 4 above and the
+cancel no longer work there. The login page, the ReadConsolidated feed and the
+my-bookings `get-list` JSON are unchanged. `book_slot` and `cancel_reservation` check
+the page kind (`_PAGE_KIND_JS`) first and raise `PageChangedError` ("page changed: …")
+on the portal before clicking anything. A transfer therefore stops with the probe
+holding the court instead of ending in `needs_check`. A cancel counts only when the
+reloaded reservation page says so (the portal's `[data-testid=status]` = "Canceled"),
+never because the submit landed somewhere else. Mapping the portal's booking form and
+cancel dialog still needs a live look: one click on a slot's `Reserve`
+(`[data-testid=consolidated-reserve-slot]`) and, on a reservation the test account
+holds, its "Cancel Reservation".
+
 **Multi-org support:** `booking.py` now exposes `OrgConfig(org_id, scheduler_id, cost_type_id, timezone)`. The CLI uses `default_org_config()` from `config.py` (reads `config.yaml`). The web UI stores orgs/accounts in SQLite and constructs `OrgConfig` per job.
 
 **Session persistence:** Playwright storage state (cookies) is saved to `~/.court-reserve-session.json` and reused across runs. `ensure_logged_in` checks if the session is still valid before re-logging in.
