@@ -406,11 +406,25 @@ class CancelAndCaptureTests(unittest.TestCase):
     """What a transfer relies on: knowing whether a cancel was started, and never
     taking another reservation's id for the one just booked."""
 
-    def _page(self, has_reason_field=True, has_submit=True):
+    def _page(self, has_reason_field=True, has_submit=True, kind="legacy",
+              status=None, has_trigger=True):
+        """A fake reservation page. `kind` is what _PAGE_KIND_JS answers; `status` what
+        _RESERVATION_STATUS_JS answers once the page is reloaded after the submit."""
         from unittest import mock
         page = mock.MagicMock()
         page.url = "https://app.courtreserve.com/Online/MyProfile/Reservation/1/12345678"
-        page.evaluate.return_value = "Reservation cancelled"
+
+        kinds = list(kind) if isinstance(kind, list) else [kind]
+
+        def evaluate(js, *args):
+            if "kendoScheduler" in js:
+                return kinds.pop(0) if len(kinds) > 1 else kinds[0]
+            if "data-testid=status" in js:
+                return status if status is not None else {"portal": False, "text": "Reservation cancelled"}
+            return ""
+
+        page.evaluate.side_effect = evaluate
+        page.get_by_text.return_value.count.return_value = 1 if has_trigger else 0
         if not has_reason_field:
             page.wait_for_selector.side_effect = TimeoutError("Timeout 5000ms exceeded")
         submit = mock.MagicMock() if has_submit else None
@@ -454,12 +468,168 @@ class CancelAndCaptureTests(unittest.TestCase):
         self.assertEqual(called, [])
         page.get_by_text.assert_not_called()
 
+    def _refused_before_the_hook(self, page, exc_type):
+        from booking import cancel_reservation
+        called = []
+        with self.assertRaises(exc_type) as cm:
+            cancel_reservation(page, "12345678", self.org(), before_first_click=lambda: called.append(1))
+        self.assertEqual(called, [])
+        page.get_by_text.return_value.first.click.assert_not_called()
+        self.assertIn("Nothing was clicked", str(cm.exception))
+        return cm.exception
+
+    def test_the_new_portal_is_refused_before_anything_is_clicked(self):
+        # Live, 2026-10-25: the reservation page is the React portal. The old form isn't
+        # there, so a transfer must stop here -- probe still holds the court -- rather
+        # than click in and end up needs_check, as #39 did.
+        from booking import PageChangedError
+        exc = self._refused_before_the_hook(self._page(kind="portal")[0], PageChangedError)
+        self.assertTrue(str(exc).startswith("page changed:"))
+
+    def test_a_missing_cancel_button_is_refused_before_anything_is_clicked(self):
+        from booking import PageChangedError
+        self._refused_before_the_hook(self._page(has_trigger=False)[0], PageChangedError)
+
+    def test_a_login_redirect_is_refused_before_anything_is_clicked(self):
+        page, _ = self._page()
+        page.url = "https://app.courtreserve.com/Online/Account/Login/1?returnUrl=%2FOnline"
+        self._refused_before_the_hook(page, BookingError)
+
+    def test_a_missing_reason_field_says_the_page_changed(self):
+        from booking import cancel_reservation, PageChangedError
+        page, _ = self._page(has_reason_field=False)
+        with self.assertRaises(PageChangedError) as cm:
+            cancel_reservation(page, "12345678", self.org())
+        self.assertIn("cancellation-reason field", str(cm.exception))
+
+    def test_a_cancel_counts_only_when_the_reservation_says_so(self):
+        from booking import cancel_reservation
+        cases = [
+            ({"portal": True, "text": "Canceled"}, True),
+            ({"portal": True, "text": "Confirmed"}, False),
+            ({"portal": False, "text": "Your reservation has been cancelled."}, True),
+            ({"portal": False, "text": "Reservation details"}, False),
+        ]
+        for status, expected in cases:
+            page, _ = self._page(status=status)
+            self.assertEqual(cancel_reservation(page, "12345678", self.org()), expected, status)
+            # The page is loaded fresh to read the answer, not judged by where the submit went.
+            self.assertEqual(page.goto.call_count, 2, status)
+
+    def test_a_portal_page_that_never_renders_its_status_is_not_a_cancel(self):
+        # Live: the portal's shell is up before React renders [data-testid=status] into
+        # it, so the answer is waited for -- and no answer is no confirmation.
+        from booking import cancel_reservation
+        page, _ = self._page(kind=["legacy", "portal"], status={"portal": True, "text": "Canceled"})
+
+        def wait_for_selector(sel, **kw):
+            if sel == "[data-testid=status]":
+                raise TimeoutError("Timeout 10000ms exceeded")
+            return page.wait_for_selector.return_value
+
+        page.wait_for_selector.side_effect = wait_for_selector
+        self.assertFalse(cancel_reservation(page, "12345678", self.org()))
+        page.wait_for_selector.side_effect = None
+        page, _ = self._page(kind=["legacy", "portal"], status={"portal": True, "text": "Canceled"})
+        self.assertTrue(cancel_reservation(page, "12345678", self.org()))
+        page.wait_for_selector.assert_any_call("[data-testid=status]", timeout=10000)
+
+    def test_a_login_page_after_the_submit_is_not_a_cancel(self):
+        # Before: any redirect off the detail page counted as cancelled, so an expired
+        # session read as "cancelled -> lost" while the probe still held the court.
+        from booking import cancel_reservation
+        page, submit = self._page()
+        login = "https://app.courtreserve.com/Online/Account/Login/1?returnUrl=%2FOnline"
+        submit.click.side_effect = lambda: setattr(page, "url", login)
+        self.assertFalse(cancel_reservation(page, "12345678", self.org()))
+
     def test_the_grid_feed_is_never_a_source_of_the_new_id(self):
         from booking import _may_carry_new_reservation_id as ok
         self.assertFalse(ok("https://app.courtreserve.com/Online/Reservations/ReadConsolidated/13234"))
         self.assertTrue(ok("https://reservations.courtreserve.com/Online/ReservationsApi/CreateReservation"))
         self.assertTrue(ok("https://app.courtreserve.com/Online/Bookings/Save"))
         self.assertFalse(ok("https://app.courtreserve.com/Online/Portal/Index"))
+
+
+class BookingPageTests(unittest.TestCase):
+    """book_slot's first step: be on a booking page whose Kendo scheduler is bound."""
+
+    URL = "https://app.courtreserve.com/Online/Reservations/Bookings/13233?sId=16983"
+
+    def _page(self, kinds, url=URL):
+        """A fake page whose _PAGE_KIND_JS answers come from `kinds`, in order (the last
+        one repeats)."""
+        from unittest import mock
+        page = mock.MagicMock()
+        page.url = url
+        answers = list(kinds)
+
+        def evaluate(js, *args):
+            if "kendoScheduler" in js and "#react-portal-shell" in js:
+                return answers.pop(0) if len(answers) > 1 else answers[0]
+            return None
+
+        page.evaluate.side_effect = evaluate
+        page.title.return_value = "Lifetime Activities: Sunnyvale | powered by CourtReserve"
+        return page
+
+    def test_a_live_scheduler_is_used_without_a_reload(self):
+        # The pre-warmed page must not be reloaded at release time.
+        from booking import _ensure_kendo_scheduler
+        page = self._page(["kendo"])
+        _ensure_kendo_scheduler(page, self.URL)
+        page.goto.assert_not_called()
+
+    def test_a_page_that_lost_its_scheduler_is_reloaded(self):
+        # Run 412: on the booking URL, but `$` was gone. Reload instead of evaluating
+        # into a page that can't answer.
+        from booking import _ensure_kendo_scheduler
+        page = self._page(["unknown", "kendo"])
+        _ensure_kendo_scheduler(page, self.URL)
+        page.goto.assert_called_once()
+
+    def test_the_new_portal_says_the_page_changed(self):
+        from booking import _ensure_kendo_scheduler, PageChangedError
+        page = self._page(["portal"])
+        with self.assertRaises(PageChangedError) as cm:
+            _ensure_kendo_scheduler(page, self.URL)
+        self.assertTrue(str(cm.exception).startswith("page changed:"))
+        self.assertIn("new portal", str(cm.exception))
+
+    def test_a_page_with_no_scheduler_names_where_it_is(self):
+        from booking import _ensure_kendo_scheduler, PageChangedError
+        page = self._page(["unknown"])
+        with self.assertRaises(PageChangedError) as cm:
+            _ensure_kendo_scheduler(page, self.URL)
+        self.assertIn("url=" + self.URL, str(cm.exception))
+
+    def test_book_slot_clicks_nothing_on_the_new_portal(self):
+        from booking import book_slot, PageChangedError
+        page = self._page(["portal"])
+        slot = mk("19:00", [1])
+        with self.assertRaises(PageChangedError):
+            book_slot(page, self.URL, slot, duration_minutes=120)
+        page.mouse.click.assert_not_called()
+
+    def test_page_changed_is_not_retried_as_a_network_blip(self):
+        # A watch retries "network" errors for 30 minutes; a changed page never clears.
+        from net_errors import is_network_error
+        from booking import _ensure_kendo_scheduler, cancel_reservation, PageChangedError
+        errors = []
+        for kinds in (["portal"], ["unknown"]):
+            try:
+                _ensure_kendo_scheduler(self._page(kinds), self.URL)
+            except PageChangedError as e:
+                errors.append(e)
+        cancel_tests = CancelAndCaptureTests()
+        for kw in ({"kind": "portal"}, {"has_trigger": False}, {"has_reason_field": False}, {"has_submit": False}):
+            try:
+                cancel_reservation(cancel_tests._page(**kw)[0], "12345678", cancel_tests.org())
+            except PageChangedError as e:
+                errors.append(e)
+        self.assertEqual(len(errors), 6)
+        for e in errors:
+            self.assertFalse(is_network_error(e), str(e))
 
 
 if __name__ == "__main__":
