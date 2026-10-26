@@ -588,6 +588,33 @@ class BookingPageTests(unittest.TestCase):
         _ensure_kendo_scheduler(page, self.URL)
         page.goto.assert_called_once()
 
+    def test_a_scheduler_that_binds_after_jquery_is_waited_for(self):
+        # Review of #7: after a reload, jQuery is up a moment before the scheduler is
+        # bound, and that moment reads "legacy". It must not fail a page that works a
+        # second later.
+        from booking import _ensure_kendo_scheduler
+        page = self._page(["unknown", "legacy", "legacy", "kendo"])
+        _ensure_kendo_scheduler(page, self.URL)
+        page.goto.assert_called_once()
+
+    def test_a_page_that_stays_legacy_says_the_page_changed(self):
+        from booking import _ensure_kendo_scheduler, PageChangedError
+        page = self._page(["legacy"])
+        with self.assertRaises(PageChangedError) as cm:
+            _ensure_kendo_scheduler(page, self.URL)
+        self.assertIn("no Kendo scheduler", str(cm.exception))
+
+    def test_the_page_title_stays_out_of_the_message(self):
+        # A "504 Gateway Time-out" title would make net_errors retry a page-changed error.
+        from booking import _ensure_kendo_scheduler, PageChangedError
+        from net_errors import is_network_error
+        page = self._page(["unknown"])
+        page.title.return_value = "504 Gateway Time-out"
+        with self.assertRaises(PageChangedError) as cm:
+            _ensure_kendo_scheduler(page, self.URL)
+        self.assertNotIn("504", str(cm.exception))
+        self.assertFalse(is_network_error(cm.exception))
+
     def test_the_new_portal_says_the_page_changed(self):
         from booking import _ensure_kendo_scheduler, PageChangedError
         page = self._page(["portal"])
