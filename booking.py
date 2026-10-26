@@ -332,13 +332,16 @@ _PAGE_KIND_JS = """(function() {
 })()"""
 
 
-def _page_kind(page: Page, settle_ms: int = 10000) -> str:
-    """The page's kind (see _PAGE_KIND_JS), waiting up to settle_ms for it to stop being
-    "unknown" -- the portal mounts its markup a moment after domcontentloaded."""
+def _page_kind(page: Page, settle_ms: int = 10000,
+               until=("kendo", "legacy", "portal")) -> str:
+    """The page's kind (see _PAGE_KIND_JS), polling up to settle_ms until it is one of
+    `until` -- the portal mounts its markup a moment after domcontentloaded, and an old
+    booking page has jQuery a moment before its scheduler is bound. Returns the last
+    answer when the window runs out."""
     kind = "unknown"
     for _ in range(max(1, settle_ms // 500)):
         kind = page.evaluate(_PAGE_KIND_JS)
-        if kind != "unknown":
+        if kind in until:
             return kind
         page.wait_for_timeout(500)
     return kind
@@ -355,7 +358,9 @@ def _ensure_kendo_scheduler(page: Page, org_url: str) -> None:
     if org_url in page.url and page.evaluate(_PAGE_KIND_JS) == "kendo":
         return  # the pre-warmed page is still good; don't spend a reload at release time
     page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
-    kind = _page_kind(page)
+    # "legacy" isn't an answer here: it's what an old booking page says while jQuery is
+    # up but the scheduler isn't bound yet, so keep polling through it.
+    kind = _page_kind(page, until=("kendo", "portal"))
     if kind == "kendo":
         return
     if kind == "portal":
@@ -363,9 +368,11 @@ def _ensure_kendo_scheduler(page: Page, org_url: str) -> None:
             "page changed: the booking page is CourtReserve's new portal (data-testid="
             "scheduler-page), and the Kendo scheduler (#ConsolidatedScheduler) this code "
             "books through is gone. Nothing was clicked.")
+    # The URL only, not the title: a "504 Gateway Time-out" title would make net_errors
+    # read this as transient and retry it.
     raise PageChangedError(
         f"page changed: no Kendo scheduler (#ConsolidatedScheduler) on the booking page "
-        f"(url={page.url}, title={page.title()!r}). Nothing was clicked.")
+        f"(url={page.url}). Nothing was clicked.")
 
 
 def _navigate_to_date(page: Page, target_date: date) -> None:
