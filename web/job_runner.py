@@ -60,6 +60,7 @@ from sqlalchemy import insert, select, update
 
 from booking import (OrgConfig, Slot, get_available_slots, find_best_slot, book_slot, slot_has_window,
                      _org_uses_court_picker, get_my_reservations, cancel_reservation, match_reservation_id,
+                     ensure_booking_page,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
                      CourtSelectionRequiredError, SlotNotBookableError)
 
@@ -388,6 +389,18 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     info["cancelled"] = False
     if not reservation_id:
         return "held_by_probe", "No reservation id captured — probe still holds the court; cancel manually."
+
+    # Know the main account can re-book before giving up the probe's court: a booking
+    # page this code can't drive (a partial rollout of a new UI) would otherwise turn a
+    # completed cancel into a lost court.
+    try:
+        ensure_booking_page(booking_page, org_cfg.booking_url)
+    except Exception as e:
+        log(f"Main account's booking page can't be used: {e}")
+        info["cancel_error"] = str(e)
+        return ("held_by_probe",
+                "The booking page can't be used, so the cancel wasn't started — probe still "
+                "holds the court.")
 
     def before_first_click():
         info["cancel_started"] = True

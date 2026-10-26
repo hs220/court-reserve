@@ -347,32 +347,345 @@ def _page_kind(page: Page, settle_ms: int = 10000,
     return kind
 
 
-def _ensure_kendo_scheduler(page: Page, org_url: str) -> None:
-    """Be on the booking page with its Kendo scheduler bound, before anything is clicked.
+def ensure_booking_page(page: Page, org_url: str) -> str:
+    """Be on a booking page this code can drive, before anything is clicked. Returns its
+    kind: "kendo" (the old Kendo scheduler) or "portal" (CourtReserve's new React
+    portal, [data-testid=scheduler-page]).
 
-    Reloads when the page is elsewhere or has lost the scheduler. It doesn't trust the
+    Reloads when the page is elsewhere or has lost its scheduler. It doesn't trust the
     URL alone: run 412's page sat on the booking URL for three hours, and when it came
     to book, the page there had no jQuery at all. Raises PageChangedError when the
-    reloaded page still has no scheduler -- above all when it is the new portal, which
-    this code can't book through yet."""
-    if org_url in page.url and page.evaluate(_PAGE_KIND_JS) == "kendo":
-        return  # the pre-warmed page is still good; don't spend a reload at release time
+    reloaded page is neither."""
+    if org_url in page.url:
+        kind = page.evaluate(_PAGE_KIND_JS)
+        if kind == "kendo" or (kind == "portal" and page.query_selector(_PORTAL_SCHEDULER)):
+            return kind  # the pre-warmed page is still good; don't spend a reload at release time
     page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
     # "legacy" isn't an answer here: it's what an old booking page says while jQuery is
     # up but the scheduler isn't bound yet, so keep polling through it.
     kind = _page_kind(page, until=("kendo", "portal"))
     if kind == "kendo":
-        return
+        return kind
     if kind == "portal":
-        raise PageChangedError(
-            "page changed: the booking page is CourtReserve's new portal (data-testid="
-            "scheduler-page), and the Kendo scheduler (#ConsolidatedScheduler) this code "
-            "books through is gone. Nothing was clicked.")
+        # The portal's shell is up before React renders the scheduler into it.
+        try:
+            page.wait_for_selector(_PORTAL_SCHEDULER, timeout=15000)
+        except Exception:
+            raise PageChangedError(
+                "page changed: the portal's booking page never showed its scheduler "
+                "([data-testid=scheduler-page]). Nothing was clicked.") from None
+        return kind
     # The URL only, not the title: a "504 Gateway Time-out" title would make net_errors
     # read this as transient and retry it.
     raise PageChangedError(
-        f"page changed: no Kendo scheduler (#ConsolidatedScheduler) on the booking page "
-        f"(url={page.url}). Nothing was clicked.")
+        f"page changed: no scheduler on the booking page, neither Kendo "
+        f"(#ConsolidatedScheduler) nor the portal's (url={page.url}). Nothing was clicked.")
+
+
+# --- CourtReserve's new portal (React + Ant Design), as recorded live on 2026-10-25 ---
+# Class names there are build hashes, so everything below keys on data-testid, ARIA
+# roles and visible text.
+#   grid:  [data-testid=scheduler-page]; a column per court type under
+#          [data-testid=scheduler-header-court-type-<CourtType>]; a 46px cell per
+#          half hour; a bookable cell is [data-testid=consolidated-reserve-slot]
+#          (role=button, "Reserve"), a taken one a plain div reading "None Available".
+#          Time labels are leaf elements reading e.g. "2:30 PM". The day is changed
+#          with [aria-label="Previous day"/"Next day"]; .ant-picker's input holds
+#          MM/DD/YYYY.
+#   form:  "Reserve" opens .ant-modal[role=dialog] "Create Reservation" holding
+#          [data-testid=reservation-form]; [data-testid=reservation-date-time-display]
+#          reads "OCT 30 Friday 2:30 PM – 3:00 PM ...". Duration is a base-ui
+#          button[role=combobox] ("30 minutes") whose [role=option]s are "30 minutes",
+#          "1 hour", "1 hour & 30 minutes", "2 hours", backed by a hidden
+#          input[name=duration] holding the minutes. "I agree to the terms above" is a
+#          styled div (no input, no aria-checked). Buttons: View, Close, Confirm.
+#          (Sunnyvale; Santa Clara's court picker hasn't been seen on the portal.)
+_PORTAL_SCHEDULER = "[data-testid=scheduler-page]"
+_PORTAL_SLOT = "[data-testid=consolidated-reserve-slot]"
+_PORTAL_FORM = "[data-testid=reservation-form]"
+_PORTAL_MODAL = ".ant-modal[role=dialog]"
+_PORTAL_TERMS = "I agree to the terms above"
+
+_PORTAL_DATE_JS = """(function() {
+    var i = document.querySelector("[data-testid=scheduler-page] .ant-picker input")
+            || document.querySelector(".ant-picker input");
+    return i ? i.value : null;
+})()"""
+
+# Where the slot's cell is, and what it shows: the cell under the court type's column
+# at the height of the slot's time label. A bookable cell is marked data-cr-pick=<token>
+# in the same pass, so the click lands on that cell even if the grid re-renders and
+# shifts the Reserve buttons in between (live: clicking the Nth one opened the next
+# half hour's form).
+_PORTAL_FIND_SLOT_JS = """([label, courtType, token]) => {
+    const leaf = [...document.querySelectorAll("[data-testid=scheduler-page] *")].find(
+        el => el.children.length === 0 && (el.textContent || "").trim().toUpperCase() === label);
+    if (!leaf) return null;
+    leaf.scrollIntoView({block: "center"});
+    const lr = leaf.getBoundingClientRect(), y = lr.y + lr.height / 2;
+    const prefix = "scheduler-header-court-type-";
+    const heads = [...document.querySelectorAll("[data-testid^='" + prefix + "']")]
+        .filter(h => !h.getAttribute("data-testid").startsWith(prefix + "name-"));
+    const head = heads.find(h => h.getAttribute("data-testid") === prefix + courtType)
+                 || (heads.length === 1 ? heads[0] : null);
+    if (!head) return {state: "no column", columns: heads.map(h => h.getAttribute("data-testid").slice(prefix.length))};
+    const hr = head.getBoundingClientRect(), x = hr.x + hr.width / 2;
+    const slots = [...document.querySelectorAll("[data-testid=consolidated-reserve-slot]")];
+    const index = slots.findIndex(s => { const r = s.getBoundingClientRect();
+        return r.top <= y && y <= r.bottom && r.left <= x && x <= r.right; });
+    if (index >= 0) {
+        document.querySelectorAll("[data-cr-pick]").forEach(e => e.removeAttribute("data-cr-pick"));
+        slots[index].setAttribute("data-cr-pick", token);
+        return {state: "reserve", pick: "[data-cr-pick='" + token + "']"};
+    }
+    const el = document.elementFromPoint(x, y);
+    const text = ((el && el.innerText) || "").trim().toUpperCase();
+    return {state: text.includes("NONE AVAILABLE") ? "none available"
+                   : text.includes("UNAVAILABLE") ? "unavailable" : "unknown", text: text.slice(0, 40)};
+}"""
+
+_PORTAL_FORM_JS = """(function() {
+    var m = document.querySelector(".ant-modal[role=dialog]");
+    if (!m) return null;
+    function txt(el) { return el ? (el.innerText || "").replace(/\\s+/g, " ").trim() : null; }
+    var combos = m.querySelectorAll("button[role=combobox]");
+    var dur = m.querySelector("input[name=duration]");
+    return {
+        form: !!m.querySelector("[data-testid=reservation-form]"),
+        dateTime: txt(m.querySelector("[data-testid=reservation-date-time-display]")),
+        combos: combos.length,
+        duration: txt(combos[0]),
+        durationValue: dur ? dur.value : null,
+        terms: Array.prototype.some.call(m.querySelectorAll("span"),
+            function(s) { return (s.textContent || "").trim() === "I agree to the terms above"; }),
+    };
+})()"""
+
+_PORTAL_SLOT_COUNT_JS = """(function() {
+    return document.querySelectorAll("[data-testid=consolidated-reserve-slot]").length;
+})()"""
+
+_PORTAL_OPTIONS_JS = """(function() {
+    return Array.prototype.map.call(document.querySelectorAll("[role=listbox] [role=option]"),
+        function(o) { return (o.innerText || "").trim(); });
+})()"""
+
+# Messages the portal shows after Confirm: toasts, notifications, alerts, and form
+# errors inside the still-open modal. Never the modal's other text (it names the member).
+_PORTAL_NOTICES_JS = """(function() {
+    var sel = ".ant-message, .ant-notification, [role=alert], .ant-form-item-explain-error, .ant-modal-confirm-content";
+    return Array.prototype.map.call(document.querySelectorAll(sel),
+        function(e) { return (e.innerText || "").replace(/\\s+/g, " ").trim().slice(0, 300); })
+        .filter(function(t) { return t; });
+})()"""
+
+
+def _portal_duration_label(minutes: int) -> str:
+    """The portal's wording for a duration: "30 minutes", "1 hour", "1 hour & 30
+    minutes", "2 hours"."""
+    h, m = divmod(minutes, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} hour" + ("s" if h > 1 else ""))
+    if m:
+        parts.append(f"{m} minute" + ("s" if m > 1 else ""))
+    return " & ".join(parts)
+
+
+def _portal_duration_minutes(label: str) -> Optional[int]:
+    h = re.search(r"(\d+)\s*hour", label or "")
+    m = re.search(r"(\d+)\s*minute", label or "")
+    if not h and not m:
+        return None
+    return (int(h.group(1)) * 60 if h else 0) + (int(m.group(1)) if m else 0)
+
+
+def _portal_go_to_date(page: Page, target: date) -> None:
+    """Step the portal's scheduler to `target` with its Previous/Next day buttons, then
+    refresh it, so the grid isn't the one loaded at pre-warm."""
+    # Live: [data-testid=scheduler-page] renders a moment before its date picker does.
+    for _ in range(20):  # up to ~10s
+        if page.evaluate(_PORTAL_DATE_JS):
+            break
+        page.wait_for_timeout(500)
+    for _ in range(62):
+        shown = page.evaluate(_PORTAL_DATE_JS)
+        try:
+            current = datetime.strptime(shown or "", "%m/%d/%Y").date()
+        except ValueError:
+            raise PageChangedError(
+                f"page changed: the portal's scheduler date picker doesn't read as "
+                f"MM/DD/YYYY ({shown!r}). Nothing was clicked.") from None
+        if current == target:
+            break
+        page.click('[aria-label="Next day"]' if current < target else '[aria-label="Previous day"]')
+        for _ in range(20):  # up to ~5s for the day to change
+            page.wait_for_timeout(250)
+            if page.evaluate(_PORTAL_DATE_JS) != shown:
+                break
+    else:
+        raise PageChangedError(f"page changed: the portal's scheduler never reached {target}.")
+    refresh = page.query_selector("[data-testid=scheduler-refresh-btn]")
+    if refresh:
+        refresh.click()
+    page.wait_for_timeout(1000)
+    # Let the refreshed grid settle: the same number of Reserve buttons twice running.
+    last = None
+    for _ in range(10):  # up to ~5s
+        count = page.evaluate(_PORTAL_SLOT_COUNT_JS)
+        if count == last:
+            break
+        last = count
+        page.wait_for_timeout(500)
+
+
+def _book_slot_portal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig,
+                      dry_run: bool, result: Optional[dict]) -> bool:
+    """book_slot on CourtReserve's new portal. Same contract as the Kendo path: True when
+    booked, False when it didn't complete, and the BookingError subclasses for what the
+    caller treats specially. A booking counts only when the account's reservation list
+    then shows it -- the portal's own confirmation hasn't been seen yet."""
+    slot_label = slot.start_dt.strftime("%-I:%M %p").upper()  # e.g. "2:30 PM"
+    _portal_go_to_date(page, slot.start_dt.date())
+
+    when = ""
+    for opened in range(2):  # a second try if the form that opens is for another slot
+        found = None
+        for attempt in range(5):  # the grid can lag the feed; re-read it like the Kendo path
+            token = f"{slot.start_ms}-{opened}-{attempt}"
+            found = page.evaluate(_PORTAL_FIND_SLOT_JS, [slot_label, slot.court_type, token])
+            if found and found.get("state") != "unknown":
+                break
+            page.wait_for_timeout(2000)
+        if not found:
+            print(f"Could not find {slot_label} in the portal's scheduler grid.")
+            return False
+        state = found.get("state")
+        if state == "no column":
+            raise PageChangedError(f"page changed: no '{slot.court_type}' column in the portal's "
+                                   f"scheduler (columns: {found.get('columns')}). Nothing was clicked.")
+        if state != "reserve":
+            marker = {"none available": "NONE AVAILABLE (taken)",
+                      "unavailable": "UNAVAILABLE (not open yet / past)"}.get(state, f"no Reserve button ({found.get('text')!r})")
+            print(f"Slot {slot_label} shows '{marker}' on the portal grid — not bookable right now.")
+            raise SlotNotBookableError(f"Slot at {slot.start_time} on {slot.start_date} not bookable ({marker}).")
+
+        page.locator(found["pick"]).click(timeout=5000)
+        try:
+            page.wait_for_selector(_PORTAL_FORM, timeout=15000)
+        except Exception:
+            raise SlotNotBookableError(f"Slot at {slot.start_time} on {slot.start_date}: 'Reserve' "
+                                       f"never opened the reservation form.") from None
+        page.wait_for_timeout(1500)
+        print("Booking form opened (portal).")
+
+        form = page.evaluate(_PORTAL_FORM_JS) or {}
+        # The form must be for this slot: its tile reads "OCT 30 Friday 2:30 PM – 3:00 PM ...".
+        when = form.get("dateTime") or ""
+        day_tag = f"{slot.start_dt.strftime('%b').upper()} {slot.start_dt.day}"
+        if day_tag in when.upper() and f"{slot_label} –" in when.upper():
+            break
+        print(f"The form that opened is for {when[:40]!r}, not {slot.start_date} {slot_label} — closing it.")
+        page.locator(_PORTAL_MODAL).locator(".ant-modal-close").first.click()
+        page.wait_for_timeout(1000)
+    else:
+        raise PageChangedError(f"page changed: the portal's form isn't for {slot.start_date} "
+                               f"{slot_label} (it reads {when[:60]!r}). Nothing was confirmed.")
+    if form.get("combos", 0) != 1:
+        # Sunnyvale's form has one picker, Duration. A second one (a court picker, as the
+        # old Santa Clara form had) hasn't been seen on the portal: don't guess at it.
+        raise PageChangedError(f"page changed: the portal's form has {form.get('combos')} "
+                               f"pickers, and only Duration is mapped. Nothing was confirmed.")
+
+    if duration_minutes > 0:
+        want = _portal_duration_label(duration_minutes)
+        if form.get("duration") != want:
+            page.locator(_PORTAL_MODAL).locator("button[role=combobox]").first.click()
+            page.wait_for_timeout(500)
+            options = page.evaluate(_PORTAL_OPTIONS_JS) or []
+            if want not in options:
+                usable = [o for o in options if _portal_duration_minutes(o)]
+                if not usable:
+                    raise PageChangedError(f"page changed: the portal's Duration list has no "
+                                           f"readable options ({options}). Nothing was confirmed.")
+                want = min(usable, key=lambda o: abs(_portal_duration_minutes(o) - duration_minutes))
+                print(f"Duration {duration_minutes} not in options {options} — using nearest: {want}")
+            page.get_by_role("option", name=want, exact=True).click()
+            page.wait_for_timeout(800)
+            form = page.evaluate(_PORTAL_FORM_JS) or {}
+        minutes = _portal_duration_minutes(want)
+        end = (slot.start_dt + timedelta(minutes=minutes)).strftime("%-I:%M %p").upper()
+        ok = (form.get("duration") == want and form.get("durationValue") == str(minutes)
+              and end in (form.get("dateTime") or "").upper())
+        print(f"Duration={duration_minutes} min (portal: {form.get('duration')!r}, value="
+              f"{form.get('durationValue')})  ends {end}: {'ok' if ok else 'NOT applied'}")
+        if not ok:
+            print(f"Could not confirm duration {want} — aborting before Confirm to avoid booking the wrong length.")
+            return False
+    else:
+        print(f"Duration=any — using the portal's default ({form.get('duration')!r})")
+
+    if dry_run:
+        print("DRY RUN — stopping before Confirm.")
+        return False
+
+    modal = page.locator(_PORTAL_MODAL)
+    if form.get("terms"):
+        modal.get_by_text(_PORTAL_TERMS, exact=True).click()
+        page.wait_for_timeout(300)
+
+    capture: dict = {}
+
+    def _on_response(resp):
+        if capture.get("id") or not _may_carry_new_reservation_id(resp.url):
+            return
+        try:
+            m = re.search(r'"[Rr]eservationId"\s*:\s*"?(\d{3,})', resp.text() or "")
+        except Exception:
+            return
+        if m:
+            capture["id"] = m.group(1)
+
+    page.on("response", _on_response)
+    try:
+        modal.get_by_role("button", name="Confirm", exact=True).click()
+        page.wait_for_timeout(4000)
+    finally:
+        page.remove_listener("response", _on_response)
+
+    notices = page.evaluate(_PORTAL_NOTICES_JS) or []
+    for msg in notices:
+        lower = msg.lower()
+        if any(k in lower for k in ("only allowed", "not allowed", "cannot reserve", "restricted to",
+                                    "no available courts", "select a court")):
+            err = _classify_booking_error(msg)
+            print(f"Booking blocked [{type(err).__name__}]: {msg}")
+            raise err
+
+    # The positive answer: the reservation is on the account's list.
+    rid = None
+    for attempt in range(3):
+        try:
+            listed = get_my_reservations(page, org)
+        except ReservationListError as exc:
+            # Confirm was clicked: this may be booked. Fail loudly rather than let a
+            # watch take it for "not booked" and try again.
+            raise ReservationListError(f"Confirm was clicked for {slot.start_date} {slot.start_time}, "
+                                       f"but the reservation list couldn't be read to check it: {exc}") from exc
+        rid = match_reservation_id(listed, slot.start_date, slot.start_time)
+        if rid:
+            break
+        page.wait_for_timeout(2000)
+    if not rid:
+        print(f"Could not confirm booking: {slot.start_date} {slot.start_time} isn't on the "
+              f"reservation list. Portal messages: {notices or 'none'}")
+        return False
+    if capture.get("id") and capture["id"] != rid:
+        print(f"(save response named reservation {capture['id']}; the list says {rid} — using the list)")
+    if result is not None:
+        result["reservation_id"] = rid
+    print(f"Booking confirmed! (on the reservation list as {rid})")
+    return True
 
 
 def _navigate_to_date(page: Page, target_date: date) -> None:
@@ -474,8 +787,9 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
     ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
 
-    # Be on the booking page with a live scheduler (raises PageChangedError if it's gone)
-    _ensure_kendo_scheduler(page, org_url)
+    # Be on a booking page with a live scheduler (raises PageChangedError if it's gone)
+    if ensure_booking_page(page, org_url) == "portal":
+        return _book_slot_portal(page, slot, duration_minutes, org, dry_run, result)
 
     # Navigate the Kendo Scheduler to the target date
     _navigate_to_date(page, slot.start_dt.date())

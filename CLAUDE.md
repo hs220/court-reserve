@@ -153,17 +153,30 @@ The tool automates CourtReserve's booking UI via Playwright. There is no officia
 
 **CourtReserve's new portal (Oct 2026):** between Oct 23 and 24, 2026 the booking page
 and the reservation page moved to a React portal (`ClientApp/pages/bundle-portal.js`).
-It has no jQuery, no Kendo and no server-rendered forms, so steps 4 above and the
-cancel no longer work there. The login page, the ReadConsolidated feed and the
-my-bookings `get-list` JSON are unchanged. `book_slot` and `cancel_reservation` check
-the page kind (`_PAGE_KIND_JS`) first and raise `PageChangedError` ("page changed: …")
-on the portal before clicking anything. A transfer therefore stops with the probe
-holding the court instead of ending in `needs_check`. A cancel counts only when the
-reloaded reservation page says so (the portal's `[data-testid=status]` = "Canceled"),
-never because the submit landed somewhere else. Mapping the portal's booking form and
-cancel dialog still needs a live look: one click on a slot's `Reserve`
-(`[data-testid=consolidated-reserve-slot]`) and, on a reservation the test account
-holds, its "Cancel Reservation".
+It has no jQuery, no Kendo and no server-rendered forms. The login page, the
+ReadConsolidated feed and the my-bookings `get-list` JSON are unchanged.
+`ensure_booking_page` tells the old Kendo page from the portal (`_PAGE_KIND_JS`) and
+raises `PageChangedError` ("page changed: …") for anything else, before any click.
+`book_slot` then takes the Kendo path or `_book_slot_portal`, which works from the DOM
+recorded live and keys only on `data-testid`, ARIA roles and visible text, since class
+names are build hashes:
+- It steps the day with "Previous day"/"Next day" to the date picker's `MM/DD/YYYY`, then
+  refreshes the grid.
+- It marks the cell under the court type's column at the time label's height
+  (`data-cr-pick`) and clicks that mark. Clicking the Nth "Reserve" opened the wrong half
+  hour once the grid re-rendered.
+- It checks the form's date and time tile, picks Duration from its `[role=option]`s and
+  verifies the hidden `input[name=duration]` and the end time.
+- It ticks "I agree to the terms above" and clicks Confirm.
+
+A portal booking counts only when the account's `get-list` then shows it, and that list
+supplies the reservation id. The portal's own confirmation hasn't been seen. A form with
+a second picker (a court picker, as the old Santa Clara form had) is refused before
+Confirm. The portal's cancel dialog hasn't been seen either, so `cancel_reservation`
+still refuses on the portal before its first click. A transfer checks
+`ensure_booking_page` on the main account's page before it cancels, so a booking page
+the code can't drive leaves the probe holding the court. A cancel counts only when the
+reloaded reservation page says so (`[data-testid=status]` = "Canceled").
 
 **Multi-org support:** `booking.py` now exposes `OrgConfig(org_id, scheduler_id, cost_type_id, timezone)`. The CLI uses `default_org_config()` from `config.py` (reads `config.yaml`). The web UI stores orgs/accounts in SQLite and constructs `OrgConfig` per job.
 

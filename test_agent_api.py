@@ -742,7 +742,7 @@ class TransferTestCase(AgentApiTestCase):
         self.addCleanup(self._drop_transfers)
         self.fake = {}
         for name in ("sync_playwright", "ensure_logged_in", "cancel_reservation", "book_slot",
-                     "_send_warning_email"):
+                     "ensure_booking_page", "_send_warning_email"):
             p = mock.patch(f"web.job_runner.{name}")
             self.fake[name] = p.start()
             self.addCleanup(p.stop)
@@ -974,6 +974,21 @@ class TransferCompleteTests(TransferTestCase):
         self.assertEqual(self.courts(tid), [])  # nothing recorded as booked
         listed = {x["id"]: x for x in call("GET", "/api/agent/v1/transfers")[1]["transfers"]}
         self.assertEqual(listed[tid]["status"], "needs_check")
+
+    def test_an_unusable_booking_page_stops_the_transfer_before_the_cancel(self):
+        # Review of #7: cancelling first and only then finding the main account can't
+        # book (a partial rollout of a new UI) would lose the court.
+        from booking import PageChangedError
+        tid = self.add_transfer()
+        self.fake["ensure_booking_page"].side_effect = PageChangedError(
+            "page changed: no scheduler on the booking page. Nothing was clicked.")
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
+        self.fake["cancel_reservation"].assert_not_called()
+        self.fake["book_slot"].assert_not_called()
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "held_by_probe")
+        self.assertIsNone(t.cancel_started_at)
 
     def test_a_cancel_that_errors_before_its_first_click_changed_nothing(self):
         # The reservation page never loaded: nothing was clicked on CourtReserve.
