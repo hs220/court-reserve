@@ -990,6 +990,31 @@ class TransferCompleteTests(TransferTestCase):
         self.assertEqual(t.status, "held_by_probe")
         self.assertIsNone(t.cancel_started_at)
 
+    def test_an_unusable_probe_booking_page_stops_the_transfer_before_the_cancel(self):
+        # The probe re-books if main can't: its page must be usable too, before the hook.
+        from booking import PageChangedError
+        tid = self.add_transfer()
+        seen = []
+
+        def check(page, url):
+            seen.append(page)
+            if len(seen) == 2:
+                raise PageChangedError("page changed: no scheduler on the booking page. Nothing was clicked.")
+            return "portal"
+
+        self.fake["ensure_booking_page"].side_effect = check
+        # A page of its own per account, as with real browser contexts.
+        browser = self.fake["sync_playwright"].return_value.__enter__.return_value.chromium.launch.return_value
+        browser.new_context.side_effect = lambda **kw: mock.MagicMock()
+        body = self.complete(tid)[1]
+        self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
+        self.assertEqual(len(seen), 2)
+        self.assertIsNot(seen[0], seen[1])  # main's page, then the probe's
+        self.fake["cancel_reservation"].assert_not_called()
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "held_by_probe")
+        self.assertIsNone(t.cancel_started_at)
+
     def test_a_cancel_that_errors_before_its_first_click_changed_nothing(self):
         # The reservation page never loaded: nothing was clicked on CourtReserve.
         tid = self.add_transfer()

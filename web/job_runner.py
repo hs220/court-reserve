@@ -390,13 +390,15 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     if not reservation_id:
         return "held_by_probe", "No reservation id captured — probe still holds the court; cancel manually."
 
-    # Know the main account can re-book before giving up the probe's court: a booking
-    # page this code can't drive (a partial rollout of a new UI) would otherwise turn a
-    # completed cancel into a lost court.
+    # Know both accounts can book before giving up the probe's court -- main to re-book,
+    # the probe to take it back if main fails. A booking page this code can't drive (a
+    # partial rollout of a new UI) would otherwise turn a completed cancel into a lost
+    # court. This is before the cancel's hook: a refusal here means nothing was clicked.
     try:
         ensure_booking_page(booking_page, org_cfg.booking_url)
+        ensure_booking_page(probe_page, org_cfg.booking_url)
     except Exception as e:
-        log(f"Main account's booking page can't be used: {e}")
+        log(f"A booking page can't be used: {e}")
         info["cancel_error"] = str(e)
         return ("held_by_probe",
                 "The booking page can't be used, so the cancel wasn't started — probe still "
@@ -722,6 +724,9 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
 
                     ensure_logged_in(context, page, account["email"], account["password"],
                                      org_cfg.booking_url, session_file)
+                    # Know now, not at the release, if the booking page can't be driven
+                    # (a new CourtReserve UI): PageChangedError fails the run and alerts.
+                    ensure_booking_page(page, org_cfg.booking_url)
 
                     if at_iso:
                         wait_until(datetime.fromisoformat(at_iso))
@@ -1019,6 +1024,10 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                         booking_page = booking_context.new_page()
                         ensure_logged_in(booking_context, booking_page, account["email"], account["password"],
                                          org_cfg.booking_url, session_file)
+                        # Know now, not when a slot opens, if the booking page can't be
+                        # driven (a new CourtReserve UI): PageChangedError fails the run
+                        # and alerts, where it would otherwise poll for days and fail late.
+                        ensure_booking_page(booking_page, org_cfg.booking_url)
 
                         # Pre-warm if we're within 10 minutes of the booking window opening.
                         time_to_release = (release_dt - datetime.now(tz_obj)).total_seconds()
@@ -1032,6 +1041,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                             probe_page = probe_context.new_page()
                             ensure_logged_in(probe_context, probe_page, probe_account["email"], probe_account["password"],
                                              org_cfg.booking_url, probe_session_file)
+                            ensure_booking_page(probe_page, org_cfg.booking_url)
                         else:
                             probe_page = booking_page
 

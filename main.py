@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 from config import load_config, default_org_config, SESSION_FILE
 from auth import ensure_logged_in, BROWSER_ARGS, USER_AGENT
 from booking import (get_available_slots, find_best_slot, book_slot, _org_uses_court_picker,
+                     ensure_booking_page,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
                      CourtSelectionRequiredError, SlotNotBookableError)
 from scheduler import wait_until
@@ -171,6 +172,8 @@ def cmd_book(args, cfg):
 
         # Pre-warm: login and land on booking page before the release time
         ensure_logged_in(context, page, cfg["email"], cfg["password"], org.booking_url, SESSION_FILE)
+        # Fail now, not at the release, if the booking page can't be driven.
+        ensure_booking_page(page, org.booking_url)
 
         if args.at:
             wait_until(datetime.fromisoformat(args.at))
@@ -289,6 +292,8 @@ def cmd_watch(args, cfg):
         context = browser.new_context(user_agent=USER_AGENT)
         page = context.new_page()
         ensure_logged_in(context, page, cfg["email"], cfg["password"], org.booking_url, SESSION_FILE)
+        # Fail now, not when a slot opens, if the booking page can't be driven.
+        ensure_booking_page(page, org.booking_url)
 
         # Probe context (separate account for slot detection only)
         if use_separate_probe:

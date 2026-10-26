@@ -27,7 +27,7 @@ from web.database import accounts, engine, init_db, job_runs, jobs, organization
 from booking import Slot, find_best_slot
 import web.job_runner as jr
 from net_errors import ErrorStreak
-from web.job_runner import (_append_run_log, _deadline_timeout_minutes, _finish_run,
+from web.job_runner import (run_book_next, _append_run_log, _deadline_timeout_minutes, _finish_run,
                             _is_network_error, _live_times, _notify_run_failed,
                             _parse_preferred_times, _send_warning_email, _start_run,
                             request_cancel, run_watch, SMTP_ATTEMPTS, SMTP_TIMEOUT_SECONDS)
@@ -298,6 +298,7 @@ class RunWatchCancelPathTests(unittest.TestCase):
         preset.set()
         for target, new in [("web.job_runner._register_cancel", lambda _job_id: preset),
                             ("web.job_runner.ensure_logged_in", mock.DEFAULT),
+                            ("web.job_runner.ensure_booking_page", mock.DEFAULT),
                             ("web.job_runner.wait_until", mock.DEFAULT)]:
             p = mock.patch(target, new) if new is not mock.DEFAULT else mock.patch(target)
             p.start()
@@ -441,6 +442,7 @@ class WatchGivesUpOnARepeatingErrorTests(unittest.TestCase):
                             ("web.job_runner.ErrorStreak",
                              lambda **kw: ErrorStreak(clock=self.clock.monotonic, **kw)),
                             ("web.job_runner.ensure_logged_in", mock.DEFAULT),
+                            ("web.job_runner.ensure_booking_page", mock.DEFAULT),
                             ("web.job_runner.wait_until", mock.DEFAULT),
                             ("web.job_runner.sync_playwright", mock.DEFAULT)]:
             p = mock.patch(target, new) if new is not mock.DEFAULT else mock.patch(target)
@@ -507,6 +509,72 @@ class WatchGivesUpOnARepeatingErrorTests(unittest.TestCase):
         self.assertEqual(run.status, "cancelled")
         self.assertNotIn("Giving up", run.log_text)
         smtp.assert_not_called()
+
+
+class PrewarmBookingPageCheckTests(unittest.TestCase):
+    """Review of #7: a booking page the code can't drive (a new CourtReserve UI) must
+    fail the run when the session is set up -- before a watch polls for days, or a
+    book-next waits for the release -- not when it finally comes to click."""
+
+    def setUp(self):
+        from booking import PageChangedError
+        self.job_id = _cancel_job_id()
+        with engine.begin() as conn:
+            conn.execute(jobs.update().where(jobs.c.id == self.job_id).values(status="active"))
+        self.fakes = {}
+        for name in ("ensure_logged_in", "wait_until", "sync_playwright", "get_available_slots",
+                     "book_slot", "ensure_booking_page"):
+            p = mock.patch(f"web.job_runner.{name}")
+            self.fakes[name] = p.start()
+            self.addCleanup(p.stop)
+        self.fakes["ensure_booking_page"].side_effect = PageChangedError(
+            "page changed: no scheduler on the booking page. Nothing was clicked.")
+        env = mock.patch.dict(os.environ, {"NOTIFY_EMAIL": "me@example.com", "SMTP_PASSWORD": "pw"})
+        env.start()
+        self.addCleanup(env.stop)
+        # If the check ever stops failing the run, a poll pauses the job, so the test
+        # fails on the run's status instead of polling forever.
+        self.event = _ScriptedEvent()
+        p = mock.patch("web.job_runner._register_cancel", lambda _job_id: self.event)
+        p.start()
+        self.addCleanup(p.stop)
+        self.fakes["get_available_slots"].side_effect = lambda *a, **k: (self.event.set(), [])[1]
+
+    def _last_run(self):
+        with engine.connect() as conn:
+            return conn.execute(job_runs.select().where(job_runs.c.job_id == self.job_id)
+                                .order_by(job_runs.c.id.desc())).fetchone()
+
+    def _assert_failed_early(self, smtp):
+        run = self._last_run()
+        self.assertEqual(run.status, "failed")
+        self.assertIn("page changed", run.log_text)
+        smtp.assert_called()                                   # the alert goes out now
+        self.fakes["get_available_slots"].assert_not_called()  # no polling a dead page
+        self.fakes["book_slot"].assert_not_called()
+        self.fakes["wait_until"].assert_not_called()           # nor waiting for the release
+
+    def test_a_watch_fails_before_its_first_poll(self):
+        with mock.patch("smtplib.SMTP") as smtp:
+            run_watch(self.job_id, _cancel_account_id(), "2026-11-20", "19:30",
+                      duration=60, interval=60, deadline_mode="infinite")
+        self._assert_failed_early(smtp)
+
+    def test_a_book_next_fails_before_waiting_for_the_release(self):
+        with mock.patch("smtplib.SMTP") as smtp:
+            run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-11-20T12:00:00",
+                          target_date_iso="2026-11-27", target_time="19:30")
+        self._assert_failed_early(smtp)
+
+    def test_a_drivable_page_is_checked_once_per_session_and_watching_goes_on(self):
+        self.fakes["ensure_booking_page"].side_effect = None
+        self.fakes["ensure_booking_page"].return_value = "portal"
+        with mock.patch("smtplib.SMTP"):
+            run_watch(self.job_id, _cancel_account_id(), "2026-11-20", "19:30",
+                      duration=60, interval=60, deadline_mode="infinite")
+        self.assertEqual(self._last_run().status, "cancelled")
+        self.assertEqual(self.fakes["ensure_booking_page"].call_count, 1)
+        self.fakes["get_available_slots"].assert_called()
 
 
 def _cancel_account_id():

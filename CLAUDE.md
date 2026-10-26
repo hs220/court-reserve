@@ -174,8 +174,11 @@ supplies the reservation id. The portal's own confirmation hasn't been seen. A f
 a second picker (a court picker, as the old Santa Clara form had) is refused before
 Confirm. The portal's cancel dialog hasn't been seen either, so `cancel_reservation`
 still refuses on the portal before its first click. A transfer checks
-`ensure_booking_page` on the main account's page before it cancels, so a booking page
-the code can't drive leaves the probe holding the court. A cancel counts only when the
+`ensure_booking_page` on both the main account's and the probe's page before it cancels
+(before the hook), so a booking page the code can't drive leaves the probe holding the
+court. `run_book_next`, `run_watch` and the CLI's `cmd_book` / `cmd_watch` run the same
+check right after login. An undrivable page then fails the run and alerts at session
+start, not when the release opens or a slot finally appears. A cancel counts only when the
 reloaded reservation page says so (`[data-testid=status]` = "Canceled").
 
 **Multi-org support:** `booking.py` now exposes `OrgConfig(org_id, scheduler_id, cost_type_id, timezone)`. The CLI uses `default_org_config()` from `config.py` (reads `config.yaml`). The web UI stores orgs/accounts in SQLite and constructs `OrgConfig` per job.
