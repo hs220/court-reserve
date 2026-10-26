@@ -8,6 +8,7 @@ from sqlalchemy import select, update
 
 from web.database import (engine, jobs, accounts, organizations, job_runs, bookings,
                           pending_transfers, row_to_dict, json_field, get_days_out)
+from log_scrub import scrub as scrub_log
 from web import apscheduler_setup
 from web.templates_shared import templates
 
@@ -493,7 +494,8 @@ async def get_transfer_log(transfer_id: int):
                          .where(pending_transfers.c.id == transfer_id)).fetchone()
     if not t:
         return PlainTextResponse("Transfer not found.", status_code=404)
-    return PlainTextResponse(t.log_text or "(no transfer output yet)")
+    # Stored logs are scrubbed when written; this covers rows written before that.
+    return PlainTextResponse(scrub_log(t.log_text or "") or "(no transfer output yet)")
 
 
 @router.get("/transfers/{transfer_id}", response_class=HTMLResponse)
@@ -504,6 +506,7 @@ async def transfer_detail(request: Request, transfer_id: int):
         if not row:
             return HTMLResponse("Transfer not found.", status_code=404)
         t = row_to_dict(row)
+        t["log_text"], t["note"] = scrub_log(t["log_text"] or ""), scrub_log(t["note"] or "")
         acct_label = {a.id: (a.label or a.email)
                       for a in conn.execute(accounts.select())}
         org = conn.execute(organizations.select()

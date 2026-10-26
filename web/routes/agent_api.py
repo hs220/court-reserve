@@ -17,9 +17,10 @@ confused or misled agent.
 
 **No secrets leave.** Responses never carry a CourtReserve password, an email
 address or a session file. Free text that originates in a run (logs, errors) is
-passed through `_redactor`, which replaces every stored account password and the
-app's own secrets from the environment, and swaps account emails for their labels:
-a Playwright error or a future log line must not be the way one leaks.
+passed through `_redactor`, which removes session cookies and auth headers
+(log_scrub), replaces every stored account password and the app's own secrets from the
+environment, and swaps account emails for their labels: a Playwright error or a future
+log line must not be the way one leaks.
 
 **Auth.** A bearer token whose SHA-256 is `AGENT_API_TOKEN_SHA256` in `.env`
 (scripts/mint_agent_token.py makes one). The plaintext lives only in home-agent's
@@ -42,6 +43,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select, text
 from starlette.concurrency import run_in_threadpool
 
+from log_scrub import scrub as scrub_log
 from web import apscheduler_setup
 from web.database import (account_orgs, accounts, engine, job_runs, jobs, organizations,
                           pending_transfers, row_to_dict)
@@ -121,9 +123,11 @@ def _encodings(value: str) -> set[str]:
 
 
 def _redactor(conn):
-    """A function that makes run text safe to return: secrets out, emails to labels.
-    Case-insensitive, and over each value's encoded forms too: what matters is that no
-    spelling of a password gets out, and over-redacting a look-alike costs nothing."""
+    """A function that makes run text safe to return: cookies and secrets out, emails
+    to labels. Case-insensitive, and over each value's encoded forms too: what matters
+    is that no spelling of a password gets out, and over-redacting a look-alike costs
+    nothing. The job runner already scrubs cookies before it stores anything; doing it
+    again here covers rows written before it did."""
     rows = conn.execute(select(accounts)).fetchall()
     secrets = {r.password for r in rows if r.password}
     secrets |= {os.environ[k] for k in ENV_SECRETS if os.environ.get(k)}
@@ -136,6 +140,7 @@ def _redactor(conn):
                _label(r)) for r in rows if r.email]
 
     def scrub(s: str) -> str:
+        s = scrub_log(s)
         if secret_re:
             s = secret_re.sub("[redacted]", s)
         for pattern, label in emails:

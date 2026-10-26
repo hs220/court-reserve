@@ -226,6 +226,17 @@ class NoSecretsTests(AgentApiTestCase):
         self.assertIn("Logging in as p***@example.com", older)
         self.assertIn("[redacted]", older)
 
+    def test_run_log_cookies_are_scrubbed(self):
+        # Rows stored before the job runner scrubbed cookies still hold them (runs 403
+        # and 411); the redactor must not pass a session on to the agent.
+        from test_log_scrub import CALL_LOG, RESPONSE_LOG
+        jid = self.add_job()
+        self.add_run(jid, "failed", CALL_LOG + RESPONSE_LOG)
+        _, body, raw = call("GET", f"/api/agent/v1/jobs/{jid}")
+        self.assertNotIn("SECRET", raw)
+        self.assertIn("cookie: [cookie removed]", body["runs"][0]["log_tail"])
+        self.assertIn("read ECONNRESET", body["runs"][0]["log_tail"])
+
     def test_an_availability_error_is_scrubbed(self):
         with mock.patch.object(agent_api, "_fetch_slots",
                                side_effect=Exception(f"Timeout typing {PASSWORD}")):

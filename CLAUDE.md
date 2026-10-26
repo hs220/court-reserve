@@ -130,6 +130,17 @@ and don't need it.
 `get_available_slots` also reports the response's title/text when the feed answers with
 HTML, so the log says *what* the site wanted instead of only "Expecting value: line 3".
 
+Run output is scrubbed of cookies before it is stored or sent (`log_scrub.py`). When a
+request fails, Playwright's call log lists its headers, and runs 403 and 411 stored a
+`cookie: ASP.NET_SessionId=…; __RequestVerificationToken=…` line: a live CourtReserve
+session for anyone on the LAN, since the UI on :7000 has no auth. `job_runner` scrubs
+the stdout proxy (both the run's copy and the container log), `_finish_run`,
+`_append_run_log`, the transfer log and note, and every email body; the run/transfer log
+pages and the agent API's `_redactor` scrub again on the way out, for rows written
+before. Cookie and `authorization:` header lines lose their whole value, as do
+CourtReserve's cookie names anywhere. `scripts/scrub_run_logs.py` (`--dry-run` for
+counts) cleans rows stored before this.
+
 **Gaps that remain:**
 - All failure alerting goes through the app itself, so an app-down event is exactly
   what it cannot report. An out-of-band check (NAS cron curling the endpoint) is the
