@@ -53,6 +53,18 @@ class SlotNotBookableError(BookingError):
     release rush). The caller should DEMOTE this slot (stop re-picking it) and try
     another candidate rather than re-clicking the same dead cell."""
 
+class PageChangedError(Exception):
+    """A CourtReserve page isn't the one this code drives: something it needs to find
+    there is gone. Retrying won't help -- the code has to be updated -- so the message
+    starts "page changed:" and says what was missing (and must never contain a word that
+    net_errors reads as transient, such as "timeout").
+
+    Seen live on 2026-10-24: the booking and reservation pages moved to CourtReserve's
+    new React portal (ClientApp/pages/bundle-portal.js). It has no jQuery, no Kendo
+    scheduler and no server-rendered cancel form, so run 412 died on "$ is not defined"
+    and transfer #39 waited for a cancellation-reason field that no longer exists."""
+
+
 CANCEL_REASONS = [
     "Schedule conflict came up",
     "Plans changed unexpectedly",
@@ -307,6 +319,62 @@ def _classify_booking_error(msg: str) -> BookingError:
     return BookingError(msg)
 
 
+# Which UI a CourtReserve page is: "kendo" (the old booking page, with a bound Kendo
+# scheduler), "legacy" (an old server-rendered page with jQuery, e.g. the old reservation
+# page), "portal" (the new React portal, marked by its shell and data-testids), or
+# "unknown" (still loading, a login or challenge page, or something new again).
+_PAGE_KIND_JS = """(function() {
+    if (window.jQuery && window.jQuery("#ConsolidatedScheduler").data("kendoScheduler")) return "kendo";
+    if (document.querySelector("#react-portal-shell, [data-testid=scheduler-page], "
+                               + "[data-testid=reservation-details-page]")) return "portal";
+    if (window.jQuery) return "legacy";
+    return "unknown";
+})()"""
+
+
+def _page_kind(page: Page, settle_ms: int = 10000,
+               until=("kendo", "legacy", "portal")) -> str:
+    """The page's kind (see _PAGE_KIND_JS), polling up to settle_ms until it is one of
+    `until` -- the portal mounts its markup a moment after domcontentloaded, and an old
+    booking page has jQuery a moment before its scheduler is bound. Returns the last
+    answer when the window runs out."""
+    kind = "unknown"
+    for _ in range(max(1, settle_ms // 500)):
+        kind = page.evaluate(_PAGE_KIND_JS)
+        if kind in until:
+            return kind
+        page.wait_for_timeout(500)
+    return kind
+
+
+def _ensure_kendo_scheduler(page: Page, org_url: str) -> None:
+    """Be on the booking page with its Kendo scheduler bound, before anything is clicked.
+
+    Reloads when the page is elsewhere or has lost the scheduler. It doesn't trust the
+    URL alone: run 412's page sat on the booking URL for three hours, and when it came
+    to book, the page there had no jQuery at all. Raises PageChangedError when the
+    reloaded page still has no scheduler -- above all when it is the new portal, which
+    this code can't book through yet."""
+    if org_url in page.url and page.evaluate(_PAGE_KIND_JS) == "kendo":
+        return  # the pre-warmed page is still good; don't spend a reload at release time
+    page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
+    # "legacy" isn't an answer here: it's what an old booking page says while jQuery is
+    # up but the scheduler isn't bound yet, so keep polling through it.
+    kind = _page_kind(page, until=("kendo", "portal"))
+    if kind == "kendo":
+        return
+    if kind == "portal":
+        raise PageChangedError(
+            "page changed: the booking page is CourtReserve's new portal (data-testid="
+            "scheduler-page), and the Kendo scheduler (#ConsolidatedScheduler) this code "
+            "books through is gone. Nothing was clicked.")
+    # The URL only, not the title: a "504 Gateway Time-out" title would make net_errors
+    # read this as transient and retry it.
+    raise PageChangedError(
+        f"page changed: no Kendo scheduler (#ConsolidatedScheduler) on the booking page "
+        f"(url={page.url}). Nothing was clicked.")
+
+
 def _navigate_to_date(page: Page, target_date: date) -> None:
     """Point the Kendo scheduler at target_date AND force a fresh server fetch.
 
@@ -319,7 +387,8 @@ def _navigate_to_date(page: Page, target_date: date) -> None:
     js_date = f"new Date({target_date.year}, {target_date.month - 1}, {target_date.day})"
     page.evaluate(f"""
         (function() {{
-            var scheduler = $("#ConsolidatedScheduler").data("kendoScheduler");
+            if (!window.jQuery) return;
+            var scheduler = window.jQuery("#ConsolidatedScheduler").data("kendoScheduler");
             if (!scheduler) return;
             window.__crDataBound = false;
             scheduler.one("dataBound", function() {{ window.__crDataBound = true; }});
@@ -405,10 +474,8 @@ def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, 
     ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
 
-    # Ensure we're on the booking page
-    if org_url not in page.url:
-        page.goto(org_url, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(2000)
+    # Be on the booking page with a live scheduler (raises PageChangedError if it's gone)
+    _ensure_kendo_scheduler(page, org_url)
 
     # Navigate the Kendo Scheduler to the target date
     _navigate_to_date(page, slot.start_dt.date())
@@ -857,33 +924,82 @@ def cancel_reservation(page: Page, reservation_id: str, org: OrgConfig = DEFAULT
     print(f"Cancelling reservation {reservation_id} (reason: '{reason}')...")
 
     page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
-    page.wait_for_timeout(2000)
+    kind = _page_kind(page)
+
+    # Everything that can refuse without touching CourtReserve does so here, before the
+    # hook: a raise from here on means nothing was clicked and the probe keeps the court.
+    if "login" in page.url.lower():
+        raise BookingError("the reservation page redirected to the login page (session "
+                           "expired?). Nothing was clicked.")
+    if kind == "portal":
+        # The portal's cancel flow hasn't been seen yet (no account held a reservation
+        # to look at), and the form below is gone from it: #39 clicked "Cancel
+        # Reservation" there and the reason field never came. Don't click into it blind.
+        raise PageChangedError(
+            "page changed: the reservation page is CourtReserve's new portal (data-testid="
+            "reservation-details-page); its cancel dialog isn't mapped yet and the old form "
+            "(#SelectedReservation_CancellationReason) is gone. Nothing was clicked.")
+    trigger = page.get_by_text("Cancel Reservation", exact=True)
+    if trigger.count() == 0:
+        raise PageChangedError("page changed: no 'Cancel Reservation' button on the "
+                               "reservation page. Nothing was clicked.")
 
     if before_first_click:
         before_first_click()
-    page.get_by_text("Cancel Reservation", exact=True).first.click()
+    trigger.first.click()
     page.wait_for_timeout(2000)
 
     # Fill cancellation reason (required)
-    reason_field = page.wait_for_selector("#SelectedReservation_CancellationReason", timeout=5000)
+    try:
+        reason_field = page.wait_for_selector("#SelectedReservation_CancellationReason", timeout=5000)
+    except Exception:
+        raise PageChangedError(
+            "page changed: the cancel dialog has no cancellation-reason field "
+            "(#SelectedReservation_CancellationReason) after 'Cancel Reservation' was clicked") from None
     reason_field.fill(reason)
     page.wait_for_timeout(300)
 
     submit = page.query_selector('button[type="submit"]:has-text("Cancel Reservation")')
     if submit is None:
-        raise BookingError("the Cancel Reservation button wasn't on the page")
+        raise PageChangedError("page changed: the cancel dialog has no 'Cancel Reservation' "
+                               "submit button")
     submit.click()
     page.wait_for_timeout(4000)
 
-    page_text = page.evaluate("document.body.innerText")
-    if "cancelled" in page_text.lower() or "canceled" in page_text.lower() or reservation_id not in page.url:
+    if _cancel_confirmed(page, detail_url):
         print("Cancellation confirmed.")
         return True
+    print("Cancellation not confirmed: the reservation page doesn't show it as cancelled.")
+    return False
 
-    # If still on detail page check for error
-    if reservation_id in page.url:
-        print(f"Cancellation may have failed. Page text: {page_text[:200]}")
+
+# The reservation's own status on its page: the portal's [data-testid=status] (seen live
+# on a cancelled reservation: "Canceled"), else the old page's body text.
+_RESERVATION_STATUS_JS = """(function() {
+    var s = document.querySelector("[data-testid=status]");
+    return s ? {portal: true, text: s.innerText || ""}
+             : {portal: false, text: document.body ? document.body.innerText || "" : ""};
+})()"""
+
+
+def _cancel_confirmed(page: Page, detail_url: str) -> bool:
+    """Whether the reservation page, loaded fresh, says the reservation is cancelled.
+
+    A positive answer from the reservation itself, not "we left the detail page": a
+    redirect to the login page (an expired session) used to read as a cancel while the
+    probe still held the court."""
+    page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+    kind = _page_kind(page)
+    if "login" in page.url.lower():
         return False
-
-    print("Cancellation submitted.")
-    return True
+    if kind == "portal":
+        # The portal's shell is there before React renders the reservation into it.
+        try:
+            page.wait_for_selector("[data-testid=status]", timeout=10000)
+        except Exception:
+            return False
+    status = page.evaluate(_RESERVATION_STATUS_JS) or {}
+    text = (status.get("text") or "").strip().lower()
+    if status.get("portal"):
+        return text in ("canceled", "cancelled")
+    return "cancelled" in text or "canceled" in text
