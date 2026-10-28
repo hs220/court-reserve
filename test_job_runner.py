@@ -27,7 +27,7 @@ from web.database import accounts, engine, init_db, job_runs, jobs, organization
 from booking import Slot, find_best_slot
 import web.job_runner as jr
 from net_errors import ErrorStreak
-from web.job_runner import (run_book_next, _append_run_log, _deadline_timeout_minutes, _finish_run,
+from web.job_runner import (_append_run_log, _deadline_timeout_minutes, _finish_run,
                             _is_network_error, _live_times, _notify_run_failed,
                             _parse_preferred_times, _send_warning_email, _start_run,
                             request_cancel, run_watch, SMTP_ATTEMPTS, SMTP_TIMEOUT_SECONDS)
@@ -562,7 +562,7 @@ class PrewarmBookingPageCheckTests(unittest.TestCase):
 
     def test_a_book_next_fails_before_waiting_for_the_release(self):
         with mock.patch("smtplib.SMTP") as smtp:
-            run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-11-20T12:00:00",
+            jr.run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-11-20T12:00:00",
                           target_date_iso="2026-11-27", target_time="19:30")
         self._assert_failed_early(smtp)
 
@@ -642,7 +642,7 @@ class ConfirmOnceTests(unittest.TestCase):
 
     def test_book_next_confirms_once_and_fails(self):
         with mock.patch("smtplib.SMTP") as smtp:
-            run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-10-23T12:00:00",
+            jr.run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-10-23T12:00:00",
                           target_date_iso="2026-10-30", target_time="14:30", duration_override=30)
         self._assert_one_confirm_and_failed(smtp)
 
@@ -658,7 +658,7 @@ class ConfirmOnceTests(unittest.TestCase):
         from test_booking import FakePortal
         self.fake = FakePortal(list_error_after_confirm=TimeoutError("Page.goto: Timeout 30000ms exceeded."))
         with mock.patch("smtplib.SMTP") as smtp:
-            run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-10-23T12:00:00",
+            jr.run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-10-23T12:00:00",
                           target_date_iso="2026-10-30", target_time="14:30", duration_override=30)
         self._assert_one_confirm_and_failed(smtp)
 
@@ -669,7 +669,7 @@ class ConfirmOnceTests(unittest.TestCase):
             conn.execute(jobs.update().where(jobs.c.id == self.job_id)
                          .values(params=json.dumps({"exact_duration": True})))
         with mock.patch("smtplib.SMTP"):
-            run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-10-23T12:00:00",
+            jr.run_book_next(self.job_id, _cancel_account_id(), at_iso="2026-10-23T12:00:00",
                           target_date_iso="2026-10-30", target_time="14:30", duration_override=120)
         self.assertNotIn("confirm", self.fake.clicks)
         self.assertEqual(self._last_run().status, "failed")
