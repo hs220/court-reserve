@@ -60,7 +60,7 @@ from sqlalchemy import insert, select, update
 
 from booking import (OrgConfig, Slot, get_available_slots, find_best_slot, book_slot, slot_has_window,
                      _org_uses_court_picker, get_my_reservations, cancel_reservation, match_reservation_id,
-                     ensure_booking_page,
+                     ensure_booking_page, known_reservation_ids, BookingUnconfirmedError,
                      BookingError, BookingWindowError, NoAvailableCourtsError, AlreadyBookedError,
                      CourtSelectionRequiredError, SlotNotBookableError)
 
@@ -181,6 +181,29 @@ def _parse_preferred_times(time_val) -> list[str]:
     if time_val and "," in str(time_val):
         return [t.strip() for t in str(time_val).split(",") if t.strip()]
     return [str(time_val).strip()] if time_val else []
+
+
+def _job_exact_duration(job_id: int) -> bool:
+    """Whether this job wants its duration exactly (agent-created jobs): a portal booking
+    then refuses a length CourtReserve doesn't offer instead of taking the nearest."""
+    with engine.connect() as conn:
+        row = conn.execute(select(jobs.c.params).where(jobs.c.id == job_id)).fetchone()
+    try:
+        return bool(json.loads((row.params if row else None) or "{}").get("exact_duration"))
+    except (ValueError, AttributeError):
+        return False
+
+
+def _ready_to_book(page, org_cfg) -> set | None:
+    """The pre-warm step for a page that will book: check its booking page can be driven
+    (PageChangedError otherwise, which fails the run and alerts now rather than at the
+    release), and on the portal note the reservation ids it already has, so a booking can
+    later be told apart as NEW. Leaves the page on the booking page."""
+    if ensure_booking_page(page, org_cfg.booking_url) != "portal":
+        return None
+    known = known_reservation_ids(page, org_cfg)
+    ensure_booking_page(page, org_cfg.booking_url)
+    return known
 
 
 def _get_account_and_org(job_id: int, account_id: int) -> tuple[dict, dict]:
@@ -349,6 +372,10 @@ def _create_pending_transfer(job_id, run_id, org, probe_account, main_account,
 CANCEL_UNCERTAIN_NOTE = ("The cancel on the probe account started but wasn't confirmed, so it "
                          "may have gone through and the court may be lost. Check CourtReserve, "
                          "then record what you found on this transfer's page before retrying.")
+REBOOK_UNCERTAIN_NOTE = ("The probe's reservation was cancelled, then {who}'s booking was "
+                         "submitted but couldn't be confirmed: it may or may not have gone "
+                         "through. Check CourtReserve, then record what you found on this "
+                         "transfer's page.")
 
 
 def _mark_cancel_started(transfer_id):
@@ -394,12 +421,14 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     # the probe to take it back if main fails. A booking page this code can't drive (a
     # partial rollout of a new UI) would otherwise turn a completed cancel into a lost
     # court. This is before the cancel's hook: a refusal here means nothing was clicked.
+    # On the portal, also note each account's reservation ids now, so a re-booking can be
+    # told apart as NEW.
     try:
-        ensure_booking_page(booking_page, org_cfg.booking_url)
-        ensure_booking_page(probe_page, org_cfg.booking_url)
+        main_known = _ready_to_book(booking_page, org_cfg)
+        probe_known = _ready_to_book(probe_page, org_cfg)
     except Exception as e:
         log(f"A booking page can't be used: {e}")
-        info["cancel_error"] = str(e)
+        info["booking_page_error"] = str(e)
         return ("held_by_probe",
                 "The booking page can't be used, so the cancel wasn't started — probe still "
                 "holds the court.")
@@ -427,10 +456,17 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     info["cancelled"] = True
 
     # Re-book on main as fast as possible (the court is exposed during this window).
+    # A re-booking whose Confirm went in unconfirmed is never retried: the court may be
+    # held already, and a second booking (or the probe's book-back) would double it.
     main_ok = False
     for attempt in range(3):
         try:
-            main_ok = book_slot(booking_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg)
+            main_ok = book_slot(booking_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg,
+                                known_reservation_ids=main_known, exact_duration=True)
+        except BookingUnconfirmedError as e:
+            log(f"Main re-book unconfirmed: {e}")
+            info["rebook_unconfirmed"] = "main"
+            return "needs_check", REBOOK_UNCERTAIN_NOTE.format(who="the main account")
         except NoAvailableCourtsError:
             main_ok = False
         except Exception as e:
@@ -445,9 +481,13 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     rebooked = {}
     try:
         if book_slot(probe_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg,
-                     result=rebooked):
+                     result=rebooked, known_reservation_ids=probe_known, exact_duration=True):
             info["reservation_id"] = rebooked.get("reservation_id", "")
             return "held_by_probe", "Main re-book failed; probe re-booked to retain the court."
+    except BookingUnconfirmedError as e:
+        log(f"Probe re-book unconfirmed: {e}")
+        info["rebook_unconfirmed"] = "probe"
+        return "needs_check", REBOOK_UNCERTAIN_NOTE.format(who="the probe")
     except Exception as e:
         log(f"Probe re-book error: {e}")
     return "failed", "Court lost: main re-book failed and probe could not re-book."
@@ -686,6 +726,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
 
     account, org = _get_account_and_org(job_id, account_id)
     org_cfg = _org_config(org)
+    exact_duration = _job_exact_duration(job_id)
     session_file = _session_file(account, org)
     preferred_times = _parse_preferred_times(target_time)
     default_duration = duration_override if duration_override > 0 else 0
@@ -726,7 +767,7 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
                                      org_cfg.booking_url, session_file)
                     # Know now, not at the release, if the booking page can't be driven
                     # (a new CourtReserve UI): PageChangedError fails the run and alerts.
-                    ensure_booking_page(page, org_cfg.booking_url)
+                    known_ids = _ready_to_book(page, org_cfg)
 
                     if at_iso:
                         wait_until(datetime.fromisoformat(at_iso))
@@ -795,7 +836,13 @@ def run_book_next(job_id: int, account_id: int, at_iso: str | None = None,
 
                         try:
                             success = book_slot(page, org_cfg.booking_url, slot,
-                                                duration_minutes=default_duration, org=org_cfg)
+                                                duration_minutes=default_duration, org=org_cfg,
+                                                known_reservation_ids=known_ids,
+                                                exact_duration=exact_duration)
+                        except BookingUnconfirmedError as e:
+                            # Never again: the court may already be booked.
+                            print(f"Booking unconfirmed — not retrying: {e}")
+                            break
                         except BookingWindowError as e:
                             if not last:
                                 print(f"Booking window not open yet — retry {book_attempt + 1}/{BOOK_ATTEMPTS} in 5s: {e}")
@@ -944,6 +991,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
     try:
         account, org = _get_account_and_org(job_id, account_id)
         org_cfg = _org_config(org)
+        exact_duration = _job_exact_duration(job_id)
         session_file = _session_file(account, org)
         if target_date_iso:
             target_date = date.fromisoformat(target_date_iso)
@@ -1027,7 +1075,7 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                         # Know now, not when a slot opens, if the booking page can't be
                         # driven (a new CourtReserve UI): PageChangedError fails the run
                         # and alerts, where it would otherwise poll for days and fail late.
-                        ensure_booking_page(booking_page, org_cfg.booking_url)
+                        main_known = _ready_to_book(booking_page, org_cfg)
 
                         # Pre-warm if we're within 10 minutes of the booking window opening.
                         time_to_release = (release_dt - datetime.now(tz_obj)).total_seconds()
@@ -1041,9 +1089,10 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                             probe_page = probe_context.new_page()
                             ensure_logged_in(probe_context, probe_page, probe_account["email"], probe_account["password"],
                                              org_cfg.booking_url, probe_session_file)
-                            ensure_booking_page(probe_page, org_cfg.booking_url)
+                            probe_known = _ready_to_book(probe_page, org_cfg)
                         else:
                             probe_page = booking_page
+                            probe_known = main_known
 
                         probe_label = (probe_account.get("label") or probe_account["email"]) if probe_account else (account.get("label") or account["email"])
                         # NOTE: the streak is deliberately NOT cleared here. Establishing
@@ -1121,7 +1170,15 @@ def run_watch(job_id: int, account_id: int, target_date_iso: str | None, target_
                                 try:
                                     success = book_slot(booker_page, org_cfg.booking_url, match,
                                                         duration_minutes=duration, org=org_cfg,
-                                                        result=book_result)
+                                                        result=book_result,
+                                                        known_reservation_ids=probe_known if using_probe else main_known,
+                                                        exact_duration=exact_duration)
+                                except BookingUnconfirmedError as e:
+                                    # Never book again on this run: the court may be held.
+                                    print(f"Booking unconfirmed — stopping, not retrying: {e}")
+                                    browser.close()
+                                    status = "failed"
+                                    done = True
                                 except NoAvailableCourtsError as e:
                                     ts = datetime.now(tz_obj).strftime("%Y-%m-%d %H:%M:%S %Z")
                                     print(f"[{ts}] No court available for the full window (server reported "

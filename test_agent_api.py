@@ -742,7 +742,7 @@ class TransferTestCase(AgentApiTestCase):
         self.addCleanup(self._drop_transfers)
         self.fake = {}
         for name in ("sync_playwright", "ensure_logged_in", "cancel_reservation", "book_slot",
-                     "ensure_booking_page", "_send_warning_email"):
+                     "ensure_booking_page", "known_reservation_ids", "_send_warning_email"):
             p = mock.patch(f"web.job_runner.{name}")
             self.fake[name] = p.start()
             self.addCleanup(p.stop)
@@ -998,7 +998,7 @@ class TransferCompleteTests(TransferTestCase):
 
         def check(page, url):
             seen.append(page)
-            if len(seen) == 2:
+            if page is not seen[0]:  # the second account's page: the probe's
                 raise PageChangedError("page changed: no scheduler on the booking page. Nothing was clicked.")
             return "portal"
 
@@ -1008,12 +1008,37 @@ class TransferCompleteTests(TransferTestCase):
         browser.new_context.side_effect = lambda **kw: mock.MagicMock()
         body = self.complete(tid)[1]
         self.assertEqual((body["outcome"], body["court"]), ("failed_before_cancel", "probe"))
-        self.assertEqual(len(seen), 2)
-        self.assertIsNot(seen[0], seen[1])  # main's page, then the probe's
+        # main's page (checked, its ids noted, checked again), then the probe's
+        self.assertEqual(len(seen), 3)
+        self.assertIs(seen[0], seen[1])
+        self.assertIsNot(seen[0], seen[2])
+        self.assertIn("booking page isn't one the app can drive", body["message"])
         self.fake["cancel_reservation"].assert_not_called()
         t = self.transfer(tid)
         self.assertEqual(t.status, "held_by_probe")
         self.assertIsNone(t.cancel_started_at)
+
+    def test_a_rebooking_that_goes_unconfirmed_needs_a_check_and_is_never_retried(self):
+        # Review of #9: main's re-book was tried 3 times and then the probe booked it back,
+        # so a Confirm that went in unseen could hold the court twice.
+        from test_booking import FakePortal
+        import booking
+        fake = FakePortal(books=False, shown="10/25/2026")
+        tid = self.add_transfer(date="2026-10-30", start_time="14:30")
+
+        def real_book(page, url, slot, **kw):
+            with fake.patched():
+                return booking.book_slot(fake, url, slot, **kw)
+
+        self.fake["book_slot"].side_effect = real_book
+        self.fake["known_reservation_ids"].return_value = set()
+        body = self.complete(tid, date="2026-10-30", start_time="14:30")[1]
+        t = self.transfer(tid)
+        self.assertEqual(t.status, "needs_check", body)
+        self.assertEqual(fake.clicks.count("confirm"), 1)
+        self.assertEqual(self.fake["book_slot"].call_count, 1)  # no retry, no book-back
+        self.assertEqual((body["outcome"], body["court"]), ("cancel_uncertain", "unknown"))
+        self.assertIn("main account's booking was submitted", body["message"])
 
     def test_a_cancel_that_errors_before_its_first_click_changed_nothing(self):
         # The reservation page never loaded: nothing was clicked on CourtReserve.
@@ -1040,7 +1065,7 @@ class TransferCompleteTests(TransferTestCase):
     def test_a_court_the_probe_books_back_gets_its_new_id(self):
         tid = self.add_transfer()
 
-        def book(page, url, slot, duration_minutes=60, org=None, result=None):
+        def book(page, url, slot, duration_minutes=60, org=None, result=None, **kw):
             if result is None:  # main's tries
                 return False
             result["reservation_id"] = "87654321"  # the probe's new reservation

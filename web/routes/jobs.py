@@ -141,7 +141,7 @@ async def list_recurring(request: Request):
 
 
 def create_book_next_job(account_id: int, org_db_id: int, date: str, time: str,
-                         duration: int, run_at: str = "") -> int:
+                         duration: int, run_at: str = "", exact_duration: bool = False) -> int:
     """Insert and schedule a one-shot booking job. Shared by the form and the agent API,
     so both fire at the same moment: 2 min before the booking window opens, or at once
     when it already has."""
@@ -152,6 +152,8 @@ def create_book_next_job(account_id: int, org_db_id: int, date: str, time: str,
         run_at = _watch_window_run_at(account_id, org, date)
 
     params = {"date": date, "time": time, "duration": duration, "run_at": run_at}
+    if exact_duration:
+        params["exact_duration"] = True  # see job_runner._job_exact_duration
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
             account_id=account_id,
@@ -182,7 +184,7 @@ async def create_book_next(
 
 def create_watch_job(account_id: int, org_db_id: int, date: str, time: str, duration: int,
                      interval: int, deadline_mode: str, probe_id: int | None = None,
-                     auto_xfer: bool = False) -> int:
+                     auto_xfer: bool = False, exact_duration: bool = False) -> int:
     """Insert and schedule a watch job. Shared by the form and the agent API."""
     with engine.connect() as conn:
         org = row_to_dict(conn.execute(organizations.select().where(organizations.c.id == org_db_id)).fetchone())
@@ -192,6 +194,8 @@ def create_watch_job(account_id: int, org_db_id: int, date: str, time: str, dura
     params = {"date": date, "time": time, "duration": duration,
               "interval": interval, "deadline_mode": deadline_mode,
               "probe_account_id": probe_id, "auto_transfer": auto_xfer, "run_at": run_at}
+    if exact_duration:
+        params["exact_duration"] = True  # see job_runner._job_exact_duration
     with engine.begin() as conn:
         result = conn.execute(jobs.insert().values(
             account_id=account_id,

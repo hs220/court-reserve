@@ -489,8 +489,9 @@ def create_booking(body: NewBooking):
     from web.routes.jobs import create_book_next_job
     with engine.connect() as conn:
         org, iso, times = _validate(conn, body)
+    # The agent asked for duration_min: book that length or nothing, never the nearest.
     job_id = create_book_next_job(body.account_id, body.org_id, iso, ",".join(times),
-                                  body.duration_min)
+                                  body.duration_min, exact_duration=True)
     return _created(job_id, org)
 
 
@@ -503,7 +504,8 @@ def create_watch(body: NewWatch):
     with engine.connect() as conn:
         org, iso, times = _validate(conn, body)
     job_id = create_watch_job(body.account_id, body.org_id, iso, ",".join(times),
-                              body.duration_min, WATCH_INTERVAL_S, body.stop_before)
+                              body.duration_min, WATCH_INTERVAL_S, body.stop_before,
+                              exact_duration=True)
     return _created(job_id, org)
 
 
@@ -705,6 +707,15 @@ def _transfer_result(outcome: dict) -> tuple[str, str, str]:
         return ("transferred", "main",
                 "Transferred: the probe's reservation was cancelled and the main account booked "
                 "the court.")
+    if status == "needs_check" and outcome.get("rebook_unconfirmed"):
+        # Same outcome value as an uncertain cancel (court unknown, a person must check),
+        # so the connector's contract is unchanged; the message says what happened.
+        who = "the main account" if outcome["rebook_unconfirmed"] == "main" else "the probe"
+        return ("cancel_uncertain", "unknown",
+                f"Not confirmed. The probe's reservation was cancelled, then {who}'s booking "
+                "was submitted but couldn't be confirmed, so it may or may not hold the court. "
+                "The court MAY BE LOST. A person must check CourtReserve and record what they "
+                "found in the app before this transfer can be tried again.")
     if status == "needs_check":
         return ("cancel_uncertain", "unknown",
                 "Not transferred. The cancel on the probe account started but wasn't confirmed, "
@@ -714,6 +725,9 @@ def _transfer_result(outcome: dict) -> tuple[str, str, str]:
     if status == "held_by_probe" and not outcome.get("cancelled"):
         if outcome.get("errored_before_cancel"):
             why = "the app couldn't open a browser or log in"
+        elif outcome.get("booking_page_error"):
+            why = ("CourtReserve's booking page isn't one the app can drive, so the cancel "
+                   "wasn't started and nothing was clicked")
         elif outcome.get("cancel_error"):
             why = "CourtReserve's reservation page didn't load, and nothing was clicked"
         else:
