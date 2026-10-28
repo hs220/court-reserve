@@ -518,6 +518,13 @@ def _cancel_account_id():
         return conn.execute(accounts.select().order_by(accounts.c.id.desc())).fetchone().id
 
 
+# Fixture passwords are long and unique. The modules share one test DB, and the agent
+# API's redactor scrubs every stored password from everything it returns: a password
+# like "p" would be scrubbed out of unrelated text in test_agent_api's assertions.
+def _fixture_password(name: str) -> str:
+    return f"jr-fixture-{name}-Q7vX2kLm9"
+
+
 def _cancel_job_id():
     """A throwaway job row for run-lifecycle assertions."""
     init_db()
@@ -526,7 +533,7 @@ def _cancel_job_id():
             name="Cancel Org", org_id="1", scheduler_id="1", cost_type_id="1",
             timezone="America/Los_Angeles")).inserted_primary_key[0]
         acct_id = conn.execute(insert(accounts).values(
-            label="c", email="c@example.com", password="p")).inserted_primary_key[0]
+            label="c", email="c@example.com", password=_fixture_password("cancel"))).inserted_primary_key[0]
         return conn.execute(insert(jobs).values(
             account_id=acct_id, org_id=org_id, type="watch", params="{}")).inserted_primary_key[0]
 
@@ -604,7 +611,7 @@ class _RunDbTestCase(unittest.TestCase):
                 cost_type_id="1", timezone="America/Los_Angeles",
             )).inserted_primary_key[0]
             cls.account_id = conn.execute(insert(accounts).values(
-                label="Tester", email="tester@example.com", password="pw",
+                label="Tester", email="tester@example.com", password=_fixture_password("tester"),
             )).inserted_primary_key[0]
 
     def setUp(self):
@@ -816,7 +823,8 @@ class RunLogCookieScrubTests(_RunDbTestCase):
 
         with engine.begin() as conn:
             acc_id = conn.execute(insert(accounts).values(
-                label="Syncer", email="syncer@example.com", password="pw", org_id=self.org_id,
+                label="Syncer", email="syncer@example.com", password=_fixture_password("syncer"),
+                org_id=self.org_id,
             )).inserted_primary_key[0]
 
         def drop():
