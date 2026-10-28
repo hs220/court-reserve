@@ -1040,6 +1040,24 @@ class TransferCompleteTests(TransferTestCase):
         self.assertEqual((body["outcome"], body["court"]), ("cancel_uncertain", "unknown"))
         self.assertIn("main account's booking was submitted", body["message"])
 
+    def test_a_court_above_the_price_cap_is_still_rebooked(self):
+        # The cap is checked after the cancel; refusing there would lose a court the probe
+        # already held at that price.
+        from test_booking import FakePortal
+        import booking
+        fake = FakePortal(price="$41.00")
+        tid = self.add_transfer(date="2026-10-30", start_time="14:30")
+
+        def real_book(page, url, slot, **kw):
+            with fake.patched():
+                return booking.book_slot(fake, url, slot, **kw)
+
+        self.fake["book_slot"].side_effect = real_book
+        self.fake["known_reservation_ids"].return_value = set()
+        body = self.complete(tid, date="2026-10-30", start_time="14:30")[1]
+        self.assertEqual(body["outcome"], "transferred", body)
+        self.assertEqual(fake.clicks.count("confirm"), 1)
+
     def test_a_cancel_that_errors_before_its_first_click_changed_nothing(self):
         # The reservation page never loaded: nothing was clicked on CourtReserve.
         tid = self.add_transfer()

@@ -457,12 +457,15 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
 
     # Re-book on main as fast as possible (the court is exposed during this window).
     # A re-booking whose Confirm went in unconfirmed is never retried: the court may be
-    # held already, and a second booking (or the probe's book-back) would double it.
+    # held already, and a second booking (or the probe's book-back) would double it. No
+    # price cap here: the probe held this court at this price, and a refusal after the
+    # cancel would only lose it.
     main_ok = False
     for attempt in range(3):
         try:
             main_ok = book_slot(booking_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg,
-                                known_reservation_ids=main_known, exact_duration=True)
+                                known_reservation_ids=main_known, exact_duration=True,
+                                enforce_price_cap=False)
         except BookingUnconfirmedError as e:
             log(f"Main re-book unconfirmed: {e}")
             info["rebook_unconfirmed"] = "main"
@@ -481,7 +484,8 @@ def _perform_transfer_with_pages(probe_page, booking_page, org_cfg, reservation_
     rebooked = {}
     try:
         if book_slot(probe_page, org_cfg.booking_url, slot, duration_minutes=duration, org=org_cfg,
-                     result=rebooked, known_reservation_ids=probe_known, exact_duration=True):
+                     result=rebooked, known_reservation_ids=probe_known, exact_duration=True,
+                     enforce_price_cap=False):
             info["reservation_id"] = rebooked.get("reservation_id", "")
             return "held_by_probe", "Main re-book failed; probe re-booked to retain the court."
     except BookingUnconfirmedError as e:

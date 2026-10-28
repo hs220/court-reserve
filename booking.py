@@ -77,6 +77,17 @@ class BookingUnconfirmedError(Exception):
     exists to stop. The original exception is chained and printed to the run log."""
 
 
+def _unconfirmed(slot: "Slot", minutes, reason: str, exc: Optional[BaseException] = None) -> "BookingUnconfirmedError":
+    """The BookingUnconfirmedError for a Confirm/Save that went in unproven. The original
+    exception, if any, goes to the run log, never into the message (see the class)."""
+    if exc is not None:
+        print(f"After Confirm/Save: {type(exc).__name__}: {exc}")
+    return BookingUnconfirmedError(
+        f"Confirm was clicked for {slot.start_date} {slot.start_time} ({slot.court_type}, "
+        f"{minutes or 'default'} min) and {reason}, so the booking couldn't be confirmed. "
+        f"Check CourtReserve before booking it again.")
+
+
 class PriceAboveCapError(BookingError):
     """The portal's form asks more than the org's cap allows (see _PORTAL_MAX_PRICE).
     Raised before Confirm."""
@@ -643,7 +654,7 @@ def _portal_go_to_date(page: Page, target: date) -> None:
 
 def _book_slot_portal(page: Page, slot: Slot, duration_minutes: int, org: OrgConfig,
                       dry_run: bool, result: Optional[dict], known_ids: Optional[set],
-                      exact_duration: bool) -> bool:
+                      exact_duration: bool, enforce_price_cap: bool = True) -> bool:
     """book_slot on CourtReserve's new portal.
 
     Before Confirm it is the Kendo path's contract: False when it didn't get as far as
@@ -746,8 +757,11 @@ def _book_slot_portal(page: Page, slot: Slot, duration_minutes: int, org: OrgCon
         raise PageChangedError(f"page changed: the portal's form shows no single total due "
                                f"({len(due)} amounts). Nothing was confirmed.")
     cap = _portal_max_price(org)
-    print(f"Price: {due[0]} (cap ${cap:.2f})")
-    if price > cap:
+    if not enforce_price_cap:
+        print(f"Price: {due[0]} (cap ${cap:.2f} not applied: re-booking a court the probe held)")
+    else:
+        print(f"Price: {due[0]} (cap ${cap:.2f})")
+    if enforce_price_cap and price > cap:
         raise PriceAboveCapError(f"{slot.start_date} {slot.start_time} costs {due[0]}, above this "
                                  f"club's cap of ${cap:.2f}. Not confirmed.")
 
@@ -777,12 +791,7 @@ def _book_slot_portal(page: Page, slot: Slot, duration_minutes: int, org: OrgCon
             capture["id"] = m.group(1)
 
     def unconfirmed(reason: str, exc: Optional[BaseException] = None):
-        if exc is not None:
-            print(f"After Confirm: {type(exc).__name__}: {exc}")
-        return BookingUnconfirmedError(
-            f"Confirm was clicked for {slot.start_date} {slot.start_time} ({slot.court_type}, "
-            f"{minutes or 'default'} min) and {reason}, so the booking couldn't be confirmed. "
-            f"Check CourtReserve before booking it again.")
+        return _unconfirmed(slot, minutes, reason, exc)
 
     page.on("response", _on_response)
     try:
@@ -814,7 +823,7 @@ def _book_slot_portal(page: Page, slot: Slot, duration_minutes: int, org: OrgCon
                    and (not minutes or r.get("duration_min") == minutes)]
             if capture.get("id") and any(r["reservation_id"] == capture["id"] for r in new):
                 new = [r for r in new if r["reservation_id"] == capture["id"]]
-            if new or refusal:
+            if new or (refusal and attempt >= 1):  # a refusal gets a second read
                 break
             page.wait_for_timeout(3000)
     except BookingUnconfirmedError:
@@ -936,19 +945,21 @@ def _find_slot_bbox(page: Page, slot_label: str):
 
 def book_slot(page: Page, org_url: str, slot: Slot, duration_minutes: int = 60, org: OrgConfig = DEFAULT_ORG_CONFIG,
               dry_run: bool = False, result: Optional[dict] = None, known_reservation_ids: Optional[set] = None,
-              exact_duration: bool = False) -> bool:
+              exact_duration: bool = False, enforce_price_cap: bool = True) -> bool:
     """Book `slot`. On the portal, `known_reservation_ids` (from known_reservation_ids(),
     taken at pre-warm) is what a NEW reservation is told apart from -- without it the list
     is read here, which costs seconds -- and `exact_duration` refuses a duration the
     portal doesn't offer instead of taking the nearest (agent-created jobs). The Kendo
-    path takes the nearest duration, as it always has."""
+    path takes the nearest duration, as it always has. `enforce_price_cap=False` is for a
+    transfer's re-book: the probe already held that court at that price, and refusing it
+    after the cancel would only lose it."""
     ts = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
     print(f"[{ts}] Booking {slot.court_type} court at {slot.start_time} on {slot.start_date} for {duration_minutes} min...")
 
     # Be on a booking page with a live scheduler (raises PageChangedError if it's gone)
     if ensure_booking_page(page, org_url) == "portal":
         return _book_slot_portal(page, slot, duration_minutes, org, dry_run, result,
-                                 known_reservation_ids, exact_duration)
+                                 known_reservation_ids, exact_duration, enforce_price_cap)
 
     # Navigate the Kendo Scheduler to the target date
     _navigate_to_date(page, slot.start_dt.date())
@@ -1261,56 +1272,67 @@ def _handle_booking_modal(page: Page, slot: Slot, duration_minutes: int, org: Or
         if m:
             _save_capture["id"] = m.group(1)
 
+    # From the Save click on, as on the portal: True when CourtReserve confirms it, a
+    # classified BookingError when it refuses it, else BookingUnconfirmedError -- never
+    # False, which every caller retries (a second booking of a court that may be held).
     page.on("response", _on_save_response)
     try:
         save_btn.click()
-        page.wait_for_timeout(4000)
-    finally:
+    except Exception as exc:
         page.remove_listener("response", _on_save_response)
+        raise _unconfirmed(slot, duration_minutes, "the click itself failed", exc) from exc
+    try:
+        try:
+            page.wait_for_timeout(4000)
+        finally:
+            page.remove_listener("response", _on_save_response)
 
-    if result is not None and _save_capture.get("id"):
-        result["reservation_id"] = _save_capture["id"]
-        print(f"Captured reservation id from save response: {_save_capture['id']}")
+        if result is not None and _save_capture.get("id"):
+            result["reservation_id"] = _save_capture["id"]
+            print(f"Captured reservation id from save response: {_save_capture['id']}")
 
-    # Check for error notice/popup (CourtReserve shows a pnotify/swal dialog on failure).
-    # Do NOT include generic modal selectors here — they match the booking form itself.
-    notice = page.query_selector(
-        '.pnotify, .ui-pnotify, [class*="pnotify"], '
-        '.sweetalert, .swal2-container'
-    )
-    if notice:
-        msg = notice.inner_text().strip()
-        if msg:
-            if "reservation confirmed" in msg.lower():
-                print("Booking confirmed! (popup)")
-                return True
-            err = _classify_booking_error(msg)
-            print(f"Booking blocked [{type(err).__name__}]: {msg}")
-            raise err
+        # Check for error notice/popup (CourtReserve shows a pnotify/swal dialog on failure).
+        # Do NOT include generic modal selectors here — they match the booking form itself.
+        notice = page.query_selector(
+            '.pnotify, .ui-pnotify, [class*="pnotify"], '
+            '.sweetalert, .swal2-container'
+        )
+        if notice:
+            msg = notice.inner_text().strip()
+            if msg:
+                if "reservation confirmed" in msg.lower():
+                    print("Booking confirmed! (popup)")
+                    return True
+                err = _classify_booking_error(msg)
+                print(f"Booking blocked [{type(err).__name__}]: {msg}")
+                raise err
 
-    # Broader page text check for inline error messages
-    page_text = page.evaluate("(function(){ return document.body.innerText; })()")
-    if "reservation confirmed" in page_text.lower():
-        print("Booking confirmed!")
-        return True
-    for marker in ["is only allowed", "not allowed", "cannot reserve", "restricted to", "no available courts", "select a court"]:
-        if marker in page_text:
-            idx = page_text.find(marker)
-            snippet = page_text[max(0, idx-30):idx+120].strip()
-            err = _classify_booking_error(snippet)
-            print(f"Booking blocked [{type(err).__name__}]: {snippet}")
-            raise err
+        # Broader page text check for inline error messages
+        page_text = page.evaluate("(function(){ return document.body.innerText; })()")
+        if "reservation confirmed" in page_text.lower():
+            print("Booking confirmed!")
+            return True
+        for marker in ["is only allowed", "not allowed", "cannot reserve", "restricted to", "no available courts", "select a court"]:
+            if marker in page_text:
+                idx = page_text.find(marker)
+                snippet = page_text[max(0, idx-30):idx+120].strip()
+                err = _classify_booking_error(snippet)
+                print(f"Booking blocked [{type(err).__name__}]: {snippet}")
+                raise err
 
-    # Check if booking page still shows an open modal (failure) vs. closed (success)
-    open_modal = page.query_selector("#create-res-modal:visible, .modal.show #create-res-modal")
-    if open_modal:
-        visible_text = open_modal.inner_text().strip()
-        if visible_text:
-            print(f"Modal still open after Save — possible error: {visible_text[:200]}")
-            return False
+        # A modal still open after Save may be a validation error -- or a booking whose
+        # confirmation didn't render. It can't be told apart from here.
+        open_modal = page.query_selector("#create-res-modal:visible, .modal.show #create-res-modal")
+        if open_modal and open_modal.inner_text().strip():
+            print(f"Modal still open after Save — possible error: {open_modal.inner_text().strip()[:200]}")
+            raise _unconfirmed(slot, duration_minutes, "the form was still open afterwards")
+    except (BookingError, BookingUnconfirmedError):
+        raise
+    except Exception as exc:
+        raise _unconfirmed(slot, duration_minutes, "an error followed the click", exc) from exc
 
-    print("Could not confirm booking (no confirmation message found) — treating as failed.")
-    return False
+    print("Could not confirm booking (no confirmation message found).")
+    raise _unconfirmed(slot, duration_minutes, "no confirmation came back")
 
 
 def get_my_reservations(page: Page, org: OrgConfig) -> list[dict]:

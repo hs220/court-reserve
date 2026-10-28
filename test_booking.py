@@ -680,6 +680,80 @@ def portal_slot(date_str="2026-10-30", time_str="14:30", court_type="Hard"):
                 available_courts=12, available_court_ids=[1], is_wait_list=False)
 
 
+class KendoAfterSaveTests(unittest.TestCase):
+    """The old Kendo path from the Save click on (review before #9's merge): Santa Clara
+    hasn't been seen on the portal, so ensure_booking_page can still answer "kendo".
+    Like the portal: confirmed, refused, or BookingUnconfirmedError -- never False."""
+
+    def _page(self, body="", notice=None, modal_text="", save_raises=None, body_raises=None):
+        from unittest import mock
+        page = mock.MagicMock()
+        save = mock.MagicMock()
+        if save_raises:
+            save.click.side_effect = save_raises
+        self.save = save
+        page.wait_for_selector.side_effect = lambda sel, **kw: save if "Save" in sel else mock.MagicMock()
+
+        def query_selector(sel):
+            if "pnotify" in sel:
+                if notice is None:
+                    return None
+                n = mock.MagicMock()
+                n.inner_text.return_value = notice
+                return n
+            if "create-res-modal" in sel and modal_text:
+                m = mock.MagicMock()
+                m.inner_text.return_value = modal_text
+                return m
+            return None
+
+        page.query_selector.side_effect = query_selector
+
+        def evaluate(js, *a):
+            if "document.body.innerText" in js:
+                if body_raises:
+                    raise body_raises
+                return body
+            return None
+
+        page.evaluate.side_effect = evaluate
+        return page
+
+    def run_modal(self, page):
+        from booking import _handle_booking_modal
+        return _handle_booking_modal(page, portal_slot(), 0, org=SUNNYVALE)
+
+    def assert_unconfirmed(self, page):
+        from booking import BookingUnconfirmedError
+        from net_errors import is_network_error
+        with self.assertRaises(BookingUnconfirmedError) as cm:
+            self.run_modal(page)
+        self.assertEqual(self.save.click.call_count, 1)
+        self.assertFalse(is_network_error(cm.exception), str(cm.exception))
+
+    def test_a_confirmation_is_a_booking(self):
+        self.assertTrue(self.run_modal(self._page(body="Reservation Confirmed")))
+        self.assertTrue(self.run_modal(self._page(notice="Reservation confirmed")))
+
+    def test_a_refusal_is_classified(self):
+        with self.assertRaises(BookingWindowError):
+            self.run_modal(self._page(notice="You are only allowed to reserve up to 7 days in advance."))
+        with self.assertRaises(NoAvailableCourtsError):
+            self.run_modal(self._page(body="There are no available courts for this time."))
+
+    def test_no_confirmation_is_unconfirmed_not_false(self):
+        self.assert_unconfirmed(self._page())
+
+    def test_a_form_still_open_is_unconfirmed(self):
+        self.assert_unconfirmed(self._page(modal_text="Create Reservation ..."))
+
+    def test_an_error_after_save_is_unconfirmed(self):
+        self.assert_unconfirmed(self._page(body_raises=TimeoutError("Timeout 30000ms exceeded.")))
+
+    def test_a_save_click_that_raises_is_unconfirmed(self):
+        self.assert_unconfirmed(self._page(save_raises=TimeoutError("Timeout 30000ms exceeded.")))
+
+
 class FakePortal:
     """CourtReserve's portal booking page and its Create Reservation form, as recorded
     live (Sunnyvale, account 3, Fri Oct 30 2:30 PM). It answers booking.py's JS by
@@ -693,7 +767,7 @@ class FakePortal:
                  combos=1, durations=DURATIONS, applies_duration=True, terms=True, terms_boxes=1,
                  price="$7.00", notices=(), books=True, save_id=None, new_id="64000001",
                  existing=(), list_error_after_confirm=None, confirm_raises=None, books_twice=False,
-                 find_state=None):
+                 find_state=None, list_lag=0):
         self.url = self.URL
         self.shown = shown
         self.cells = {"2:30 PM": "reserve"} if cells is None else cells
@@ -703,6 +777,9 @@ class FakePortal:
         self.notices, self.books, self.save_id, self.new_id = notices, books, save_id, new_id
         self.list_error_after_confirm, self.confirm_raises = list_error_after_confirm, confirm_raises
         self.books_twice, self.find_state = books_twice, find_state
+        self.list_lag = list_lag  # list reads after Confirm before the booking shows
+        self.reads_after_confirm = 0
+        self.booked = []
         self.reservations = [dict(r) for r in existing]
         self.minutes = 30
         self.open_tile = None
@@ -828,15 +905,20 @@ class FakePortal:
         """A reservation for what the open form shows, as the real list would have it."""
         lines = self._tile_lines()
         start = datetime.strptime(lines[3].split(" – ")[0], "%I:%M %p").strftime("%H:%M")
-        self.reservations.append({"reservation_id": rid,
+        self.booked.append({"reservation_id": rid,
                                   "date": f"2026-{MONTHS[lines[0]]:02d}-{int(lines[1]):02d}",
                                   "start_time": start, "duration_min": self.minutes,
                                   "court_type": lines[5]})
 
     def get_my_reservations(self, page, org):
         self.list_reads += 1
-        if self.confirmed and self.list_error_after_confirm:
-            raise self.list_error_after_confirm
+        if self.confirmed:
+            if self.list_error_after_confirm:
+                raise self.list_error_after_confirm
+            self.reads_after_confirm += 1
+            if self.reads_after_confirm > self.list_lag:
+                self.reservations += self.booked
+                self.booked = []
         return [dict(r) for r in self.reservations]
 
     def patched(self):
@@ -1102,6 +1184,18 @@ class PortalBookingTests(unittest.TestCase):
         with self.assertRaises(AlreadyBookedError):
             self.book(fake)
         self.assertEqual(fake.clicks.count("confirm"), 1)
+
+    def test_a_refusal_notice_gets_a_second_list_read(self):
+        # The list can lag a moment behind a notice that turns out to be wrong.
+        fake = FakePortal(list_lag=1, notices=("You are restricted to 1 court reservation per day.",))
+        self.assertTrue(self.book(fake)[0])
+        self.assertEqual(fake.reads_after_confirm, 2)
+
+    def test_a_price_above_the_cap_is_booked_for_a_transfers_rebook(self):
+        # The probe already held this court at this price; refusing it after the cancel
+        # would only lose it.
+        fake = FakePortal(price="$41.00")
+        self.assertTrue(self.book(fake, enforce_price_cap=False)[0])
 
     def test_a_refusal_with_a_new_reservation_anyway_counts_as_booked(self):
         fake = FakePortal(notices=("Something about restricted to 1 court per day",))
