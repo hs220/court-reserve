@@ -12,12 +12,13 @@ import os
 import sqlite3
 import stat
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from log_scrub import AUTH_MARK, COOKIE_MARK, scrub, scrub_counted
+from log_scrub import AUTH_MARK, COOKIE_MARK, MAX_LINE, TOKEN_MARK, scrub, scrub_counted
 from scripts import scrub_run_logs
 
 SESSION = "SECRETsess" + "q1w2e3r4t5y6u7i8"
@@ -126,6 +127,71 @@ class ScrubTests(unittest.TestCase):
         self.assertEqual(scrub(""), "")
         self.assertEqual(scrub_counted(None), (None, {}))
 
+    def test_anti_forgery_token_headers(self):
+        out = scrub(f"  -   RequestVerificationToken: {XSRF}\n"
+                    f"  -   X-XSRF-TOKEN: {XSRF}\n"
+                    f"  -   x-csrf-token:{XSRF}\n"
+                    f"""{{'x-requestverificationtoken': '{XSRF}'}}""")
+        assert_clean(self, out)
+        self.assertEqual(out.count(TOKEN_MARK), 4)
+
+    def test_storage_state_value_before_name_and_pretty_printed(self):
+        out = scrub(f'{{"value": "{SESSION}", "name": "ASP.NET_SessionId"}}\n'
+                    '{\n  "name": "other",\n  "domain": "app.courtreserve.com",\n'
+                    f'  "value": "{XSRF}",\n  "path": "/"\n}}')
+        assert_clean(self, out)
+        self.assertIn('"path": "/"', out)
+
+    def test_folded_header(self):
+        out = scrub(f"Cookie: ASP.NET_SessionId={SESSION};\n"
+                    f"    __RequestVerificationToken_Lw__=SECRETfold;\n"
+                    f"\t.ASPXAUTH=SECRETaspx\n"
+                    f"Host: app.courtreserve.com\n"
+                    f"  -   cookie: a=SECRETb\n  -   accept: */*\n")
+        assert_clean(self, out)
+        self.assertIn("Host: app.courtreserve.com", out)
+        self.assertIn("  -   accept: */*", out)  # a call log's next entry isn't a fold
+
+    def test_percent_encoded_and_escaped_text(self):
+        # e.g. an exception that went through quote() into a redirect URL.
+        out = scrub(f"errmsg=Failed%3A%20cookie%3A%20ASP.NET_SessionId%3D{SESSION}%3B%20x\n"
+                    f"msg=__RequestVerificationToken%3D{XSRF}&next=1\n"
+                    f'"detail": "set-cookie\\u003a ASP.NET_SessionId\\u003d{SESSION}"\n'
+                    f"b'.ASPXAUTH\\x3d{APP_COOKIE}'")
+        assert_clean(self, out)
+        self.assertIn("&next=1", out)
+
+    def test_an_over_long_line_goes_whole_if_it_mentions_a_cookie(self):
+        long_line = "x=" + "y" * MAX_LINE + f" cookie {SESSION}"
+        out = scrub(f"before\n{long_line}\nafter\n" + "z" * (MAX_LINE + 1))
+        assert_clean(self, out)
+        self.assertIn("before\n[line of ", out)
+        self.assertIn("characters removed", out)
+        self.assertTrue(out.endswith("z" * (MAX_LINE + 1)))  # nothing cookie-like: kept
+
+    def test_adversarial_input_is_linear(self):
+        """Run on third-party text in print() and in web requests: no shape may take
+        long. Each case is 1MB, as one line (over the cap) and as many lines under it."""
+        shapes = {
+            "unclosed quote, backslashes": '"cookie": "' + "\\" * 15000,
+            "unclosed quote, escaped quotes": "'cookie': '" + '\\"' * 7000,
+            "word run after cookie": "cookie " + "a" * 16000,
+            "dotted run after cookie": "cookie " + "a.-" * 5000,
+            "repeated header names": "set-cookie:" * 1400,
+            "repeated cookie names": "ASP.NET_SessionId=" * 800,
+            "unclosed quoted cookie name": '"ASP.NET_SessionId": "' + "x" * 15000,
+            "unclosed record": '{"name": 1, "value": "' + "\\" * 15000,
+            "open braces": "{" * 16000,
+            "folded lines": "cookie: x" + "\n x" * 5000,
+            "spaces after colon": "cookie:" + " " * 15000,
+        }
+        for name, line in shapes.items():
+            for text in ((line * (2**20 // len(line) + 1))[:2**20],
+                         "\n".join([line[:MAX_LINE]] * (2**20 // len(line[:MAX_LINE]) + 1))):
+                t = time.perf_counter()
+                scrub(text)
+                self.assertLess(time.perf_counter() - t, 1.0, name)
+
 
 class ScrubRunLogsScriptTests(unittest.TestCase):
     """The one-off cleanup, against a synthetic database shaped like the app's."""
@@ -145,7 +211,7 @@ class ScrubRunLogsScriptTests(unittest.TestCase):
                          [(1, "success", "Booking confirmed!\n"),
                           (2, "failed", CALL_LOG),
                           (3, "failed", RESPONSE_LOG),
-                          (4, "running", None)])
+                          (4, "cancelled", None)])
         conn.execute("INSERT INTO pending_transfers VALUES (1, 'held_by_probe', ?, ?)",
                      (f"Transfer errored (cookie: ASP.NET_SessionId={SESSION})", CALL_LOG))
         conn.commit()
@@ -245,6 +311,70 @@ class ScrubRunLogsScriptTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("pending_transfers", out)
         assert_clean(self, self.dump())
+
+    def set_running(self, run_id=4):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE job_runs SET status = 'running', job_id = 7 WHERE id = ?", (run_id,))
+        conn.commit()
+        conn.close()
+
+    def test_refuses_while_a_run_is_in_flight(self):
+        self.set_running()
+        before = self.dump()
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code, out = self.run_script()
+        self.assertEqual(code, 2)
+        self.assertIn("jobs 7", err.getvalue())
+        self.assertEqual(self.dump(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_dry_run_names_runs_in_flight(self):
+        self.set_running()
+        code, out = self.run_script("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("Runs in flight for jobs 7", out)
+
+    def test_wal_is_truncated(self):
+        # The WAL holds the frames the app wrote the cookies in; nothing may be left.
+        reader = sqlite3.connect(self.db)  # keeps the WAL file from being removed on close
+        self.addCleanup(reader.close)
+        reader.execute("SELECT count(*) FROM job_runs").fetchone()
+        writer = sqlite3.connect(self.db)
+        writer.execute("UPDATE job_runs SET log_text = log_text || ? WHERE id = 1", (CALL_LOG,))
+        writer.commit()
+        writer.close()
+        wal = Path(str(self.db) + "-wal")
+        self.assertIn(SESSION.encode(), wal.read_bytes())
+        code, _ = self.run_script()
+        self.assertEqual(code, 0)
+        self.assertEqual(wal.stat().st_size, 0)
+        self.assertNotIn(SESSION.encode(), self.db.read_bytes())
+
+    def test_a_held_wal_fails_loudly(self):
+        reader = sqlite3.connect(self.db, isolation_level=None)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM job_runs").fetchone()  # an open read snapshot
+        err = io.StringIO()
+        with mock.patch.object(scrub_run_logs, "CHECKPOINT_WAIT_S", 0.3), \
+                mock.patch("sys.stderr", err):
+            code, out = self.run_script()
+        self.assertEqual(code, 3)
+        self.assertIn("may still hold old log text", err.getvalue())
+        assert_clean(self, out + err.getvalue())
+        reader.execute("COMMIT")
+        # Running it again with the reader gone finishes the job without a new backup.
+        code, out = self.run_script()
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing to scrub", out)
+        self.assertEqual(Path(str(self.db) + "-wal").stat().st_size, 0)
+
+    def test_dry_run_creates_no_sidecar_files(self):
+        # setUp closed every connection, so SQLite removed the WAL and shm files.
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["court_reserve.db"])
+        self.run_script("--dry-run")
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["court_reserve.db"])
 
     def test_missing_database(self):
         with redirect_stdout(io.StringIO()), \

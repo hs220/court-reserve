@@ -5,6 +5,7 @@ import pytz
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from sqlalchemy import select, update
+from starlette.concurrency import run_in_threadpool
 
 from web.database import (engine, jobs, accounts, organizations, job_runs, bookings,
                           pending_transfers, row_to_dict, json_field, get_days_out)
@@ -494,8 +495,10 @@ async def get_transfer_log(transfer_id: int):
                          .where(pending_transfers.c.id == transfer_id)).fetchone()
     if not t:
         return PlainTextResponse("Transfer not found.", status_code=404)
-    # Stored logs are scrubbed when written; this covers rows written before that.
-    return PlainTextResponse(scrub_log(t.log_text or "") or "(no transfer output yet)")
+    # Stored logs are scrubbed when written; this covers rows written before that. Off
+    # the event loop, so a huge log can't hold up every other request.
+    return PlainTextResponse(await run_in_threadpool(scrub_log, t.log_text or "")
+                             or "(no transfer output yet)")
 
 
 @router.get("/transfers/{transfer_id}", response_class=HTMLResponse)
@@ -506,7 +509,6 @@ async def transfer_detail(request: Request, transfer_id: int):
         if not row:
             return HTMLResponse("Transfer not found.", status_code=404)
         t = row_to_dict(row)
-        t["log_text"], t["note"] = scrub_log(t["log_text"] or ""), scrub_log(t["note"] or "")
         acct_label = {a.id: (a.label or a.email)
                       for a in conn.execute(accounts.select())}
         org = conn.execute(organizations.select()
@@ -514,6 +516,8 @@ async def transfer_detail(request: Request, transfer_id: int):
     t["probe_label"] = acct_label.get(t["probe_account_id"], "?")
     t["main_label"] = acct_label.get(t["main_account_id"], "?")
     t["org_name"] = org.name if org else "?"
+    for key in ("log_text", "note"):
+        t[key] = await run_in_threadpool(scrub_log, t[key] or "")
     return templates.TemplateResponse(request, "transfer_detail.html", context={"t": t})
 
 

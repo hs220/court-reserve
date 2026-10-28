@@ -131,15 +131,25 @@ and don't need it.
 HTML, so the log says *what* the site wanted instead of only "Expecting value: line 3".
 
 Run output is scrubbed of cookies before it is stored or sent (`log_scrub.py`). When a
-request fails, Playwright's call log lists its headers, and runs 403 and 411 stored a
-`cookie: ASP.NET_SessionId=…; __RequestVerificationToken=…` line: a live CourtReserve
-session for anyone on the LAN, since the UI on :7000 has no auth. `job_runner` scrubs
-the stdout proxy (both the run's copy and the container log), `_finish_run`,
-`_append_run_log`, the transfer log and note, and every email body; the run/transfer log
-pages and the agent API's `_redactor` scrub again on the way out, for rows written
-before. Cookie and `authorization:` header lines lose their whole value, as do
-CourtReserve's cookie names anywhere. `scripts/scrub_run_logs.py` (`--dry-run` for
-counts) cleans rows stored before this.
+request fails, Playwright's call log lists its headers, and 90 runs (8–411, May–Oct 2026)
+stored a `cookie: ASP.NET_SessionId=…; __RequestVerificationToken=…` line: a live
+CourtReserve session for anyone on the LAN, since the UI on :7000 has no auth.
+`job_runner` scrubs the stdout proxy (both the run's copy and the container log),
+`_finish_run`, `_append_run_log`, the transfer log and note, and every email body; so do
+the CLI's `_send_failure_email`, the reservation-sync errors (they go into a redirect
+URL) and the org login check. The run/transfer log pages (off the event loop) and the
+agent API's `_redactor` scrub again on the way out, for rows written before. Cookie,
+anti-forgery-token and `authorization:` header values go whole, as do CourtReserve's
+cookie names anywhere. Every pattern must stay linear: this runs on third-party text
+inside `print()` and inside requests, and `test_log_scrub` times each on 1MB of
+adversarial input. `scripts/scrub_run_logs.py` (`--dry-run` for counts) cleans rows
+stored before this.
+
+**Scrubbing is not the fix for a cookie that already leaked; ending the session is.**
+The scrub can't recall failure emails already sent, log tails the home agent read,
+the cleanup's backup, old extents on the btrfs volume or its snapshots. If a session
+cookie ever reaches a log again, log the account out of CourtReserve (or change its
+password) first, then clean up.
 
 **Gaps that remain:**
 - All failure alerting goes through the app itself, so an app-down event is exactly

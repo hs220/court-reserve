@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from datetime import date, datetime
+from pathlib import Path
 from unittest import mock
 
 import pytz
@@ -791,6 +792,43 @@ class RunLogCookieScrubTests(_RunDbTestCase):
         for copy in (buf.getvalue(), real.getvalue()):  # the run log, the container log
             self.assertNotIn("SECRET", copy)
             self.assertIn("cookie: [cookie removed]", copy)
+
+    def test_cli_failure_email_is_scrubbed(self):
+        # main.py's own mailer, which sends traceback.format_exc() for the CLI runner.
+        import main
+        with mock.patch("smtplib.SMTP") as smtp:
+            main._send_failure_email(f"failed: {RESPONSE_LOG}", f"Traceback ...\n{CALL_LOG}")
+            sent = self._sent_text(smtp)
+            subject = smtp.return_value.__enter__.return_value.sendmail.call_args.args[2]
+        self.assertNotIn("SECRET", sent)
+        self.assertNotIn("SECRET", subject)
+        self.assertIn("read ECONNRESET", sent)
+
+    def test_sync_and_login_check_errors_are_scrubbed(self):
+        # Sync errors go into a redirect URL (uvicorn's access log); a login check's
+        # error is shown on the org page.
+        from web.routes import orgs, reservations
+        with mock.patch("playwright.sync_api.sync_playwright", side_effect=ValueError(CALL_LOG)):
+            ok, msg = orgs._verify_login("e", "p", "u", Path("/nonexistent"))
+        self.assertFalse(ok)
+        self.assertNotIn("SECRET", msg)
+        self.assertIn("read ECONNRESET", msg)
+
+        with engine.begin() as conn:
+            acc_id = conn.execute(insert(accounts).values(
+                label="Syncer", email="syncer@example.com", password="pw", org_id=self.org_id,
+            )).inserted_primary_key[0]
+
+        def drop():
+            with engine.begin() as conn:
+                conn.execute(accounts.delete().where(accounts.c.id == acc_id))
+        self.addCleanup(drop)
+        with mock.patch("playwright.sync_api.sync_playwright", side_effect=ValueError(CALL_LOG)):
+            errors = reservations._do_sync()["errors"]
+        mine = [e for e in errors if e.startswith("Syncer:")]
+        self.assertEqual(len(mine), 1)
+        self.assertNotIn("SECRET", mine[0])
+        self.assertIn("read ECONNRESET", mine[0])
 
     def test_transfer_log_and_note_are_scrubbed(self):
         with engine.begin() as conn:
