@@ -153,17 +153,51 @@ The tool automates CourtReserve's booking UI via Playwright. There is no officia
 
 **CourtReserve's new portal (Oct 2026):** between Oct 23 and 24, 2026 the booking page
 and the reservation page moved to a React portal (`ClientApp/pages/bundle-portal.js`).
-It has no jQuery, no Kendo and no server-rendered forms, so steps 4 above and the
-cancel no longer work there. The login page, the ReadConsolidated feed and the
-my-bookings `get-list` JSON are unchanged. `book_slot` and `cancel_reservation` check
-the page kind (`_PAGE_KIND_JS`) first and raise `PageChangedError` ("page changed: …")
-on the portal before clicking anything. A transfer therefore stops with the probe
-holding the court instead of ending in `needs_check`. A cancel counts only when the
-reloaded reservation page says so (the portal's `[data-testid=status]` = "Canceled"),
-never because the submit landed somewhere else. Mapping the portal's booking form and
-cancel dialog still needs a live look: one click on a slot's `Reserve`
-(`[data-testid=consolidated-reserve-slot]`) and, on a reservation the test account
-holds, its "Cancel Reservation".
+It has no jQuery, no Kendo and no server-rendered forms. The login page, the
+ReadConsolidated feed and the my-bookings `get-list` JSON are unchanged.
+`ensure_booking_page` tells the old Kendo page from the portal (`_PAGE_KIND_JS`) and
+raises `PageChangedError` ("page changed: …") for anything else, before any click.
+`book_slot` then takes the Kendo path or `_book_slot_portal`, which works from the DOM
+recorded live and keys only on `data-testid`, ARIA roles and visible text, since class
+names are build hashes:
+- It steps the day with "Previous day"/"Next day" to the date picker's `MM/DD/YYYY`, then
+  refreshes the grid.
+- It marks the cell under the court type's own column (no fallback to another column) at
+  the height of the one matching time label (`data-cr-pick`), and clicks that mark.
+  Clicking the Nth "Reserve" opened the wrong half hour once the grid re-rendered.
+- It parses the form's date and time tile anchored and whole: six lines, "OCT" / "30" /
+  "Friday" / "2:30 PM – 3:00 PM" / activity / "Hard". It compares month, day, weekday,
+  start, court type and end exactly; substring checks let "12:30 PM" pass for "2:30 PM".
+  It then picks Duration from its `[role=option]`s and verifies the hidden
+  `input[name=duration]`. Agent-created jobs (`params.exact_duration`) refuse a length
+  the portal doesn't offer; UI jobs take the nearest, as the Kendo path does.
+- It reads the total due (the `$` amount only: the form also names the member) and
+  refuses above `_PORTAL_MAX_PRICE` (per org, default $40).
+- It marks and clicks the innermost "I agree to the terms above" span (the label nests
+  three), then clicks Confirm once.
+
+From the Confirm click on, there are only three outcomes:
+- True: a NEW reservation id, not in the snapshot `known_reservation_ids()` took at
+  pre-warm, matching the date, start and length, is on the account's `get-list`.
+- A classified BookingError: the portal refused it and the list shows nothing new.
+- `BookingUnconfirmedError`: anything else.
+
+It never returns False after Confirm, because every caller retries False.
+`BookingUnconfirmedError`'s message is fixed text, so net_errors never reads it as
+transient. `run_book_next` and `run_watch` fail and alert on it without booking again,
+and a transfer stores `needs_check`. A form with a second picker (a court picker, as the
+old Santa Clara form had) is refused before Confirm. `test_portal_js.py` runs the portal
+JS in an offline Chromium; set `CR_TEST_CHROMIUM` to a chromium binary if the installed
+build doesn't match Playwright's.
+
+The portal's cancel dialog hasn't been seen, so `cancel_reservation` still refuses on the
+portal before its first click. A transfer checks both the main account's and the probe's
+booking pages, and notes their reservation ids, before it cancels (before the hook). A
+booking page the code can't drive therefore leaves the probe holding the court.
+`run_book_next`, `run_watch` and the CLI's `cmd_book` / `cmd_watch` run the same check
+right after login, so an undrivable page fails the run and alerts at session start. A
+cancel counts only when the reloaded reservation page says so (`[data-testid=status]` =
+"Canceled").
 
 **Multi-org support:** `booking.py` now exposes `OrgConfig(org_id, scheduler_id, cost_type_id, timezone)`. The CLI uses `default_org_config()` from `config.py` (reads `config.yaml`). The web UI stores orgs/accounts in SQLite and constructs `OrgConfig` per job.
 

@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 import pytz
 
 from booking import (
-    Slot, slot_has_window, find_best_slot,
+    book_slot, PageChangedError, Slot, slot_has_window, find_best_slot,
     _parse_ms, _build_json_data, _classify_booking_error, _org_uses_court_picker,
     match_reservation_id, _feed_json, FeedNotJsonError,
     OrgConfig, BookingError, BookingWindowError,
@@ -552,11 +552,12 @@ class CancelAndCaptureTests(unittest.TestCase):
 
 
 class BookingPageTests(unittest.TestCase):
-    """book_slot's first step: be on a booking page whose Kendo scheduler is bound."""
+    """book_slot's first step: be on a booking page it can drive -- the old Kendo
+    scheduler or the new portal's."""
 
     URL = "https://app.courtreserve.com/Online/Reservations/Bookings/13233?sId=16983"
 
-    def _page(self, kinds, url=URL):
+    def _page(self, kinds, url=URL, portal_renders=True):
         """A fake page whose _PAGE_KIND_JS answers come from `kinds`, in order (the last
         one repeats)."""
         from unittest import mock
@@ -571,81 +572,78 @@ class BookingPageTests(unittest.TestCase):
 
         page.evaluate.side_effect = evaluate
         page.title.return_value = "Lifetime Activities: Sunnyvale | powered by CourtReserve"
+        if not portal_renders:
+            page.wait_for_selector.side_effect = TimeoutError("Timeout 15000ms exceeded")
+            page.query_selector.return_value = None
         return page
 
     def test_a_live_scheduler_is_used_without_a_reload(self):
         # The pre-warmed page must not be reloaded at release time.
-        from booking import _ensure_kendo_scheduler
-        page = self._page(["kendo"])
-        _ensure_kendo_scheduler(page, self.URL)
-        page.goto.assert_not_called()
+        from booking import ensure_booking_page
+        for kind in ("kendo", "portal"):
+            page = self._page([kind])
+            self.assertEqual(ensure_booking_page(page, self.URL), kind)
+            page.goto.assert_not_called()
 
     def test_a_page_that_lost_its_scheduler_is_reloaded(self):
         # Run 412: on the booking URL, but `$` was gone. Reload instead of evaluating
         # into a page that can't answer.
-        from booking import _ensure_kendo_scheduler
-        page = self._page(["unknown", "kendo"])
-        _ensure_kendo_scheduler(page, self.URL)
-        page.goto.assert_called_once()
+        from booking import ensure_booking_page
+        for kinds, kind in ((["unknown", "kendo"], "kendo"), (["unknown", "portal"], "portal")):
+            page = self._page(kinds)
+            self.assertEqual(ensure_booking_page(page, self.URL), kind)
+            page.goto.assert_called_once()
 
     def test_a_scheduler_that_binds_after_jquery_is_waited_for(self):
         # Review of #7: after a reload, jQuery is up a moment before the scheduler is
         # bound, and that moment reads "legacy". It must not fail a page that works a
         # second later.
-        from booking import _ensure_kendo_scheduler
+        from booking import ensure_booking_page
         page = self._page(["unknown", "legacy", "legacy", "kendo"])
-        _ensure_kendo_scheduler(page, self.URL)
+        self.assertEqual(ensure_booking_page(page, self.URL), "kendo")
         page.goto.assert_called_once()
 
     def test_a_page_that_stays_legacy_says_the_page_changed(self):
-        from booking import _ensure_kendo_scheduler, PageChangedError
+        from booking import ensure_booking_page, PageChangedError
         page = self._page(["legacy"])
         with self.assertRaises(PageChangedError) as cm:
-            _ensure_kendo_scheduler(page, self.URL)
-        self.assertIn("no Kendo scheduler", str(cm.exception))
+            ensure_booking_page(page, self.URL)
+        self.assertIn("no scheduler", str(cm.exception))
 
     def test_the_page_title_stays_out_of_the_message(self):
         # A "504 Gateway Time-out" title would make net_errors retry a page-changed error.
-        from booking import _ensure_kendo_scheduler, PageChangedError
+        from booking import ensure_booking_page, PageChangedError
         from net_errors import is_network_error
         page = self._page(["unknown"])
         page.title.return_value = "504 Gateway Time-out"
         with self.assertRaises(PageChangedError) as cm:
-            _ensure_kendo_scheduler(page, self.URL)
+            ensure_booking_page(page, self.URL)
         self.assertNotIn("504", str(cm.exception))
         self.assertFalse(is_network_error(cm.exception))
 
-    def test_the_new_portal_says_the_page_changed(self):
-        from booking import _ensure_kendo_scheduler, PageChangedError
-        page = self._page(["portal"])
+    def test_a_portal_that_never_shows_its_scheduler_says_the_page_changed(self):
+        from booking import ensure_booking_page, PageChangedError
+        page = self._page(["portal"], url="https://app.courtreserve.com/Online/Portal/Index/13233",
+                          portal_renders=False)
         with self.assertRaises(PageChangedError) as cm:
-            _ensure_kendo_scheduler(page, self.URL)
+            ensure_booking_page(page, self.URL)
         self.assertTrue(str(cm.exception).startswith("page changed:"))
-        self.assertIn("new portal", str(cm.exception))
 
     def test_a_page_with_no_scheduler_names_where_it_is(self):
-        from booking import _ensure_kendo_scheduler, PageChangedError
+        from booking import ensure_booking_page, PageChangedError
         page = self._page(["unknown"])
         with self.assertRaises(PageChangedError) as cm:
-            _ensure_kendo_scheduler(page, self.URL)
+            ensure_booking_page(page, self.URL)
         self.assertIn("url=" + self.URL, str(cm.exception))
-
-    def test_book_slot_clicks_nothing_on_the_new_portal(self):
-        from booking import book_slot, PageChangedError
-        page = self._page(["portal"])
-        slot = mk("19:00", [1])
-        with self.assertRaises(PageChangedError):
-            book_slot(page, self.URL, slot, duration_minutes=120)
-        page.mouse.click.assert_not_called()
 
     def test_page_changed_is_not_retried_as_a_network_blip(self):
         # A watch retries "network" errors for 30 minutes; a changed page never clears.
         from net_errors import is_network_error
-        from booking import _ensure_kendo_scheduler, cancel_reservation, PageChangedError
+        from booking import ensure_booking_page, cancel_reservation, book_slot, PageChangedError
         errors = []
-        for kinds in (["portal"], ["unknown"]):
+        for kinds, renders in ((["portal"], False), (["unknown"], True)):
             try:
-                _ensure_kendo_scheduler(self._page(kinds), self.URL)
+                ensure_booking_page(self._page(kinds, url="about:blank", portal_renders=renders), self.URL)
             except PageChangedError as e:
                 errors.append(e)
         cancel_tests = CancelAndCaptureTests()
@@ -654,9 +652,569 @@ class BookingPageTests(unittest.TestCase):
                 cancel_reservation(cancel_tests._page(**kw)[0], "12345678", cancel_tests.org())
             except PageChangedError as e:
                 errors.append(e)
-        self.assertEqual(len(errors), 6)
+        for kw in ({"columns": ("Clay",)}, {"tile": ["OCT", "31", "Saturday"] + TILE[3:]},
+                   {"combos": 2}, {"durations": ("soon",)}, {"shown": "2026-10-30"}):
+            fake = FakePortal(**kw)
+            try:
+                with fake.patched():
+                    book_slot(fake, self.URL, portal_slot(), duration_minutes=120, org=SUNNYVALE)
+            except PageChangedError as e:
+                errors.append(e)
+        self.assertEqual(len(errors), 11)
         for e in errors:
             self.assertFalse(is_network_error(e), str(e))
+
+
+SUNNYVALE = OrgConfig(org_id="13233", scheduler_id="16983", cost_type_id="1")
+
+# The form's date and time tile as recorded live (book_once, Oct 27): six lines.
+TILE = ["OCT", "30", "Friday", "2:30 PM – {end}", "Recreational Play - Tennis", "Hard"]
+MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG",
+                                      "SEP", "OCT", "NOV", "DEC"], 1)}
+
+
+def portal_slot(date_str="2026-10-30", time_str="14:30", court_type="Hard"):
+    start = _tz.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+    ms = int(start.timestamp() * 1000)
+    return Slot(court_type=court_type, start_ms=ms, end_ms=ms + 30 * 60_000,
+                available_courts=12, available_court_ids=[1], is_wait_list=False)
+
+
+class KendoAfterSaveTests(unittest.TestCase):
+    """The old Kendo path from the Save click on (review before #9's merge): Santa Clara
+    hasn't been seen on the portal, so ensure_booking_page can still answer "kendo".
+    Like the portal: confirmed, refused, or BookingUnconfirmedError -- never False."""
+
+    def _page(self, body="", notice=None, modal_text="", save_raises=None, body_raises=None):
+        from unittest import mock
+        page = mock.MagicMock()
+        save = mock.MagicMock()
+        if save_raises:
+            save.click.side_effect = save_raises
+        self.save = save
+        page.wait_for_selector.side_effect = lambda sel, **kw: save if "Save" in sel else mock.MagicMock()
+
+        def query_selector(sel):
+            if "pnotify" in sel:
+                if notice is None:
+                    return None
+                n = mock.MagicMock()
+                n.inner_text.return_value = notice
+                return n
+            if "create-res-modal" in sel and modal_text:
+                m = mock.MagicMock()
+                m.inner_text.return_value = modal_text
+                return m
+            return None
+
+        page.query_selector.side_effect = query_selector
+
+        def evaluate(js, *a):
+            if "document.body.innerText" in js:
+                if body_raises:
+                    raise body_raises
+                return body
+            return None
+
+        page.evaluate.side_effect = evaluate
+        return page
+
+    def run_modal(self, page):
+        from booking import _handle_booking_modal
+        return _handle_booking_modal(page, portal_slot(), 0, org=SUNNYVALE)
+
+    def assert_unconfirmed(self, page):
+        from booking import BookingUnconfirmedError
+        from net_errors import is_network_error
+        with self.assertRaises(BookingUnconfirmedError) as cm:
+            self.run_modal(page)
+        self.assertEqual(self.save.click.call_count, 1)
+        self.assertFalse(is_network_error(cm.exception), str(cm.exception))
+
+    def test_a_confirmation_is_a_booking(self):
+        self.assertTrue(self.run_modal(self._page(body="Reservation Confirmed")))
+        self.assertTrue(self.run_modal(self._page(notice="Reservation confirmed")))
+
+    def test_a_refusal_is_classified(self):
+        with self.assertRaises(BookingWindowError):
+            self.run_modal(self._page(notice="You are only allowed to reserve up to 7 days in advance."))
+        with self.assertRaises(NoAvailableCourtsError):
+            self.run_modal(self._page(body="There are no available courts for this time."))
+
+    def test_no_confirmation_is_unconfirmed_not_false(self):
+        self.assert_unconfirmed(self._page())
+
+    def test_a_form_still_open_is_unconfirmed(self):
+        self.assert_unconfirmed(self._page(modal_text="Create Reservation ..."))
+
+    def test_an_error_after_save_is_unconfirmed(self):
+        self.assert_unconfirmed(self._page(body_raises=TimeoutError("Timeout 30000ms exceeded.")))
+
+    def test_a_save_click_that_raises_is_unconfirmed(self):
+        self.assert_unconfirmed(self._page(save_raises=TimeoutError("Timeout 30000ms exceeded.")))
+
+
+class FakePortal:
+    """CourtReserve's portal booking page and its Create Reservation form, as recorded
+    live (Sunnyvale, account 3, Fri Oct 30 2:30 PM). It answers booking.py's JS by
+    identity, records every click in order, and -- like the real list -- puts on the
+    account's reservation list whatever the CONFIRMED form was for."""
+
+    URL = "https://app.courtreserve.com/Online/Reservations/Bookings/13233?sId=16983"
+    DURATIONS = ("30 minutes", "1 hour", "1 hour & 30 minutes", "2 hours")
+
+    def __init__(self, shown="10/25/2026", cells=None, columns=("Hard",), tile=TILE, tiles=(),
+                 combos=1, durations=DURATIONS, applies_duration=True, terms=True, terms_boxes=1,
+                 price="$7.00", notices=(), books=True, save_id=None, new_id="64000001",
+                 existing=(), list_error_after_confirm=None, confirm_raises=None, books_twice=False,
+                 find_state=None, list_lag=0):
+        self.url = self.URL
+        self.shown = shown
+        self.cells = {"2:30 PM": "reserve"} if cells is None else cells
+        self.columns, self.tile, self.tiles, self.combos = columns, tile, list(tiles), combos
+        self.durations, self.applies_duration = durations, applies_duration
+        self.terms, self.terms_boxes, self.price = terms, terms_boxes, price
+        self.notices, self.books, self.save_id, self.new_id = notices, books, save_id, new_id
+        self.list_error_after_confirm, self.confirm_raises = list_error_after_confirm, confirm_raises
+        self.books_twice, self.find_state = books_twice, find_state
+        self.list_lag = list_lag  # list reads after Confirm before the booking shows
+        self.reads_after_confirm = 0
+        self.booked = []
+        self.reservations = [dict(r) for r in existing]
+        self.minutes = 30
+        self.open_tile = None
+        self.modal = self.listbox = self.confirmed = self.terms_marked = False
+        self.pick = None
+        self.clicks = []
+        self.handlers = []
+        self.list_reads = 0
+
+    # -- what booking.py calls -------------------------------------------------------
+    def evaluate(self, js, arg=None):
+        import booking as b
+        if js is b._PAGE_KIND_JS:
+            return "portal"
+        if js is b._PORTAL_DATE_JS:
+            return self.shown
+        if js is b._PORTAL_FIND_SLOT_JS:
+            label, court_type, token = arg
+            if self.find_state:
+                return {"state": self.find_state, "count": 2}
+            if court_type not in self.columns:  # like the real JS: no fallback column
+                return {"state": "no column", "columns": list(self.columns)}
+            state = self.cells.get(label)
+            if state is None:
+                return None
+            if state != "reserve":
+                return {"state": state, "text": state.upper()}
+            self.pick = f"[data-cr-pick='{token}']"
+            return {"state": "reserve", "pick": self.pick}
+        if js is b._PORTAL_SLOT_COUNT_JS:
+            return 15
+        if js is b._PORTAL_FORM_JS:
+            if not self.modal:
+                return None
+            label = next((d for d in self.durations if b._portal_duration_minutes(d) == self.minutes),
+                         f"{self.minutes} minutes")
+            return {"form": True, "tileLines": self._tile_lines(), "combos": self.combos,
+                    "duration": label, "durationValue": str(self.minutes),
+                    "totalDue": [self.price] if self.price else [], "terms": self.terms}
+        if js is b._PORTAL_MARK_TERMS_JS:
+            self.terms_marked = self.terms_boxes == 1
+            return self.terms_boxes
+        if js is b._PORTAL_OPTIONS_JS:
+            return list(self.durations) if self.listbox else []
+        if js is b._PORTAL_NOTICES_JS:
+            return list(self.notices) if self.confirmed else []
+        raise AssertionError(f"unexpected evaluate: {js[:60]}")
+
+    def _tile_lines(self):
+        start = datetime.strptime(self.open_tile[3].split(" – ")[0], "%I:%M %p")
+        end = (start + timedelta(minutes=self.minutes)).strftime("%-I:%M %p")
+        return [line.format(end=end) for line in self.open_tile]
+
+    def click(self, selector):
+        self.clicks.append(selector)
+        d = datetime.strptime(self.shown, "%m/%d/%Y")
+        step = {'[aria-label="Next day"]': 1, '[aria-label="Previous day"]': -1}[selector]
+        self.shown = (d + timedelta(days=step)).strftime("%m/%d/%Y")
+
+    def query_selector(self, selector):
+        import booking as b
+        if selector == b._PORTAL_SCHEDULER:
+            return object()
+        if selector == "[data-testid=scheduler-refresh-btn]":
+            return _FakeElement(self, "refresh")
+        return None
+
+    def locator(self, selector):
+        return _FakeLocator(self, selector)
+
+    def get_by_role(self, role, name=None, exact=False):
+        assert role == "option", role
+        return _FakeElement(self, f"option:{name}")
+
+    def wait_for_selector(self, selector, **kw):
+        import booking as b
+        if selector == b._PORTAL_FORM and not self.modal:
+            raise TimeoutError("Timeout 15000ms exceeded")
+        return object()
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def goto(self, url, **kw):
+        self.url = url
+
+    def on(self, event, handler):
+        self.handlers.append(handler)
+
+    def remove_listener(self, event, handler):
+        self.handlers.remove(handler)
+
+    # -- what the clicks do ------------------------------------------------------------
+    def press(self, what):
+        import booking as b
+        self.clicks.append(what)
+        if what == "reserve":
+            self.modal = True
+            self.open_tile = self.tiles.pop(0) if self.tiles else self.tile
+        elif what == "close":
+            self.modal = False
+        elif what == "combobox":
+            self.listbox = True
+        elif what.startswith("option:"):
+            self.listbox = False
+            if self.applies_duration:
+                self.minutes = b._portal_duration_minutes(what[len("option:"):])
+        elif what == "terms":
+            assert self.terms_marked, "clicked a terms label that wasn't the one marked"
+        elif what == "confirm":
+            if self.confirm_raises:
+                raise self.confirm_raises
+            self.confirmed = True
+            if self.save_id:
+                for h in list(self.handlers):
+                    h(_FakeSaveResponse(self.save_id))
+            if self.books:
+                self._book(self.new_id)
+                if self.books_twice:
+                    self._book(str(int(self.new_id) + 1))
+
+    def _book(self, rid):
+        """A reservation for what the open form shows, as the real list would have it."""
+        lines = self._tile_lines()
+        start = datetime.strptime(lines[3].split(" – ")[0], "%I:%M %p").strftime("%H:%M")
+        self.booked.append({"reservation_id": rid,
+                                  "date": f"2026-{MONTHS[lines[0]]:02d}-{int(lines[1]):02d}",
+                                  "start_time": start, "duration_min": self.minutes,
+                                  "court_type": lines[5]})
+
+    def get_my_reservations(self, page, org):
+        self.list_reads += 1
+        if self.confirmed:
+            if self.list_error_after_confirm:
+                raise self.list_error_after_confirm
+            self.reads_after_confirm += 1
+            if self.reads_after_confirm > self.list_lag:
+                self.reservations += self.booked
+                self.booked = []
+        return [dict(r) for r in self.reservations]
+
+    def patched(self):
+        from unittest import mock
+        return mock.patch("booking.get_my_reservations", side_effect=self.get_my_reservations)
+
+
+class _FakeLocator:
+    def __init__(self, fake, selector):
+        self.fake, self.selector = fake, selector
+
+    def nth(self, i):
+        return self
+
+    @property
+    def first(self):
+        return self
+
+    def locator(self, selector):
+        return _FakeLocator(self.fake, selector)
+
+    def get_by_role(self, role, name=None, exact=False):
+        assert (role, name) == ("button", "Confirm"), (role, name)
+        return _FakeElement(self.fake, "confirm")
+
+    def click(self, timeout=None):
+        import booking as b
+        if self.selector == self.fake.pick:
+            self.fake.press("reserve")
+        elif self.selector == ".ant-modal-close":
+            self.fake.press("close")
+        elif self.selector == "button[role=combobox]":
+            self.fake.press("combobox")
+        elif self.selector == b._PORTAL_TERMS_MARK:
+            self.fake.press("terms")
+        else:
+            raise AssertionError(f"unexpected click on {self.selector}")
+
+
+class _FakeElement:
+    def __init__(self, fake, what):
+        self.fake, self.what = fake, what
+
+    def click(self, timeout=None):
+        self.fake.press(self.what)
+
+
+class _FakeSaveResponse:
+    url = "https://app.courtreserve.com/api/v1/portalreservationsapi/Api_Reservation_Create"
+
+    def __init__(self, rid):
+        self.rid = rid
+
+    def text(self):
+        return json.dumps({"IsValid": True, "Data": {"ReservationId": int(self.rid)}})
+
+
+class PortalBookingTests(unittest.TestCase):
+    """book_slot on the portal, against a fake that mirrors the recorded DOM."""
+
+    def book(self, fake, duration=30, slot=None, **kw):
+        result = {}
+        with fake.patched():
+            ok = book_slot(fake, FakePortal.URL, slot or portal_slot(), duration_minutes=duration,
+                           org=SUNNYVALE, result=result, **kw)
+        return ok, result
+
+    def assert_never_confirmed(self, fake, exc=None, **kw):
+        if exc:
+            with self.assertRaises(exc):
+                self.book(fake, **kw)
+        else:
+            self.assertFalse(self.book(fake, **kw)[0])
+        self.assertNotIn("confirm", fake.clicks)
+
+    def unconfirmed(self, fake, **kw):
+        from booking import BookingUnconfirmedError
+        from net_errors import is_network_error
+        with self.assertRaises(BookingUnconfirmedError) as cm:
+            self.book(fake, **kw)
+        self.assertEqual(fake.clicks.count("confirm"), 1)
+        self.assertFalse(is_network_error(cm.exception), str(cm.exception))
+        return cm.exception
+
+    # -- the happy paths -------------------------------------------------------------
+    def test_a_30_minute_booking_goes_reserve_terms_confirm_and_is_checked_on_the_list(self):
+        fake = FakePortal()
+        ok, result = self.book(fake)
+        self.assertTrue(ok)
+        self.assertEqual(result["reservation_id"], "64000001")
+        self.assertEqual(fake.clicks, ['[aria-label="Next day"]'] * 5 + ["refresh", "reserve", "terms", "confirm"])
+
+    def test_a_longer_booking_picks_it_from_the_duration_list(self):
+        fake = FakePortal()
+        self.assertTrue(self.book(fake, duration=120)[0])
+        self.assertEqual(fake.clicks[-5:], ["reserve", "combobox", "option:2 hours", "terms", "confirm"])
+        self.assertEqual(fake.reservations[-1]["duration_min"], 120)
+
+    def test_the_day_is_stepped_back_too(self):
+        fake = FakePortal(shown="11/01/2026")
+        self.assertTrue(self.book(fake)[0])
+        self.assertEqual(fake.clicks[:2], ['[aria-label="Previous day"]'] * 2)
+
+    def test_a_date_picker_that_renders_late_is_waited_for(self):
+        # Live dry run: the scheduler container was up while its date picker read None.
+        fake = FakePortal()
+        late = iter([None, None, None])
+        real = fake.evaluate
+
+        def evaluate(js, arg=None):
+            import booking as b
+            if js is b._PORTAL_DATE_JS:
+                return next(late, fake.shown)
+            return real(js, arg)
+
+        fake.evaluate = evaluate
+        self.assertTrue(self.book(fake)[0])
+
+    def test_a_form_for_the_next_half_hour_is_closed_and_the_slot_retried(self):
+        # Live dry run: the grid re-rendered between finding the cell and clicking it,
+        # and the 3:00 PM form opened for a 2:30 PM slot.
+        wrong = ["OCT", "30", "Friday", "3:00 PM – {end}", "Recreational Play - Tennis", "Hard"]
+        fake = FakePortal(tiles=[wrong])
+        self.assertTrue(self.book(fake)[0])
+        self.assertEqual(fake.clicks[-5:], ["reserve", "close", "reserve", "terms", "confirm"])
+        self.assertEqual(fake.reservations[-1]["start_time"], "14:30")
+
+    def test_known_ids_from_pre_warm_spare_the_list_read(self):
+        fake = FakePortal()
+        self.assertTrue(self.book(fake, known_reservation_ids=set())[0])
+        self.assertEqual(fake.list_reads, 1)  # only the check after Confirm
+
+    def test_terms_are_skipped_when_the_form_has_none(self):
+        fake = FakePortal(terms=False)
+        self.assertTrue(self.book(fake)[0])
+        self.assertNotIn("terms", fake.clicks)
+
+    # -- never the wrong slot (review of #9: substring holes) ----------------------
+    def test_a_12_30_form_is_never_confirmed_for_a_2_30_slot(self):
+        # "2:30 PM –" is inside "12:30 PM – 1:00 PM"; the tile is now parsed whole.
+        tile = ["OCT", "30", "Friday", "12:30 PM – {end}", "Recreational Play - Tennis", "Hard"]
+        for duration in (0, 30):
+            fake = FakePortal(tile=tile)
+            self.assert_never_confirmed(fake, exc=PageChangedError, duration=duration)
+
+    def test_an_oct_30_form_is_never_confirmed_for_oct_3(self):
+        # "OCT 3" is inside "OCT 30".
+        fake = FakePortal(shown="10/01/2026")
+        self.assert_never_confirmed(fake, exc=PageChangedError, slot=portal_slot("2026-10-03"))
+
+    def test_a_form_for_another_court_type_is_never_confirmed(self):
+        tile = TILE[:5] + ["Pickleball"]
+        self.assert_never_confirmed(FakePortal(tile=tile), exc=PageChangedError)
+
+    def test_a_grid_without_the_court_types_column_is_refused(self):
+        # Review of #9: a single-column fallback marked a Pickleball cell for Hard.
+        fake = FakePortal(columns=("Pickleball",))
+        self.assert_never_confirmed(fake, exc=PageChangedError)
+        self.assertNotIn("reserve", fake.clicks)
+
+    def test_an_ambiguous_grid_is_refused(self):
+        for state in ("ambiguous label", "ambiguous cell"):
+            fake = FakePortal(find_state=state)
+            self.assert_never_confirmed(fake, exc=PageChangedError)
+            self.assertNotIn("reserve", fake.clicks)
+
+    def test_a_form_for_another_slot_twice_is_never_confirmed(self):
+        wrong = ["OCT", "30", "Friday", "3:00 PM – {end}", "Recreational Play - Tennis", "Hard"]
+        self.assert_never_confirmed(FakePortal(tile=wrong), exc=PageChangedError)
+
+    def test_a_tile_of_another_shape_is_never_confirmed(self):
+        self.assert_never_confirmed(FakePortal(tile=TILE[:4]), exc=PageChangedError)
+
+    def test_a_taken_slot_is_demoted_without_a_click(self):
+        from booking import SlotNotBookableError
+        for state in ("none available", "unavailable"):
+            fake = FakePortal(cells={"2:30 PM": state})
+            self.assert_never_confirmed(fake, exc=SlotNotBookableError)
+            self.assertNotIn("reserve", fake.clicks)
+
+    def test_a_slot_missing_from_the_grid_is_not_booked(self):
+        fake = FakePortal(cells={})
+        self.assert_never_confirmed(fake)
+        self.assertNotIn("reserve", fake.clicks)
+
+    def test_an_unmapped_second_picker_is_never_confirmed(self):
+        self.assert_never_confirmed(FakePortal(combos=2), exc=PageChangedError)
+
+    def test_an_ambiguous_terms_label_is_never_confirmed(self):
+        self.assert_never_confirmed(FakePortal(terms_boxes=3), exc=PageChangedError)
+
+    # -- duration and price ----------------------------------------------------------
+    def test_a_duration_that_doesnt_take_is_never_confirmed(self):
+        self.assert_never_confirmed(FakePortal(applies_duration=False), duration=120)
+
+    def test_a_duration_not_offered_uses_the_nearest_for_the_ui(self):
+        fake = FakePortal(durations=("30 minutes", "1 hour", "1 hour & 30 minutes"))
+        self.assertTrue(self.book(fake, duration=120)[0])
+        self.assertIn("option:1 hour & 30 minutes", fake.clicks)
+
+    def test_a_duration_not_offered_is_refused_for_an_exact_job(self):
+        from booking import DurationNotOfferedError
+        fake = FakePortal(durations=("30 minutes", "1 hour", "1 hour & 30 minutes"))
+        self.assert_never_confirmed(fake, exc=DurationNotOfferedError, duration=120, exact_duration=True)
+
+    def test_the_price_is_logged_as_an_amount_only(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(self.book(FakePortal())[0])
+        self.assertIn("Price: $7.00 (cap $40.00)", out.getvalue())
+
+    def test_a_price_above_the_cap_is_never_confirmed(self):
+        from unittest import mock
+        from booking import PriceAboveCapError
+        self.assert_never_confirmed(FakePortal(price="$41.00"), exc=PriceAboveCapError)
+        with mock.patch.dict("booking._PORTAL_MAX_PRICE", {"13233": 5.00}):
+            self.assert_never_confirmed(FakePortal(), exc=PriceAboveCapError)
+
+    def test_a_form_without_a_price_is_never_confirmed(self):
+        self.assert_never_confirmed(FakePortal(price=None), exc=PageChangedError)
+
+    def test_dry_run_stops_before_confirm(self):
+        fake = FakePortal()
+        self.assert_never_confirmed(fake, dry_run=True)
+        self.assertNotIn("terms", fake.clicks)
+
+    # -- after Confirm: booked, refused, or unconfirmed -- never False --------------
+    def test_a_confirm_that_isnt_on_the_list_is_unconfirmed_not_false(self):
+        self.unconfirmed(FakePortal(books=False))
+
+    def test_a_reservation_that_was_already_there_never_counts(self):
+        # Review of #9: an existing 14:30 reservation passed as the new booking.
+        existing = [{"reservation_id": "63000000", "date": "2026-10-30", "start_time": "14:30",
+                     "duration_min": 30, "court_type": "Hard"}]
+        self.unconfirmed(FakePortal(books=False, existing=existing))
+
+    def test_a_new_reservation_of_another_length_doesnt_count(self):
+        other = FakePortal(books=False, existing=[{"reservation_id": "64000009", "date": "2026-10-30",
+                                                   "start_time": "14:30", "duration_min": 120,
+                                                   "court_type": "Hard"}])
+        self.unconfirmed(other, known_reservation_ids=set())
+
+    def test_two_new_matches_are_unconfirmed(self):
+        self.unconfirmed(FakePortal(books_twice=True))
+
+    def test_the_save_responses_id_is_preferred_among_new_ones(self):
+        fake = FakePortal(books_twice=True, save_id="64000002")
+        self.assertEqual(self.book(fake)[1]["reservation_id"], "64000002")
+
+    def test_an_unreadable_list_after_confirm_is_unconfirmed(self):
+        from booking import ReservationListError
+        for err in (ReservationListError("no get-list response"),
+                    TimeoutError("Page.goto: Timeout 30000ms exceeded.")):
+            exc = self.unconfirmed(FakePortal(list_error_after_confirm=err))
+            self.assertIn("Confirm was clicked", str(exc))
+
+    def test_a_confirm_click_that_raises_is_unconfirmed(self):
+        self.unconfirmed(FakePortal(confirm_raises=TimeoutError("Timeout 5000ms exceeded.")))
+
+    def test_a_refusal_the_list_agrees_with_is_classified(self):
+        fake = FakePortal(books=False, notices=("You are restricted to 1 court reservation per day.",))
+        with self.assertRaises(AlreadyBookedError):
+            self.book(fake)
+        self.assertEqual(fake.clicks.count("confirm"), 1)
+
+    def test_a_refusal_notice_gets_a_second_list_read(self):
+        # The list can lag a moment behind a notice that turns out to be wrong.
+        fake = FakePortal(list_lag=1, notices=("You are restricted to 1 court reservation per day.",))
+        self.assertTrue(self.book(fake)[0])
+        self.assertEqual(fake.reads_after_confirm, 2)
+
+    def test_a_price_above_the_cap_is_booked_for_a_transfers_rebook(self):
+        # The probe already held this court at this price; refusing it after the cancel
+        # would only lose it.
+        fake = FakePortal(price="$41.00")
+        self.assertTrue(self.book(fake, enforce_price_cap=False)[0])
+
+    def test_a_refusal_with_a_new_reservation_anyway_counts_as_booked(self):
+        fake = FakePortal(notices=("Something about restricted to 1 court per day",))
+        self.assertTrue(self.book(fake)[0])
+
+    def test_duration_wording(self):
+        from booking import _portal_duration_label, _portal_duration_minutes
+        for minutes, label in ((30, "30 minutes"), (60, "1 hour"), (90, "1 hour & 30 minutes"), (120, "2 hours")):
+            self.assertEqual(_portal_duration_label(minutes), label)
+            self.assertEqual(_portal_duration_minutes(label), minutes)
+        self.assertIsNone(_portal_duration_minutes("soon"))
+
+    def test_tile_parsing_is_anchored(self):
+        from booking import _parse_portal_tile
+        self.assertEqual(_parse_portal_tile([l.format(end="3:00 PM") for l in TILE])["start"], "2:30 PM")
+        for bad in (["OCT", "30", "Friday", "x 2:30 PM – 3:00 PM", "Tennis", "Hard"],
+                    ["OCT 30", "Friday", "2:30 PM – 3:00 PM", "Tennis", "Hard"],
+                    ["Oct", "30", "Friday", "2:30 PM – 3:00 PM", "Tennis", "Hard"], None, []):
+            self.assertIsNone(_parse_portal_tile(bad), bad)
 
 
 if __name__ == "__main__":
