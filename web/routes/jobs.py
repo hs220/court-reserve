@@ -5,9 +5,11 @@ import pytz
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from sqlalchemy import select, update
+from starlette.concurrency import run_in_threadpool
 
 from web.database import (engine, jobs, accounts, organizations, job_runs, bookings,
                           pending_transfers, row_to_dict, json_field, get_days_out)
+from log_scrub import scrub as scrub_log
 from web import apscheduler_setup
 from web.templates_shared import templates
 
@@ -493,7 +495,10 @@ async def get_transfer_log(transfer_id: int):
                          .where(pending_transfers.c.id == transfer_id)).fetchone()
     if not t:
         return PlainTextResponse("Transfer not found.", status_code=404)
-    return PlainTextResponse(t.log_text or "(no transfer output yet)")
+    # Stored logs are scrubbed when written; this covers rows written before that. Off
+    # the event loop, so a huge log can't hold up every other request.
+    return PlainTextResponse(await run_in_threadpool(scrub_log, t.log_text or "")
+                             or "(no transfer output yet)")
 
 
 @router.get("/transfers/{transfer_id}", response_class=HTMLResponse)
@@ -511,6 +516,8 @@ async def transfer_detail(request: Request, transfer_id: int):
     t["probe_label"] = acct_label.get(t["probe_account_id"], "?")
     t["main_label"] = acct_label.get(t["main_account_id"], "?")
     t["org_name"] = org.name if org else "?"
+    for key in ("log_text", "note"):
+        t[key] = await run_in_threadpool(scrub_log, t[key] or "")
     return templates.TemplateResponse(request, "transfer_detail.html", context={"t": t})
 
 

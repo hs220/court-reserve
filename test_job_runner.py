@@ -7,6 +7,7 @@ That same temp DB backs the run-lifecycle integration tests at the bottom.
 Run:  python -m unittest test_job_runner -v
 """
 
+import io
 import json
 import os
 import tempfile
@@ -14,6 +15,7 @@ import threading
 import time
 import unittest
 from datetime import date, datetime
+from pathlib import Path
 from unittest import mock
 
 import pytz
@@ -23,10 +25,12 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="cr-test-data-"))
 
 from sqlalchemy import insert
 
-from web.database import accounts, engine, init_db, job_runs, jobs, organizations
+from web.database import (accounts, engine, init_db, job_runs, jobs, organizations,
+                          pending_transfers)
 from booking import Slot, find_best_slot
 import web.job_runner as jr
 from net_errors import ErrorStreak
+from test_log_scrub import CALL_LOG, RESPONSE_LOG
 from web.job_runner import (_append_run_log, _deadline_timeout_minutes, _finish_run,
                             _is_network_error, _live_times, _notify_run_failed,
                             _parse_preferred_times, _send_warning_email, _start_run,
@@ -514,6 +518,13 @@ def _cancel_account_id():
         return conn.execute(accounts.select().order_by(accounts.c.id.desc())).fetchone().id
 
 
+# Fixture passwords are long and unique. The modules share one test DB, and the agent
+# API's redactor scrubs every stored password from everything it returns: a password
+# like "p" would be scrubbed out of unrelated text in test_agent_api's assertions.
+def _fixture_password(name: str) -> str:
+    return f"jr-fixture-{name}-Q7vX2kLm9"
+
+
 def _cancel_job_id():
     """A throwaway job row for run-lifecycle assertions."""
     init_db()
@@ -522,7 +533,7 @@ def _cancel_job_id():
             name="Cancel Org", org_id="1", scheduler_id="1", cost_type_id="1",
             timezone="America/Los_Angeles")).inserted_primary_key[0]
         acct_id = conn.execute(insert(accounts).values(
-            label="c", email="c@example.com", password="p")).inserted_primary_key[0]
+            label="c", email="c@example.com", password=_fixture_password("cancel"))).inserted_primary_key[0]
         return conn.execute(insert(jobs).values(
             account_id=acct_id, org_id=org_id, type="watch", params="{}")).inserted_primary_key[0]
 
@@ -588,15 +599,8 @@ class SendWarningEmailTests(unittest.TestCase):
             self.assertTrue(_send_warning_email("s", "b").startswith("failed:"))
 
 
-class RunFailureNotificationTests(unittest.TestCase):
-    """Integration coverage for _finish_run -> _notify_run_failed -> _append_run_log,
-    against the real (temp) SQLite DB.
-
-    Run #282 failed and no alert arrived, and the run page gave no hint that a
-    notification had even been attempted: the send's only error report was a print()
-    issued after the run's stdout had already been snapshotted into the DB. These
-    tests assert the outcome is persisted where you'd actually look for it.
-    """
+class _RunDbTestCase(unittest.TestCase):
+    """A job in the real (temp) SQLite DB, with SMTP configured but never waited on."""
 
     @classmethod
     def setUpClass(cls):
@@ -607,7 +611,7 @@ class RunFailureNotificationTests(unittest.TestCase):
                 cost_type_id="1", timezone="America/Los_Angeles",
             )).inserted_primary_key[0]
             cls.account_id = conn.execute(insert(accounts).values(
-                label="Tester", email="tester@example.com", password="pw",
+                label="Tester", email="tester@example.com", password=_fixture_password("tester"),
             )).inserted_primary_key[0]
 
     def setUp(self):
@@ -636,6 +640,17 @@ class RunFailureNotificationTests(unittest.TestCase):
         """Extract the message text handed to sendmail()."""
         session = smtp.return_value.__enter__.return_value
         return session.sendmail.call_args.args[2]
+
+
+class RunFailureNotificationTests(_RunDbTestCase):
+    """Integration coverage for _finish_run -> _notify_run_failed -> _append_run_log,
+    against the real (temp) SQLite DB.
+
+    Run #282 failed and no alert arrived, and the run page gave no hint that a
+    notification had even been attempted: the send's only error report was a print()
+    issued after the run's stdout had already been snapshotted into the DB. These
+    tests assert the outcome is persisted where you'd actually look for it.
+    """
 
     def test_failed_run_records_that_the_alert_was_sent(self):
         run_id = _start_run(self.job_id)
@@ -728,6 +743,115 @@ class RunFailureNotificationTests(unittest.TestCase):
         with mock.patch("smtplib.SMTP") as smtp:
             _notify_run_failed(999_999, "log")
             smtp.assert_not_called()
+
+
+class RunLogCookieScrubTests(_RunDbTestCase):
+    """A failed ReadConsolidated poll prints Playwright's call log, which lists the
+    request's cookie header. Runs 403 and 411 stored live sessions that way, readable
+    by anyone on the LAN. Nothing that stores or sends run output may keep one."""
+
+    def _sent_text(self, smtp):
+        """The decoded body: the call log's arrow makes it UTF-8, so it goes out base64,
+        where a plain assertNotIn would pass whatever it held."""
+        from email import message_from_string
+        return message_from_string(self._sent_body(smtp)).get_payload(decode=True).decode()
+
+    def test_failed_run_stores_and_emails_no_cookie(self):
+        run_id = _start_run(self.job_id)
+        with mock.patch("smtplib.SMTP") as smtp:
+            _finish_run(run_id, "failed", CALL_LOG + RESPONSE_LOG)
+            body = self._sent_text(smtp)
+        log = self._read_run(run_id).log_text
+        self.assertNotIn("SECRET", log)
+        self.assertNotIn("SECRET", body)
+        self.assertIn("cookie: [cookie removed]", body)
+        self.assertIn("cookie: [cookie removed]", log)
+        self.assertIn("read ECONNRESET", log)
+        self.assertIn("[failure notification] sent", log)
+
+    def test_running_snapshots_are_scrubbed(self):
+        run_id = _start_run(self.job_id)
+        _finish_run(run_id, "running", CALL_LOG)
+        self.assertNotIn("SECRET", self._read_run(run_id).log_text)
+
+    def test_appended_lines_are_scrubbed(self):
+        run_id = _start_run(self.job_id)
+        _append_run_log(run_id, f"[failure notification] errored before sending: {RESPONSE_LOG}")
+        self.assertNotIn("SECRET", self._read_run(run_id).log_text)
+
+    def test_warning_emails_are_scrubbed(self):
+        # run_watch's streak warning carries the last error, call log and all.
+        with mock.patch("smtplib.SMTP") as smtp:
+            _send_warning_email("Watch job warning", f"last error: {CALL_LOG}")
+            sent = self._sent_text(smtp)
+        self.assertNotIn("SECRET", sent)
+        self.assertIn("read ECONNRESET", sent)
+
+    def test_captured_output_is_scrubbed_on_both_copies(self):
+        real, buf = io.StringIO(), io.StringIO()
+        proxy = jr._StdoutProxy(real)
+        jr._tls.capture = buf
+        try:
+            proxy.write(f"Poll error: {CALL_LOG}")
+            proxy.write("\n")
+        finally:
+            jr._tls.capture = None
+        for copy in (buf.getvalue(), real.getvalue()):  # the run log, the container log
+            self.assertNotIn("SECRET", copy)
+            self.assertIn("cookie: [cookie removed]", copy)
+
+    def test_cli_failure_email_is_scrubbed(self):
+        # main.py's own mailer, which sends traceback.format_exc() for the CLI runner.
+        import main
+        with mock.patch("smtplib.SMTP") as smtp:
+            main._send_failure_email(f"failed: {RESPONSE_LOG}", f"Traceback ...\n{CALL_LOG}")
+            sent = self._sent_text(smtp)
+            subject = smtp.return_value.__enter__.return_value.sendmail.call_args.args[2]
+        self.assertNotIn("SECRET", sent)
+        self.assertNotIn("SECRET", subject)
+        self.assertIn("read ECONNRESET", sent)
+
+    def test_sync_and_login_check_errors_are_scrubbed(self):
+        # Sync errors go into a redirect URL (uvicorn's access log); a login check's
+        # error is shown on the org page.
+        from web.routes import orgs, reservations
+        with mock.patch("playwright.sync_api.sync_playwright", side_effect=ValueError(CALL_LOG)):
+            ok, msg = orgs._verify_login("e", "p", "u", Path("/nonexistent"))
+        self.assertFalse(ok)
+        self.assertNotIn("SECRET", msg)
+        self.assertIn("read ECONNRESET", msg)
+
+        with engine.begin() as conn:
+            acc_id = conn.execute(insert(accounts).values(
+                label="Syncer", email="syncer@example.com", password=_fixture_password("syncer"),
+                org_id=self.org_id,
+            )).inserted_primary_key[0]
+
+        def drop():
+            with engine.begin() as conn:
+                conn.execute(accounts.delete().where(accounts.c.id == acc_id))
+        self.addCleanup(drop)
+        with mock.patch("playwright.sync_api.sync_playwright", side_effect=ValueError(CALL_LOG)):
+            errors = reservations._do_sync()["errors"]
+        mine = [e for e in errors if e.startswith("Syncer:")]
+        self.assertEqual(len(mine), 1)
+        self.assertNotIn("SECRET", mine[0])
+        self.assertIn("read ECONNRESET", mine[0])
+
+    def test_transfer_log_and_note_are_scrubbed(self):
+        with engine.begin() as conn:
+            tid = conn.execute(insert(pending_transfers).values(
+                job_id=self.job_id, org_id=self.org_id, probe_account_id=self.account_id,
+                main_account_id=self.account_id, date="2026-11-01", start_time="19:30",
+            )).inserted_primary_key[0]
+        jr._persist_transfer_log(tid, io.StringIO(CALL_LOG))
+        jr._update_pending_transfer(tid, "held_by_probe", f"Transfer errored ({RESPONSE_LOG})")
+        with engine.connect() as conn:
+            t = conn.execute(pending_transfers.select()
+                             .where(pending_transfers.c.id == tid)).fetchone()
+        self.assertNotIn("SECRET", t.log_text)
+        self.assertNotIn("SECRET", t.note)
+        self.assertIn("read ECONNRESET", t.log_text)
 
 
 if __name__ == "__main__":

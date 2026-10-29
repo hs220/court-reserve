@@ -30,6 +30,8 @@ from web.database import (account_orgs, accounts, bookings, engine, init_db, job
 import web.job_runner as jr
 from web.database import row_to_dict
 from web.routes import agent_api
+from web.routes import jobs as jobs_routes
+from web.routes import logs as logs_routes
 
 #: Saved before any test patches it, for the tests that need the real thing.
 REAL_REQUEST_CANCEL = jr.request_cancel
@@ -43,8 +45,8 @@ app = FastAPI()
 app.include_router(agent_api.router)
 
 
-def call(method, path, body=None, token=TOKEN):
-    """One request through the ASGI app; returns (status, parsed JSON)."""
+def call(method, path, body=None, token=TOKEN, asgi=app):
+    """One request through the ASGI app; returns (status, parsed JSON, raw body)."""
     async def run():
         sent = []
         payload = json.dumps(body).encode() if body is not None else b""
@@ -64,13 +66,20 @@ def call(method, path, body=None, token=TOKEN):
                  "method": method, "scheme": "http", "path": p, "raw_path": p.encode(),
                  "query_string": qs.encode(), "root_path": "", "headers": headers,
                  "client": ("test", 1), "server": ("test", 80)}
-        await app(scope, receive, send)
+        await asgi(scope, receive, send)
         status = next(m["status"] for m in sent if m["type"] == "http.response.start")
         raw = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
         return status, raw.decode()
 
     status, raw = asyncio.run(run())
-    return status, (json.loads(raw) if raw else None), raw
+    is_json = asgi is app and raw
+    return status, (json.loads(raw) if is_json else None), raw
+
+
+#: The web UI's log pages (no auth there), for the read-side scrub.
+ui_app = FastAPI()
+ui_app.include_router(logs_routes.router)
+ui_app.include_router(jobs_routes.router)
 
 
 def future(days=10):
@@ -225,6 +234,17 @@ class NoSecretsTests(AgentApiTestCase):
         older = body["runs"][1]["log_tail"]
         self.assertIn("Logging in as p***@example.com", older)
         self.assertIn("[redacted]", older)
+
+    def test_run_log_cookies_are_scrubbed(self):
+        # Rows stored before the job runner scrubbed cookies still hold them (runs 403
+        # and 411); the redactor must not pass a session on to the agent.
+        from test_log_scrub import CALL_LOG, RESPONSE_LOG
+        jid = self.add_job()
+        self.add_run(jid, "failed", CALL_LOG + RESPONSE_LOG)
+        _, body, raw = call("GET", f"/api/agent/v1/jobs/{jid}")
+        self.assertNotIn("SECRET", raw)
+        self.assertIn("cookie: [cookie removed]", body["runs"][0]["log_tail"])
+        self.assertIn("read ECONNRESET", body["runs"][0]["log_tail"])
 
     def test_an_availability_error_is_scrubbed(self):
         with mock.patch.object(agent_api, "_fetch_slots",
@@ -1202,6 +1222,36 @@ class TransferCheckedTests(TransferTestCase):
         for path in (f"/transfers/{tid}/checked", f"/transfers/{tid}/confirm"):
             self.assertIn(call("POST", "/api/agent/v1" + path, {"holder": "probe"})[0], (404, 405))
         self.assertEqual(self.transfer(tid).status, "needs_check")
+
+
+class LogPageScrubTests(TransferTestCase):
+    """The UI's run and transfer log pages have no auth, and rows stored before the job
+    runner scrubbed cookies still hold them until scripts/scrub_run_logs.py runs."""
+
+    def setUp(self):
+        super().setUp()
+        from test_log_scrub import CALL_LOG, RESPONSE_LOG
+        self.log = CALL_LOG + RESPONSE_LOG
+
+    def assert_page_clean(self, path):
+        status, _, raw = call("GET", path, token=None, asgi=ui_app)
+        self.assertEqual(status, 200, path)
+        self.assertNotIn("SECRET", raw, path)
+        self.assertIn("[cookie removed]", raw, path)
+        self.assertIn("read ECONNRESET", raw, path)
+
+    def test_run_log_pages(self):
+        rid = self.add_run(self.add_job(), "failed", self.log)
+        self.assert_page_clean(f"/runs/{rid}/log")
+        self.assert_page_clean(f"/runs/{rid}")
+
+    def test_transfer_log_pages(self):
+        tid = self.add_transfer(status="held_by_probe", note=f"Transfer errored ({self.log})")
+        with engine.begin() as conn:
+            conn.execute(pending_transfers.update().where(pending_transfers.c.id == tid)
+                         .values(log_text=self.log))
+        self.assert_page_clean(f"/transfers/{tid}/log")
+        self.assert_page_clean(f"/transfers/{tid}")
 
 
 class AutoTransferTests(TransferTestCase):

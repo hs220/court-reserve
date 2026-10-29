@@ -7,6 +7,7 @@ from starlette.concurrency import run_in_threadpool
 
 from sqlalchemy import text
 
+from log_scrub import scrub as scrub_log
 from web.database import engine, organizations, accounts, bookings, row_to_dict
 from web.templates_shared import templates
 
@@ -56,7 +57,9 @@ def _do_sync() -> dict:
                 reservations = get_my_reservations(page, org_cfg)
                 browser.close()
         except Exception as e:
-            errors.append(f"{acc.get('label') or acc['email']}: {e}")
+            # Scrubbed here: it goes into a redirect URL, so into uvicorn's access log
+            # and browser history, as well as to the agent API.
+            errors.append(f"{acc.get('label') or acc['email']}: {scrub_log(str(e))}")
             continue
 
         # Upsert returned reservations

@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from log_scrub import scrub as scrub_log
+
 # ── Thread-safe stdout capture ────────────────────────────────────────────────
 # redirect_stdout() modifies sys.stdout globally and is not thread-safe.
 # Instead we install a proxy once and route per-thread output via threading.local.
@@ -20,14 +22,21 @@ _stdout_patched = False
 
 
 class _StdoutProxy:
-    """Passes all writes through to the real stdout while also copying to per-thread buffers."""
+    """Passes all writes through to the real stdout while also copying to per-thread buffers.
+
+    Both copies are scrubbed of cookies (log_scrub): a Playwright error printed by a run
+    carries the request's headers, and neither the run log nor the container's log
+    should hold a live session. A print() hands its message over in one write, so the
+    message is scrubbed whole; the stored log is scrubbed again as a whole anyway."""
     def __init__(self, real):
         self._real = real
 
     def write(self, data):
-        buf = getattr(_tls, "capture", None)
-        if buf is not None and isinstance(data, str):
-            buf.write(data)
+        if isinstance(data, str):
+            data = scrub_log(data)
+            buf = getattr(_tls, "capture", None)
+            if buf is not None:
+                buf.write(data)
         self._real.write(data)
 
     def flush(self):
@@ -150,6 +159,9 @@ def _send_warning_email(subject: str, body: str) -> str:
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER", to_addr)
 
+    # Bodies carry run output and exception text (a log tail, a streak's last error),
+    # which is where a Playwright call log's cookie header would ride along.
+    subject, body = scrub_log(subject), scrub_log(body)
     last_error = ""
     for attempt in range(1, SMTP_ATTEMPTS + 1):
         try:
@@ -224,6 +236,7 @@ def _start_run(job_id: int) -> int:
 
 
 def _finish_run(run_id: int, status: str, log: str):
+    log = scrub_log(log)
     with engine.begin() as conn:
         conn.execute(
             update(job_runs)
@@ -242,7 +255,7 @@ def _append_run_log(run_id: int, line: str) -> None:
             conn.execute(
                 update(job_runs)
                 .where(job_runs.c.id == run_id)
-                .values(log_text=job_runs.c.log_text + f"\n{line}")
+                .values(log_text=job_runs.c.log_text + f"\n{scrub_log(line)}")
             )
     except Exception as e:
         print(f"Could not append to run #{run_id} log: {e}")
@@ -358,7 +371,7 @@ def _mark_cancel_started(transfer_id):
 
 def _update_pending_transfer(transfer_id, status, note="", reservation_id=None):
     resolved = datetime.utcnow() if status in ("transferred", "failed") else None
-    values = dict(status=status, note=note, resolved_at=resolved)
+    values = dict(status=status, note=scrub_log(note), resolved_at=resolved)
     if reservation_id is not None:
         values["reservation_id"] = reservation_id
     with engine.begin() as conn:
@@ -445,7 +458,7 @@ def _persist_transfer_log(transfer_id: int, buf: io.StringIO):
         with engine.begin() as conn:
             conn.execute(update(pending_transfers)
                          .where(pending_transfers.c.id == transfer_id)
-                         .values(log_text=buf.getvalue()))
+                         .values(log_text=scrub_log(buf.getvalue())))
     except Exception:
         pass
 

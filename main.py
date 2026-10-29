@@ -21,6 +21,7 @@ from booking import (get_available_slots, find_best_slot, book_slot, _org_uses_c
                      CourtSelectionRequiredError, SlotNotBookableError)
 from scheduler import wait_until
 from net_errors import ErrorStreak, is_network_error
+from log_scrub import scrub as scrub_log
 
 PT = pytz.timezone("America/Los_Angeles")
 
@@ -51,8 +52,9 @@ def _send_failure_email(subject: str, body: str) -> None:
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER", to_addr)
     try:
-        msg = MIMEText(body)
-        msg["Subject"] = f"[court-reserve] {subject}"
+        # Bodies carry tracebacks, which carry Playwright's call log and its cookie header.
+        msg = MIMEText(scrub_log(body))
+        msg["Subject"] = f"[court-reserve] {scrub_log(subject)}"
         msg["From"] = smtp_user
         msg["To"] = to_addr
         # Bounded: without a timeout smtplib blocks indefinitely on a half-open

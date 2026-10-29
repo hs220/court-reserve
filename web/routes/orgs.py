@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from sqlalchemy import text
+from log_scrub import scrub as scrub_log
 from web.database import engine, organizations, accounts, account_orgs, bookings, row_to_dict, DATA_DIR
 from web.templates_shared import templates
 
@@ -29,7 +30,7 @@ def _verify_login(email: str, password: str, org_url: str, session_file: Path) -
     except RuntimeError as e:
         return False, str(e)
     except Exception as e:
-        return False, f"Unexpected error: {e}"
+        return False, f"Unexpected error: {scrub_log(str(e))}"
 
 
 def _last_check_time(log_text: str) -> str | None:
